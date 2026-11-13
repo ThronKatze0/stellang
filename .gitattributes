@@ -1,0 +1,2 @@
+# .st is Smalltalk to GitHub; stellang reads like Rust, so highlight it as Rust
+*.st linguist-language=Rust

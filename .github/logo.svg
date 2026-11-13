@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="160" viewBox="0 0 560 160">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffd166"/><stop offset="0.5" stop-color="#ef476f"/><stop offset="1" stop-color="#7b5cff"/>
+    </linearGradient>
+  </defs>
+  <path transform="translate(80 80)" fill="url(#g)"
+    d="M0,-62 L15,-20 L59,-19 L24,8 L37,50 L0,25 L-37,50 L-24,8 L-59,-19 L-15,-20 Z"/>
+  <text x="160" y="104" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"
+    font-size="72" font-weight="700" fill="url(#g)">stellang</text>
+</svg>
