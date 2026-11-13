@@ -2210,8 +2210,13 @@ fn stellaos_procs() {
         "error: out of memory\n[exit 101]",
         "name? hello Ada!\ndouble: 42\n[exit 0]",
         "churn 1398890 sum 12497500 intact true\ncollections true bounded true\n[exit 0]",
+        "1.0\n3.14\n0.3\n0.333333333333333\n1e+21\n-2.5\n100000000.0\n1.4142135623731\n2.5\n0.001\n1.5e-07\n",
+        "len 5.0 half 2.5\nf=5.0 int=5 float=7.0 floor=-3.0 ceil=3.0 round=3.0 abs=3.25\ntrue true true true\n",
+        "sin 0.5 cos 0.5 tan 1.0\n",
+        "parse -125.0 0.0\n[0.5, 1.25]\n1.00000000000792\n[exit 0]",
         "[exe] from a file",
         "exe parse of junk: true",
+        "example bounce.st compiles\nexample guess.st compiles\nexample hello.st compiles\nexample music.st compiles\nexample notebook.st compiles\nexample orbits.st compiles\nexample paint.st compiles\nexample primes.st compiles\n",
         "\ndone",
     ] {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");

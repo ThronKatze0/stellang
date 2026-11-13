@@ -140,8 +140,40 @@ struct Lexer {
                 }
                 self.i += 1
             }
-            if self.c(0) == 46 && is_digit(self.c(1)) {
-                self.fail("floats aren't supported here yet (only int)")
+            if self.c(0) == 46 && is_digit(self.c(1)) || ((self.c(0) == 101 || self.c(0) == 69) && (is_digit(self.c(1)) || ((self.c(1) == 45 || self.c(1) == 43) && is_digit(self.c(2))))) {
+                // a float: digits . digits [e[+-]digits], kept as digits x 10^exp
+                var exp = 0
+                if self.c(0) == 46 {
+                    self.i += 1
+                    while self.i < self.n && (is_digit(self.c(0)) || self.c(0) == 95) {
+                        if self.c(0) != 95 {
+                            if v < 100_000_000_000_000_000 {
+                                v = v * 10 + self.c(0) - 48
+                                exp -= 1
+                            }
+                        }
+                        self.i += 1
+                    }
+                }
+                if self.c(0) == 101 || self.c(0) == 69 {
+                    self.i += 1
+                    var sign = 1
+                    if self.c(0) == 45 || self.c(0) == 43 {
+                        if self.c(0) == 45 { sign = -1 }
+                        self.i += 1
+                    }
+                    var e = 0
+                    while self.i < self.n && is_digit(self.c(0)) {
+                        e = min(e * 10 + self.c(0) - 48, 10000)
+                        self.i += 1
+                    }
+                    exp += sign * e
+                }
+                if is_alpha(self.c(0)) {
+                    self.fail("a letter right after a number")
+                    return
+                }
+                self.toks.push(Tok { k: "float", s: st_k_substr(self.src, at, self.i).replace("_", ""), n: v, line: self.line, col: at - self.lstart + 1 })
                 return
             }
         }
@@ -381,7 +413,6 @@ struct Parser {
         }
         let t = self.peek()
         let name = self.ident()
-        if name == "float" { self.fail_at(t, "floats aren't supported here yet (only int)") }
         if self.is("?") { self.fail("optional types (`T?`) aren't supported here yet") }
         if self.is("!") { self.fail("result types (`T!`) aren't supported here yet") }
         return name
@@ -631,6 +662,10 @@ struct Parser {
                 operand.n = -operand.n
                 return operand
             }
+            if t.s == "-" && operand.k == "float" {
+                operand.s = if operand.s.starts_with("-") { operand.s.slice(1, operand.s.len()) } else { "-" + operand.s }
+                return operand
+            }
             let n = self.node("un", t)
             n.s = t.s
             n.kids.push(operand)
@@ -686,6 +721,13 @@ struct Parser {
             self.next()
             let n = self.node("int", t)
             n.n = t.n
+            return n
+        }
+        if t.k == "float" {
+            self.next()
+            let n = self.node("float", t)
+            n.n = t.n
+            n.s = t.s
             return n
         }
         if t.k == "str" {
@@ -1026,7 +1068,7 @@ struct Gen {
     }
 
     fn known_type(self, e: Tree, ty: str) {
-        if ty == "int" || ty == "bool" || ty == "str" || ty == "?" { return }
+        if ty == "int" || ty == "bool" || ty == "str" || ty == "float" || ty == "?" { return }
         if ty.starts_with("[") {
             self.known_type(e, elem(ty))
             return
@@ -1098,8 +1140,8 @@ struct Gen {
             let at = Tree { k: "", line: g.line, col: g.col }
             if self.globals.contains(g.name) || self.funcs.contains(g.name) { self.fail(at, "`${g.name}` is already declared") }
             if g.ty != "" { self.known_type(at, g.ty) }
-            if g.constant && (g.init.k == "int" || g.init.k == "str" || g.init.k == "bool") {
-                let ty = if g.init.k == "int" { "int" } else if g.init.k == "str" { "str" } else { "bool" }
+            if g.constant && (g.init.k == "int" || g.init.k == "str" || g.init.k == "bool" || g.init.k == "float") {
+                let ty = if g.init.k == "int" { "int" } else if g.init.k == "str" { "str" } else if g.init.k == "float" { "float" } else { "bool" }
                 if g.ty != "" { self.check(at, ty, g.ty, "const ${g.name}") }
                 self.globals[g.name] = GlobalInfo { off: -1, ty, mutable: false, value: g.init }
                 continue
@@ -1453,7 +1495,18 @@ struct Gen {
             self.rt("__str_cat", 2)
             return
         }
-        if ty != "int" && ty != "?" { self.fail(st, "`${st.s}` works on int (and += on str), not ${ty}") }
+        if ty == "float" {
+            let vt = self.expr(st.kids[1], "float")
+            self.check(st.kids[1], vt, "float", "`${st.s}`")
+            a.pop(rv.T0)
+            if op != "+" && op != "-" && op != "*" && op != "/" { self.fail(st, "`${st.s}` doesn't work on floats") }
+            a.fmv_dx(0, rv.T0)
+            a.fmv_dx(1, rv.A0)
+            a.fop(if op == "+" { 0x01 } else if op == "-" { 0x05 } else if op == "*" { 0x09 } else { 0x0d }, 0, 0, 1)
+            a.fmv_xd(rv.A0, 0)
+            return
+        }
+        if ty != "int" && ty != "?" { self.fail(st, "`${st.s}` works on int and float (and += on str), not ${ty}") }
         let vt = self.expr(st.kids[1], "int")
         self.check(st.kids[1], vt, "int", "`${st.s}`")
         a.pop(rv.T0)
@@ -1501,10 +1554,31 @@ struct Gen {
 
     // ---- expressions: the value ends up in a0; returns its type ----
 
+    // an expression; an int where a float is wanted becomes a float
     fn expr(self, e: Tree, want: str) -> str {
+        let t = self.expr_raw(e, want)
+        if want == "float" && t == "int" {
+            self.int_to_float(rv.A0)
+            return "float"
+        }
+        return t
+    }
+
+    fn int_to_float(self, reg: int) {
+        self.a.fcvt_dl(0, reg)
+        self.a.fmv_xd(reg, 0)
+    }
+
+    fn expr_raw(self, e: Tree, want: str) -> str {
         if self.err != "" { return "?" }
         let a = self.a
         let k = e.k
+        if k == "float" {
+            // parsed here, written as its exact bits
+            let x = float(e.s) catch 0.0
+            a.li(rv.A0, float_bits(x))
+            return "float"
+        }
         if k == "int" {
             a.li(rv.A0, e.n)
             return "int"
@@ -1544,6 +1618,12 @@ struct Gen {
                 self.check(e, t, "bool", "`!`")
                 a.seqz(rv.A0, rv.A0)
                 return "bool"
+            }
+            if t == "float" && e.s == "-" {
+                a.fmv_dx(0, rv.A0)
+                a.fsgnj(1, 0, 0, 0)
+                a.fmv_xd(rv.A0, 0)
+                return "float"
             }
             self.check(e, t, "int", "`${e.s}`")
             if e.s == "-" { a.neg(rv.A0, rv.A0) } else { a.xori(rv.A0, rv.A0, -1) }
@@ -1744,6 +1824,33 @@ struct Gen {
             self.fail(e, "`${op}` doesn't work on strings")
             return "?"
         }
+        if lt == "float" || rt2 == "float" {
+            if lt == "int" { self.int_to_float(rv.T0) }
+            if rt2 == "int" { self.int_to_float(rv.A0) }
+            let other = if lt == "float" { rt2 } else { lt }
+            if other != "int" && other != "float" && other != "?" { self.fail(e, "`${op}` between float and ${other}") }
+            a.fmv_dx(0, rv.T0)
+            a.fmv_dx(1, rv.A0)
+            if op == "+" || op == "-" || op == "*" || op == "/" {
+                a.fop(if op == "+" { 0x01 } else if op == "-" { 0x05 } else if op == "*" { 0x09 } else { 0x0d }, 0, 0, 1)
+                a.fmv_xd(rv.A0, 0)
+                return "float"
+            }
+            if op == "==" || op == "!=" {
+                a.fcmp(2, rv.A0, 0, 1)
+                if op == "!=" { a.xori(rv.A0, rv.A0, 1) }
+                return "bool"
+            }
+            if op == "<" { a.fcmp(1, rv.A0, 0, 1) }
+            else if op == ">" { a.fcmp(1, rv.A0, 1, 0) }
+            else if op == "<=" { a.fcmp(0, rv.A0, 0, 1) }
+            else if op == ">=" { a.fcmp(0, rv.A0, 1, 0) }
+            else {
+                self.fail(e, "`${op}` doesn't work on floats")
+                return "?"
+            }
+            return "bool"
+        }
         if op == "==" || op == "!=" {
             if !self.same(lt, rt2) { self.fail(e, "comparing ${lt} with ${rt2}") }
             a.xor(rv.A0, rv.T0, rv.A0)
@@ -1792,7 +1899,9 @@ struct Gen {
         let a = self.a
         if ty == "str" || ty == "?" { return }
         a.push(rv.A0)
-        if ty == "int" { self.rt("__int_str", 1) } else if ty == "bool" { self.rt("__bool_str", 1) } else if ty == "[int]" { self.rt("__l_int_str", 1) } else if ty == "[str]" { self.rt("__l_str_str", 1) } else if ty == "[bool]" { self.rt("__l_bool_str", 1) } else if ty == "void" {
+        if ty == "int" { self.rt("__int_str", 1) }
+        else if ty == "float" { self.rt("__float_str", 1) }
+        else if ty == "[float]" { self.rt("__l_float_str", 1) } else if ty == "bool" { self.rt("__bool_str", 1) } else if ty == "[int]" { self.rt("__l_int_str", 1) } else if ty == "[str]" { self.rt("__l_str_str", 1) } else if ty == "[bool]" { self.rt("__l_bool_str", 1) } else if ty == "void" {
             self.fail(e, "this has no value to show")
             a.pop(rv.A0)
         } else {
@@ -1838,6 +1947,24 @@ struct Gen {
         }
         if name.starts_with("__") && self.crt {
             if let t = self.intrinsic(e) { return t }
+        }
+        if (name == "int" || name == "float") && self.lookup(name) == none {
+            if e.kids.len() != 1 {
+                self.fail(e, "${name}() takes one number")
+                return name
+            }
+            let t = self.expr(e.kids[0], "")
+            if t == "str" {
+                self.fail(e, if name == "int" { "for text, use parse_int(s)" } else { "for text, use parse_float(s)" })
+            } else if t != "int" && t != "float" && t != "?" {
+                self.fail(e, "${name}() of ${t}")
+            }
+            if name == "float" && t == "int" { self.int_to_float(rv.A0) }
+            if name == "int" && t == "float" {
+                a.fmv_dx(0, rv.A0)
+                a.fcvt_ld(rv.A0, 0, 1)
+            }
+            return name
         }
         if self.lookup(name) != none { self.fail(e, "`${name}` is a variable, not a function") }
         if !self.funcs.contains(name) {
@@ -1906,6 +2033,10 @@ struct Gen {
             self.expr(e.kids[0], "")
             return some("str")
         }
+        if name == "__float" {
+            self.expr(e.kids[0], "")
+            return some("float")
+        }
         if name == "__copy" {
             // __copy(dst, src, n): bytes, front to back
             for x in e.kids {
@@ -1966,6 +2097,34 @@ struct Gen {
             }
             self.fail(e, "str has no method `${name}`")
             return "?"
+        }
+        if ot == "float" {
+            if argc != 0 || !["sqrt", "floor", "ceil", "round", "abs"].contains(name) {
+                self.fail(e, "float has no method `${name}` (with ${argc} arguments): sqrt floor ceil round abs")
+                return "?"
+            }
+            a.fmv_dx(0, rv.A0)
+            if name == "sqrt" {
+                a.fsqrt(0, 0)
+            } else if name == "abs" {
+                a.fsgnj(2, 0, 0, 0)
+            } else {
+                // through an int, for numbers that have a fraction (|x| < 2^52); bigger ones are whole already
+                let big = a.label()
+                let done = a.label()
+                a.li(rv.T1, 0x4330000000000000)      // 2^52
+                a.fmv_dx(1, rv.T1)
+                a.fsgnj(2, 2, 0, 0)                  // f2 = |x|
+                a.fcmp(1, rv.T2, 2, 1)               // |x| < 2^52 ?
+                a.jump_if_zero(rv.T2, big)
+                a.fcvt_ld(rv.T0, 0, if name == "floor" { 2 } else if name == "ceil" { 3 } else { 4 })
+                a.fcvt_dl(1, rv.T0)
+                a.fsgnj(0, 0, 1, 0)                  // keep the sign (-0.5.ceil() is -0.0)
+                a.place(big)
+                a.place(done)
+            }
+            a.fmv_xd(rv.A0, 0)
+            return "float"
         }
         if ot.starts_with("[") {
             let et = elem(ot)
@@ -2096,6 +2255,33 @@ const STR_METHODS = [
     ["count", "int", "str"],
     ["reverse", "str"],
 ]
+
+// a double's IEEE 754 bits (the host has no bit casts: frexp by hand; halving and doubling are exact)
+fn float_bits(x: float) -> int {
+    if x != x { return 0x7ff8000000000000 }
+    var sign = 0
+    var v = x
+    if v < 0.0 || (v == 0.0 && 1.0 / v < 0.0) {
+        sign = 1 << 63
+        v = -v
+    }
+    if v == 0.0 { return sign }
+    if v > 1.7976931348623157e308 { return sign | 0x7ff0000000000000 }
+    var e = 0
+    while v >= 2.0 {
+        v = v / 2.0
+        e += 1
+    }
+    while v < 1.0 && e > -1022 {
+        v = v * 2.0
+        e -= 1
+    }
+    if v < 1.0 {
+        // subnormal: no hidden bit
+        return sign | int(v * 4503599627370496.0)
+    }
+    return sign | (e + 1023) << 52 | int((v - 1.0) * 4503599627370496.0)
+}
 
 fn elem(ty: str) -> str {
     if ty.starts_with("[") && ty.ends_with("]") { return ty.slice(1, ty.len() - 1) }

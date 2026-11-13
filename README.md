@@ -526,15 +526,15 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
   message and nothing else. From the shell: `run hello.st`, `cc game.st -o game` then `run game`, `ps`,
   `kill <pid>`. Example programs are in `/home/examples` (a game, bouncing balls, a sketch pad, music, files).
   - **The language** is stellang, the parts a one-file program needs: `fn`, `struct` with fields, defaults and
-    methods, `const`/`let`/`var`, `int`/`bool`/`str` and lists (`[int]`, `[[str]]`, `[Point]`), `if`/`else` (also
+    methods, `const`/`let`/`var`, `int`/`float`/`bool`/`str` and lists (`[int]`, `[[str]]`, `[Point]`), `if`/`else` (also
     as a value), `while`, `for x in list`, `for i, x in list`, `for i in a..b`, `match`, `break`/`continue`,
     string interpolation, the string and list methods (`len slice find contains split lines chars upper lower
-    trim replace repeat`; `push pop insert remove slice contains index_of sort reverse join sum`). Not yet:
-    floats, `T?`/`T!`, enums, closures, generics, imports. Every index is checked, division by zero is caught,
+    trim replace repeat`; `push pop insert remove slice contains index_of sort reverse join sum`; floats'
+    `sqrt floor ceil round abs`, `int(x)` and `float(x)`). Not yet: `T?`/`T!`, enums, closures, generics, imports. Every index is checked, division by zero is caught,
     runtime errors name their line, and memory is garbage-collected (a mark-and-sweep collector, also written
     in the language).
-  - **Built in**: `print println input read_line sleep now_ms random exit max min abs parse_int is_number char
-    pid user gc_count memory_used`,
+  - **Built in**: `print println input read_line sleep now_ms random exit max min abs parse_int parse_float
+    is_number char pid user gc_count memory_used`, math (`sin cos tan atan atan2 exp log pow sqrt PI E`),
     files (`read_file write_file file_exists`: as the program's user, relative to their home), graphics
     (`window clear rect circle line text big_text mono_text text_width show key mouse_x mouse_y mouse_down rgb`)
     and sound (`beep(hz, ms)`, `note("A4")`). The runtime behind them (strings, lists, printing, the system
@@ -628,7 +628,7 @@ fn main() {
   is `src/runtime_klibc.c`; the fonts are pre-rendered glyphs (`tools/genfont.py`); nothing else is linked.
 - The embedded userland (`userland.st`: the programs' runtime and the examples) is made from
   `examples/stellaos/userland/` by `tools/genuserland.py`.
-- Next: images (PNG, JPEG), floats and closures in the compiler, more harts.
+- Next: images (PNG, JPEG), enums and closures in the compiler, more harts.
 
 ## Editor support
 

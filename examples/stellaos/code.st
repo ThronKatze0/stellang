@@ -38,11 +38,12 @@ const STATUS_H = 22
 const SIDE_W = 190
 
 const KEYWORDS = ["fn", "struct", "const", "let", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "match", "true", "false", "self"]
-const TYPES = ["int", "bool", "str", "void"]
+const TYPES = ["int", "bool", "str", "void", "float"]
 const BUILTINS = ["print", "println", "input", "read_line", "sleep", "now_ms", "random", "exit", "max", "min", "abs",
     "parse_int", "is_number", "char", "window", "clear", "rect", "circle", "line", "text", "big_text", "mono_text",
     "text_width", "show", "key", "mouse_x", "mouse_y", "mouse_down", "beep", "note", "read_file", "write_file",
-    "file_exists", "pid", "user", "rgb", "gc_count", "memory_used"]
+    "file_exists", "pid", "user", "rgb", "gc_count", "memory_used", "sin", "cos", "tan", "atan", "atan2",
+    "exp", "log", "pow", "sqrt", "floor", "parse_float", "float", "int"]
 
 // what the editor needs from the system
 struct Env {

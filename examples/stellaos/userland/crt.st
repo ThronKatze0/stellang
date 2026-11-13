@@ -675,6 +675,7 @@ fn __l_show(l: int, kind: int) -> str {
         if kind == 0 { s = __int_str(v) }
         if kind == 1 { s = "\"" + __str(v) + "\"" }
         if kind == 2 { s = __bool_str(v != 0) }
+        if kind == 3 { s = __float_str(__float(v)) }
         __l_push(parts, __int(s))
         i += 1
     }
@@ -684,6 +685,7 @@ fn __l_show(l: int, kind: int) -> str {
 fn __l_int_str(l: int) -> str { return __l_show(l, 0) }
 fn __l_str_str(l: int) -> str { return __l_show(l, 1) }
 fn __l_bool_str(l: int) -> str { return __l_show(l, 2) }
+fn __l_float_str(l: int) -> str { return __l_show(l, 3) }
 
 // ---- the built-in functions ----
 
@@ -896,4 +898,284 @@ fn note(name: str) -> int {
         oct += 1
     }
     return hz
+}
+
+// ---- floats ----
+
+const PI = 3.141592653589793
+const E = 2.718281828459045
+
+// up to 15 significant digits, the way stellang prints them: 3.14, 2.0, 1e+21, 0.001
+fn __float_str(x: float) -> str {
+    if x != x { return "NaN" }
+    if x > 1.7976931348623157e308 { return "inf" }
+    if x < -1.7976931348623157e308 { return "-inf" }
+    if x == 0.0 {
+        if __int(x) != 0 { return "-0.0" }
+        return "0.0"
+    }
+    var v = x
+    var sign = ""
+    if v < 0.0 {
+        sign = "-"
+        v = -v
+    }
+    // the decimal exponent, then 15 digits
+    var e = 0
+    var probe = v
+    while probe >= 10.0 {
+        probe = probe / 10.0
+        e += 1
+    }
+    while probe < 1.0 {
+        probe = probe * 10.0
+        e -= 1
+    }
+    let scaled = __pow10(v, 14 - e)
+    var digits = int(scaled.round())
+    if digits >= 1000000000000000 {
+        digits = digits / 10
+        e += 1
+    }
+    var ds = __int_str(digits)
+    // trailing zeros go
+    var end = ds.len()
+    while end > 1 && ds[end - 1] == "0" { end -= 1 }
+    ds = ds.slice(0, end)
+    if e >= 15 || e < -5 {
+        var m = ds.slice(0, 1)
+        if ds.len() > 1 { m = m + "." + ds.slice(1, ds.len()) }
+        var es = __int_str(abs(e))
+        if es.len() < 2 { es = "0" + es }
+        return sign + m + "e" + (if e < 0 { "-" } else { "+" }) + es
+    }
+    if e < 0 {
+        return sign + "0." + "0".repeat(-e - 1) + ds
+    }
+    if ds.len() <= e + 1 {
+        return sign + ds + "0".repeat(e + 1 - ds.len()) + ".0"
+    }
+    return sign + ds.slice(0, e + 1) + "." + ds.slice(e + 1, ds.len())
+}
+
+// v x 10^k, with as few roundings as can be
+fn __pow10(v: float, k: int) -> float {
+    var p = 1.0
+    var b = 10.0
+    var n = abs(k)
+    while n > 0 {
+        if n % 2 == 1 { p = p * b }
+        b = b * b
+        n = n / 2
+    }
+    if k < 0 { return v / p }
+    return v * p
+}
+
+fn sqrt(x: float) -> float { return x.sqrt() }
+fn floor(x: float) -> float { return x.floor() }
+fn fabs(x: float) -> float { return x.abs() }
+
+// the number in s ("3.5", "-2", "1e3"), or 0.0 if there is none
+fn parse_float(s: str) -> float {
+    let t = __s_trim(s)
+    let n = t.len()
+    var i = 0
+    var neg = false
+    if n > 0 && (t[0] == "-" || t[0] == "+") {
+        neg = t[0] == "-"
+        i = 1
+    }
+    var m = 0.0
+    var any = false
+    while i < n && t.byte(i) >= 48 && t.byte(i) <= 57 {
+        m = m * 10.0 + float(t.byte(i) - 48)
+        i += 1
+        any = true
+    }
+    var scale = 0
+    if i < n && t[i] == "." {
+        i += 1
+        while i < n && t.byte(i) >= 48 && t.byte(i) <= 57 {
+            m = m * 10.0 + float(t.byte(i) - 48)
+            scale -= 1
+            i += 1
+            any = true
+        }
+    }
+    if !any { return 0.0 }
+    if i < n && (t[i] == "e" || t[i] == "E") {
+        i += 1
+        var es = 1
+        if i < n && (t[i] == "-" || t[i] == "+") {
+            if t[i] == "-" { es = -1 }
+            i += 1
+        }
+        var ev = 0
+        while i < n && t.byte(i) >= 48 && t.byte(i) <= 57 {
+            ev = min(ev * 10 + t.byte(i) - 48, 1000)
+            i += 1
+        }
+        scale += es * ev
+    }
+    if i != n { return 0.0 }
+    let v = __pow10(m, scale)
+    if neg { return -v }
+    return v
+}
+
+// sin and cos: down to [-pi/4, pi/4], then their series
+fn __reduce(x: float) -> [float] {
+    // x = q * pi/2 + r
+    let q = (x / (PI / 2.0)).round()
+    let r = x - q * (PI / 2.0)
+    return [r, q - 4.0 * (q / 4.0).floor()]
+}
+
+fn __sin_series(r: float) -> float {
+    let r2 = r * r
+    return r * (1.0 - r2 / 6.0 * (1.0 - r2 / 20.0 * (1.0 - r2 / 42.0 * (1.0 - r2 / 72.0 * (1.0 - r2 / 110.0 * (1.0 - r2 / 156.0 * (1.0 - r2 / 210.0 * (1.0 - r2 / 272.0))))))))
+}
+
+fn __cos_series(r: float) -> float {
+    let r2 = r * r
+    return 1.0 - r2 / 2.0 * (1.0 - r2 / 12.0 * (1.0 - r2 / 30.0 * (1.0 - r2 / 56.0 * (1.0 - r2 / 90.0 * (1.0 - r2 / 132.0 * (1.0 - r2 / 182.0 * (1.0 - r2 / 240.0)))))))
+}
+
+fn sin(x: float) -> float {
+    let rq = __reduce(x)
+    let r = rq[0]
+    let q = int(rq[1])
+    if q == 0 { return __sin_series(r) }
+    if q == 1 { return __cos_series(r) }
+    if q == 2 { return -__sin_series(r) }
+    return -__cos_series(r)
+}
+
+fn cos(x: float) -> float {
+    let rq = __reduce(x)
+    let r = rq[0]
+    let q = int(rq[1])
+    if q == 0 { return __cos_series(r) }
+    if q == 1 { return -__sin_series(r) }
+    if q == 2 { return -__cos_series(r) }
+    return __sin_series(r)
+}
+
+fn tan(x: float) -> float { return sin(x) / cos(x) }
+
+// atan: small arguments by the series, the rest by identities
+fn atan(x: float) -> float {
+    if x < 0.0 { return -atan(-x) }
+    if x > 1.0 { return PI / 2.0 - atan(1.0 / x) }
+    if x > 0.2679491924311227 {
+        // atan(x) = pi/6 + atan((x*sqrt3 - 1) / (x + sqrt3))
+        let s3 = 1.7320508075688772
+        return PI / 6.0 + atan((x * s3 - 1.0) / (x + s3))
+    }
+    let x2 = x * x
+    var term = x
+    var sum = x
+    var k = 1
+    while k < 30 {
+        term = -term * x2
+        sum = sum + term / float(2 * k + 1)
+        k += 1
+    }
+    return sum
+}
+
+fn atan2(y: float, x: float) -> float {
+    if x > 0.0 { return atan(y / x) }
+    if x < 0.0 {
+        if y >= 0.0 { return atan(y / x) + PI }
+        return atan(y / x) - PI
+    }
+    if y > 0.0 { return PI / 2.0 }
+    if y < 0.0 { return -PI / 2.0 }
+    return 0.0
+}
+
+// e^x: 2^k e^r with |r| <= ln2/2
+fn exp(x: float) -> float {
+    if x > 709.0 { return 1.0 / 0.0 }
+    if x < -745.0 { return 0.0 }
+    let ln2 = 0.6931471805599453
+    let k = (x / ln2).round()
+    let r = x - k * ln2
+    var term = 1.0
+    var sum = 1.0
+    var i = 1
+    while i < 20 {
+        term = term * r / float(i)
+        sum = sum + term
+        i += 1
+    }
+    // times 2^k, through the exponent bits
+    let ki = int(k)
+    if ki > 1000 || ki < -1000 { return sum * __pow2(ki) }
+    return sum * __float((ki + 1023) << 52)
+}
+
+fn __pow2(k: int) -> float {
+    var p = 1.0
+    var n = k
+    while n > 0 {
+        p = p * 2.0
+        n -= 1
+    }
+    while n < 0 {
+        p = p / 2.0
+        n += 1
+    }
+    return p
+}
+
+// the natural logarithm: x = m 2^e, ln m by atanh's series
+fn log(x: float) -> float {
+    if x <= 0.0 {
+        if x == 0.0 { return -1.0 / 0.0 }
+        return 0.0 / 0.0
+    }
+    let bits = __int(x)
+    var e = ((bits >> 52) & 2047) - 1023
+    var m = __float((bits & 4503599627370495) | 4607182418800017408)   // the mantissa, in [1, 2)
+    if e == -1023 {
+        // a tiny (subnormal) number
+        return log(x * 4503599627370496.0) - 36.04365338911715
+    }
+    if m > 1.4142135623730951 {
+        m = m / 2.0
+        e += 1
+    }
+    let t = (m - 1.0) / (m + 1.0)
+    let t2 = t * t
+    var term = t
+    var sum = 0.0
+    var k = 1
+    while k < 40 {
+        sum = sum + term / float(k)
+        term = term * t2
+        k += 2
+    }
+    return 2.0 * sum + float(e) * 0.6931471805599453
+}
+
+fn pow(x: float, y: float) -> float {
+    if y == 0.0 { return 1.0 }
+    // whole powers: by squaring (exact where it can be, negative bases too)
+    if y == y.floor() && y.abs() < 1000000.0 {
+        var n = int(y.abs())
+        var p = 1.0
+        var b = x
+        while n > 0 {
+            if n % 2 == 1 { p = p * b }
+            b = b * b
+            n = n / 2
+        }
+        if y < 0.0 { return 1.0 / p }
+        return p
+    }
+    if x < 0.0 { return 0.0 / 0.0 }
+    return exp(y * log(x))
 }

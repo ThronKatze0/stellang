@@ -97,6 +97,16 @@ struct Asm {
     fn sd(self, rs: int, base: int, off: int) { self.emit(s(3, base, rs, off)) }
     fn sb(self, rs: int, base: int, off: int) { self.emit(s(0, base, rs, off)) }
 
+    // floating point (doubles), f0/f1 as scratch: values travel in integer registers as their bits
+    fn fmv_dx(self, fd: int, rs: int) { self.emit(r(0x53, fd, 0, rs, 0, 0x79)) }
+    fn fmv_xd(self, rd: int, fs: int) { self.emit(r(0x53, rd, 0, fs, 0, 0x71)) }
+    fn fop(self, f7: int, fd: int, a: int, b2: int) { self.emit(r(0x53, fd, 7, a, b2, f7)) }   // fadd 0x01, fsub 0x05, fmul 0x09, fdiv 0x0d
+    fn fsqrt(self, fd: int, a: int) { self.emit(r(0x53, fd, 7, a, 0, 0x2d)) }
+    fn fsgnj(self, f3: int, fd: int, a: int, b2: int) { self.emit(r(0x53, fd, f3, a, b2, 0x11)) }  // 1: neg, 2: abs
+    fn fcmp(self, f3: int, rd: int, a: int, b2: int) { self.emit(r(0x53, rd, f3, a, b2, 0x51)) }   // 2 eq, 1 lt, 0 le
+    fn fcvt_ld(self, rd: int, fs: int, rm: int) { self.emit(r(0x53, rd, rm, fs, 2, 0x61)) }       // rm 1: toward 0, 2: down, 3: up, 4: nearest
+    fn fcvt_dl(self, fd: int, rs: int) { self.emit(r(0x53, fd, 7, rs, 2, 0x69)) }
+
     fn push(self, rs: int) {
         self.addi(SP, SP, -8)
         self.sd(rs, SP, 0)

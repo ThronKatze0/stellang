@@ -7,6 +7,7 @@ import kernel
 import rv
 import proc
 import cc
+import userland
 
 extern fn st_k_byte(s: str, i: int) -> int
 
@@ -55,7 +56,8 @@ const PROGS = [
     ["j_spin.st", "fn main() {\n    var i = 0\n    while true { i += 1 }\n}\n"],
     ["k_mem.st", "fn main() {\n    var s = \"x\"\n    while true { s = s + s }\n}\n"],
     ["l_input.st", "fn main() {\n    let name = input(\"name? \")\n    println(\"hello \${name}!\")\n    let n = parse_int(read_line())\n    println(\"double: \${n * 2}\")\n}\n"],
-    ["m_gc.st", "struct Cell {\n    v: int,\n    tags: [str] = [],\n}\n\nfn churn(n: int) -> int {\n    var total = 0\n    for i in 0..n {\n        let s = \"item \${i} \" + \"x\".repeat(i % 20)\n        let parts = s.split(\" \")\n        total += parts.len() + s.len()\n    }\n    return total\n}\n\nfn main() {\n    var cells: [Cell] = []\n    for i in 0..5000 {\n        let c = Cell { v: i }\n        c.tags.push(\"t\${i}\")\n        cells.push(c)\n    }\n    let t = churn(60000)\n    var sum = 0\n    var ok = true\n    for i, c in cells {\n        sum += c.v\n        if c.tags[0] != \"t\${i}\" { ok = false }\n    }\n    println(\"churn \${t} sum \${sum} intact \${ok}\")\n    println(\"collections \${gc_count() > 3} bounded \${memory_used() < 3000000}\")\n}\n"]
+    ["m_gc.st", "struct Cell {\n    v: int,\n    tags: [str] = [],\n}\n\nfn churn(n: int) -> int {\n    var total = 0\n    for i in 0..n {\n        let s = \"item \${i} \" + \"x\".repeat(i % 20)\n        let parts = s.split(\" \")\n        total += parts.len() + s.len()\n    }\n    return total\n}\n\nfn main() {\n    var cells: [Cell] = []\n    for i in 0..5000 {\n        let c = Cell { v: i }\n        c.tags.push(\"t\${i}\")\n        cells.push(c)\n    }\n    let t = churn(60000)\n    var sum = 0\n    var ok = true\n    for i, c in cells {\n        sum += c.v\n        if c.tags[0] != \"t\${i}\" { ok = false }\n    }\n    println(\"churn \${t} sum \${sum} intact \${ok}\")\n    println(\"collections \${gc_count() > 3} bounded \${memory_used() < 3000000}\")\n}\n"],
+    ["n_float.st", "struct Vec2 {\n    x: float,\n    y: float = 0.0,\n    fn len(self) -> float { return (self.x * self.x + self.y * self.y).sqrt() }\n}\n\nfn main() {\n    println(1.0)\n    println(3.14)\n    println(0.1 + 0.2)\n    println(1.0 / 3.0)\n    println(1e21)\n    println(-2.5)\n    println(100000000.0)\n    println(2.0.sqrt())\n    println(10.0 / 4.0)\n    println(0.001)\n    println(1.5e-7)\n    let v = Vec2 { x: 3.0, y: 4 }\n    println(\"len \${v.len()} half \${v.len() / 2}\")\n    var f = 1.5\n    f += 1\n    f *= 2.0\n    println(\"f=\${f} int=\${int(f)} float=\${float(7)} floor=\${(-2.5).floor()} ceil=\${2.1.ceil()} round=\${2.5.round()} abs=\${(-3.25).abs()}\")\n    println(\"\${f > 4.9} \${f == 5.0} \${1 < 1.5} \${2.0 >= 2}\")\n    println(\"sin \${sin(PI / 6)} cos \${cos(PI / 3)} tan \${tan(PI / 4)}\")\n    println(\"atan2 \${atan2(1.0, 1.0) * 4.0} exp \${exp(1.0)} log \${log(E)} pow \${pow(2.0, 10.0)} \${pow(2.0, 0.5)}\")\n    println(\"parse \${parse_float(\" -12.5e1 \")} \${parse_float(\"x\")}\")\n    let xs: [float] = [0.5, 1.25]\n    println(xs)\n    var acc = 0.0\n    for i in 0..1000000 { acc += 0.000001 }\n    println(acc)\n}\n"]
 ]
 
 fn main() {
@@ -151,6 +153,15 @@ fn main() {
         let p = start(ps, "exe", img, true)
     }
     println("exe parse of junk: ${cc.exe_parse("#!stella-exe 1 4096 16\nzz") == none}")
+    // every example program a fresh system gets compiles
+    for pr in userland.programs() {
+        let r = cc.compile(pr[1], () => kernel.uptime())
+        if r.errors.is_empty() {
+            println("example ${pr[0]} compiles")
+        } else {
+            println("example ${pr[0]}: ${r.errors[0].line}:${r.errors[0].col}: ${r.errors[0].msg}")
+        }
+    }
     println("done")
     kernel.shutdown(0)
 }
