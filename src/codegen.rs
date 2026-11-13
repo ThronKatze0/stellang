@@ -26,10 +26,8 @@ pub const RESERVED: &[&str] = &[
     "abs", "some", "none", "to_json", "self", "sleep", "now_ms", "url_encode",
 ];
 
-/// Signatures of the builtins that have a fixed one, for hover.
+/// Signatures of the newer builtins, for hover.
 const BUILTIN_SIGS: &[(&str, &str)] = &[
-    ("env", "fn env(name: str) -> str"),
-    ("panic", "fn panic(msg: str)"),
     ("sleep", "fn sleep(ms: int)"),
     ("now_ms", "fn now_ms() -> int"),
     ("url_encode", "fn url_encode(s: str) -> str"),

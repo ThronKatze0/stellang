@@ -1009,6 +1009,7 @@ Vec *st_fetch(const char *method, const char *url, Vec *headers, const char *bod
         curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, (long)timeout_ms);
         curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, (long)timeout_ms);
     }
+    // libcurl ignores these (the curl tool doesn't); networks with TLS inspection need them
     const char *ca = getenv("CURL_CA_BUNDLE");
     if (!ca || !*ca) ca = getenv("SSL_CERT_FILE");
     if (ca && *ca) curl_easy_setopt(c, CURLOPT_CAINFO, ca);
@@ -1036,7 +1037,7 @@ Vec *st_fetch(const char *method, const char *url, Vec *headers, const char *bod
         return out;
     }
     st_vec_push_str(out, st_itoa(status));
-    st_vec_push_str(out, got.p);
+    st_vec_push_str(out, got.p); // shortcut: str is NUL-terminated, so binary bodies get cut; add a byte type if one is ever needed
     for (int64_t i = 0; i < hs->len; i++) st_vec_push_str(out, ((char **)hs->data)[i]);
     return out;
 }

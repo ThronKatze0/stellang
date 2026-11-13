@@ -22,7 +22,8 @@
 //     let user = r.json()?
 //     let made = http.request("POST", url, {"Content-Type": "application/json"}, to_json(user))?
 //
-// fetch blocks until the answer is there (at most `timeout_ms`), the server's event loop included.
+// shortcut: fetch blocks until the answer is there (at most `timeout_ms`), the server's event loop included;
+// move to libcurl's multi interface inside the poll loop once handlers need fetches side by side.
 
 import net
 import json
