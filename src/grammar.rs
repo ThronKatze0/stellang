@@ -6,7 +6,7 @@ use crate::codegen::RESERVED;
 use crate::lexer::{Tok, EMOJI, WORDS};
 
 /// Keywords that introduce declarations; every other keyword is control flow.
-const DECLARE: &[&str] = &["fn", "struct", "enum", "const", "impl", "extern", "import", "let", "var"];
+const DECLARE: &[&str] = &["fn", "struct", "enum", "trait", "const", "impl", "extern", "import", "let", "var"];
 const TYPES: &[&str] = &["int", "float", "bool", "str", "void"];
 const CONSTANTS: &[&str] = &["true", "false", "none"];
 
@@ -78,6 +78,7 @@ pub fn textmate() -> String {
         caps(format!("({})\\s+({ident})", kw(Tok::Fn)), &["storage.type.function.stellang", "entity.name.function.declaration.stellang"]),
         caps(format!("({})\\s+({ident})", kw(Tok::Struct)), &["storage.type.struct.stellang", "entity.name.type.struct.stellang"]),
         caps(format!("({})\\s+({ident})", kw(Tok::Enum)), &["storage.type.enum.stellang", "entity.name.type.enum.stellang"]),
+        caps(format!("({})\\s+({ident})", kw(Tok::Trait)), &["storage.type.trait.stellang", "entity.name.type.trait.stellang"]),
         caps(format!("({})\\s+({ident})", kw(Tok::Const)), &["storage.modifier.const.stellang", "variable.other.constant.declaration.stellang"]),
         caps(format!("({})\\s+({lower})", kw(Tok::Var)), &["storage.modifier.mut.stellang", "variable.other.mutable.declaration.stellang"]),
         caps(format!("({})\\s+({lower})", kw(Tok::Let)), &["storage.type.let.stellang", "variable.other.readonly.declaration.stellang"]),

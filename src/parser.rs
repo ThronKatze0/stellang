@@ -17,6 +17,8 @@ pub enum Type {
     Fn(Vec<Type>, Box<Type>), // fn(A, B) -> R
     Result(Box<Type>),       // T!  = a T or an error message
     Opt(Box<Type>),          // T?  = a T or `none`
+    Generic(String, Vec<Type>), // Box<int>: a generic type applied to arguments (resolved to a Struct/Enum instance)
+    Node,                    // a JSX element (an HTML fragment on the server, a DOM node in the browser)
 }
 
 impl fmt::Display for Type {
@@ -33,6 +35,11 @@ impl fmt::Display for Type {
             Type::Opt(t) => write!(f, "{t}?"),
             Type::List(t) => write!(f, "[{t}]"),
             Type::Result(t) => write!(f, "{t}!"),
+            Type::Node => write!(f, "Node"),
+            Type::Generic(n, args) => {
+                let a: Vec<String> = args.iter().map(|t| t.to_string()).collect();
+                write!(f, "{n}<{}>", a.join(", "))
+            }
             Type::Fn(ps, r) => {
                 let ps: Vec<String> = ps.iter().map(|p| p.to_string()).collect();
                 write!(f, "fn({})", ps.join(", "))?;
@@ -74,6 +81,7 @@ pub enum Cond {
     Let(Pat, Expr),
 }
 
+#[derive(Clone)]
 pub struct Arm {
     pub pat: Pat,
     pub guard: Option<Expr>,
@@ -136,8 +144,17 @@ pub enum Stmt {
     Continue(Pos),
 }
 
+/// `T` or `T: Show + Eq` in `fn f<...>` / `struct Box<...>`.
+#[derive(Clone, Debug)]
+pub struct TParam {
+    pub name: String,
+    pub bounds: Vec<String>,
+}
+
+#[derive(Clone)]
 pub struct Func {
     pub name: String,
+    pub tparams: Vec<TParam>,
     pub params: Vec<(String, Option<Type>)>, // only `self` may omit its type
     pub ret: Type,
     pub body: Vec<Stmt>,
@@ -151,12 +168,15 @@ pub struct Field {
     pub default: Option<Expr>,
 }
 
+#[derive(Clone)]
 pub struct StructDef {
     pub name: String,
+    pub tparams: Vec<TParam>,
     pub fields: Vec<Field>,
     pub pos: Pos,
 }
 
+#[derive(Clone)]
 pub struct Variant {
     pub name: String,
     pub fields: Vec<Field>, // tuple variants get the names "0", "1", ... unless named
@@ -164,8 +184,10 @@ pub struct Variant {
     pub pos: Pos,
 }
 
+#[derive(Clone)]
 pub struct EnumDef {
     pub name: String,
+    pub tparams: Vec<TParam>,
     pub variants: Vec<Variant>,
     pub pos: Pos,
 }
@@ -179,7 +201,15 @@ pub struct Const {
 
 pub struct Impl {
     pub name: String,
+    pub trait_: Option<String>, // `impl Show for Point`
     pub methods: Vec<Func>,
+    pub pos: Pos,
+}
+
+/// `trait Show { fn show(self) -> str; fn twice(self) -> str { ... } }`
+pub struct Trait {
+    pub name: String,
+    pub methods: Vec<(Func, bool)>, // (method, has a default body)
     pub pos: Pos,
 }
 
@@ -197,6 +227,7 @@ pub struct Module {
     pub enums: Vec<EnumDef>,
     pub consts: Vec<Const>,
     pub impls: Vec<Impl>,
+    pub traits: Vec<Trait>,
     pub funcs: Vec<Func>,
     pub externs: Vec<Extern>,
     /// (token index, opens?) for every block brace; `stellang fmt` uses it to tell ⭐ apart
@@ -220,14 +251,14 @@ pub fn parse(toks: Vec<Token>) -> P<Module> {
             Tok::Struct => {
                 let (s, methods) = p.structdef()?;
                 if !methods.is_empty() {
-                    m.impls.push(Impl { name: s.name.clone(), methods, pos: s.pos });
+                    m.impls.push(Impl { name: s.name.clone(), trait_: None, methods, pos: s.pos });
                 }
                 m.structs.push(s);
             }
             Tok::Enum => {
                 let (e, methods) = p.enumdef()?;
                 if !methods.is_empty() {
-                    m.impls.push(Impl { name: e.name.clone(), methods, pos: e.pos });
+                    m.impls.push(Impl { name: e.name.clone(), trait_: None, methods, pos: e.pos });
                 }
                 m.enums.push(e);
             }
@@ -242,7 +273,12 @@ pub fn parse(toks: Vec<Token>) -> P<Module> {
             Tok::Impl => {
                 let pos = p.pos();
                 p.next();
-                let name = p.ident()?;
+                let mut name = p.impl_name()?;
+                let mut trait_ = None;
+                if p.eat(&Tok::For) {
+                    trait_ = Some(name);
+                    name = p.impl_name()?;
+                }
                 p.open()?;
                 let mut methods = vec![];
                 loop {
@@ -253,7 +289,23 @@ pub fn parse(toks: Vec<Token>) -> P<Module> {
                     }
                     methods.push(p.func(true)?);
                 }
-                m.impls.push(Impl { name, methods, pos });
+                m.impls.push(Impl { name, trait_, methods, pos });
+            }
+            Tok::Trait => {
+                let pos = p.pos();
+                p.next();
+                let name = p.ident()?;
+                p.open()?;
+                let mut methods = vec![];
+                loop {
+                    p.nl();
+                    if p.closes() { break }
+                    if *p.peek() != Tok::Fn {
+                        return p.fail(format!("expected `fn` inside trait, found {}", p.peek()));
+                    }
+                    methods.push(p.func_decl()?);
+                }
+                m.traits.push(Trait { name, methods, pos });
             }
             Tok::Extern => {
                 let pos = p.pos();
@@ -269,7 +321,7 @@ pub fn parse(toks: Vec<Token>) -> P<Module> {
                 m.braces = p.braces;
                 return Ok(m);
             }
-            t => return p.fail(format!("expected `fn`, `struct`, `enum`, `impl`, `const` or `import`, found {t}")),
+            t => return p.fail(format!("expected `fn`, `struct`, `enum`, `trait`, `impl`, `const` or `import`, found {t}")),
         }
     }
 }
@@ -416,8 +468,16 @@ impl Parser {
                 "bool" => Type::Bool,
                 "str" => Type::Str,
                 "void" => Type::Void,
-                _ if self.eat(&Tok::Dot) => Type::Struct(format!("{name}.{}", self.ident()?)),
-                _ => Type::Struct(name),
+                _ => {
+                    let name = if self.eat(&Tok::Dot) { format!("{name}.{}", self.ident()?) } else { name };
+                    if name == "Node" {
+                        Type::Node
+                    } else if *self.peek() == Tok::Lt {
+                        Type::Generic(name, self.type_args()?)
+                    } else {
+                        Type::Struct(name)
+                    }
+                }
             }
         };
         let mut t = t;
@@ -432,6 +492,57 @@ impl Parser {
         }
     }
 
+    /// `<int, str>` after a generic type's name.
+    fn type_args(&mut self) -> P<Vec<Type>> {
+        self.expect(Tok::Lt)?;
+        let mut v = vec![];
+        loop {
+            v.push(self.ty()?);
+            if self.eat(&Tok::Comma) { continue }
+            // `Box<int>= x` lexes as `>=`: take the `>` and leave a `=`
+            if *self.peek() == Tok::Ge {
+                self.toks[self.i].tok = Tok::Assign;
+                return Ok(v);
+            }
+            self.expect(Tok::Gt)?;
+            return Ok(v);
+        }
+    }
+
+    /// `<T, U: Show + Eq>` after a function or type name (or nothing).
+    fn tparams(&mut self) -> P<Vec<TParam>> {
+        if !self.eat(&Tok::Lt) {
+            return Ok(vec![]);
+        }
+        let mut v: Vec<TParam> = vec![];
+        loop {
+            let name = self.ident()?;
+            let mut bounds = vec![];
+            if self.eat(&Tok::Colon) {
+                loop {
+                    let mut b = self.ident()?;
+                    if self.eat(&Tok::Dot) { b = format!("{b}.{}", self.ident()?) }
+                    bounds.push(b);
+                    if !self.eat(&Tok::Plus) { break }
+                }
+            }
+            v.push(TParam { name, bounds });
+            if self.eat(&Tok::Comma) { continue }
+            self.expect(Tok::Gt)?;
+            return Ok(v);
+        }
+    }
+
+    /// The type named after `impl` / `for`: `Point`, `Box<T>` (the arguments just repeat the type's parameters), `int`.
+    fn impl_name(&mut self) -> P<String> {
+        let mut name = self.ident()?;
+        if self.eat(&Tok::Dot) { name = format!("{name}.{}", self.ident()?) }
+        if *self.peek() == Tok::Lt {
+            self.type_args()?;
+        }
+        Ok(name)
+    }
+
     /// `name: Type`, or a bare `self` when `allow_self`.
     fn param(&mut self, allow_self: bool) -> P<(String, Option<Type>)> {
         let n = self.ident()?;
@@ -443,9 +554,26 @@ impl Parser {
     }
 
     fn func(&mut self, method: bool) -> P<Func> {
+        let mut f = self.signature(method)?;
+        f.body = self.block()?;
+        Ok(f)
+    }
+
+    /// A trait method: a signature, with or without a default body.
+    fn func_decl(&mut self) -> P<(Func, bool)> {
+        let mut f = self.signature(true)?;
+        if self.at_open() {
+            f.body = self.block()?;
+            return Ok((f, true));
+        }
+        Ok((f, false))
+    }
+
+    fn signature(&mut self, method: bool) -> P<Func> {
         let pos = self.pos();
         self.next();
         let name = self.ident()?;
+        let tparams = self.tparams()?;
         self.expect(Tok::LParen)?;
         let mut first = method;
         let params = self.list(Tok::RParen, |p| {
@@ -454,7 +582,7 @@ impl Parser {
             r
         })?;
         let ret = if self.eat(&Tok::Arrow) { self.ty()? } else { Type::Void };
-        Ok(Func { name, params, ret, body: self.block()?, pos })
+        Ok(Func { name, tparams, params, ret, body: vec![], pos })
     }
 
     /// `name: Type` or `name: Type = default`.
@@ -493,14 +621,16 @@ impl Parser {
         let pos = self.pos();
         self.next();
         let name = self.ident()?;
+        let tparams = self.tparams()?;
         let (fields, methods) = self.body(|p| p.field())?;
-        Ok((StructDef { name, fields, pos }, methods))
+        Ok((StructDef { name, tparams, fields, pos }, methods))
     }
 
     fn enumdef(&mut self) -> P<(EnumDef, Vec<Func>)> {
         let pos = self.pos();
         self.next();
         let name = self.ident()?;
+        let tparams = self.tparams()?;
         let (variants, methods) = self.body(|p| {
             let pos = p.pos();
             let name = p.ident()?;
@@ -522,7 +652,7 @@ impl Parser {
                 Ok(Variant { name, fields: vec![], braces: false, pos })
             }
         })?;
-        Ok((EnumDef { name, variants, pos }, methods))
+        Ok((EnumDef { name, tparams, variants, pos }, methods))
     }
 
     fn block(&mut self) -> P<Vec<Stmt>> {

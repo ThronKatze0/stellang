@@ -737,6 +737,123 @@ fn main() -> void! {
     assert_eq!(left, "bob left");
 }
 
+#[test]
+fn generics_and_traits() {
+    let src = r##"
+trait Show {
+    fn show(self) -> str
+    fn loud(self) -> str { return self.show().upper() + "!" }
+}
+
+struct Point { x: int, y: int }
+impl Show for Point {
+    fn show(self) -> str { return "(${self.x}, ${self.y})" }
+}
+impl Show for int {
+    fn show(self) -> str { return "#${self}" }
+}
+
+struct Box<T> {
+    value: T
+
+    fn get(self) -> T { return self.value }
+    fn map<U>(self, f: fn(T) -> U) -> Box<U> { return Box { value: f(self.value) } }
+}
+
+struct Stack<T> {
+    items: [T] = []
+
+    fn new() -> Stack<T> { return Stack {} }
+    fn push(self, x: T) { self.items.push(x) }
+    fn pop(self) -> T? { return self.items.pop() }
+    fn len(self) -> int { return self.items.len() }
+}
+
+enum Tree<T> {
+    Leaf
+    Node(Tree<T>, T, Tree<T>)
+
+    fn size(self) -> int {
+        return match self {
+            .Leaf => 0,
+            .Node(l, _, r) => l.size() + 1 + r.size()
+        }
+    }
+}
+
+fn insert<T>(t: Tree<T>, x: T, less: fn(T, T) -> bool) -> Tree<T> {
+    return match t {
+        .Leaf => Tree.Node(.Leaf, x, .Leaf),
+        .Node(l, v, r) => if less(x, v) { Tree.Node(insert(l, x, less), v, r) } else { Tree.Node(l, v, insert(r, x, less)) }
+    }
+}
+
+fn walk<T>(t: Tree<T>, out: [T]) {
+    if let .Node(l, v, r) = t {
+        walk(l, out)
+        out.push(v)
+        walk(r, out)
+    }
+}
+
+fn first<T>(xs: [T]) -> T? {
+    if xs.is_empty() { return none }
+    return xs[0]
+}
+
+fn largest<T>(xs: [T]) -> T {
+    var best = xs[0]
+    for x in xs { if x > best { best = x } }
+    return best
+}
+
+fn all_shown<T: Show>(xs: [T]) -> str {
+    return xs.map(x => x.show()).join(" ")
+}
+
+fn pair<A, B>(a: A, b: B) -> Pair<A, B> { return Pair { a, b } }
+struct Pair<A, B> { a: A, b: B }
+
+fn main() {
+    let b = Box { value: 41 }
+    println(b.get() + 1)
+    let s = b.map(x => "n=${x}")
+    println(s.value)
+    let st: Stack<str> = Stack.new()
+    st.push("a")
+    st.push("b")
+    println(st.len())
+    println(st.pop() ?? "?")
+    var t: Tree<int> = .Leaf
+    for x in [5, 2, 8, 1, 9] { t = insert(t, x, (a, b) => a < b) }
+    println(t.size())
+    let out: [int] = []
+    walk(t, out)
+    println(out)
+    println(first(["x", "y"]) ?? "none")
+    println(largest([3.5, 9.25, 1.0]))
+    println(largest(["pear", "apple"]))
+    println(all_shown([Point { x: 1, y: 2 }, Point { x: 3, y: 4 }]))
+    println(all_shown([1, 2]))
+    println(Point { x: 0, y: 0 }.loud())
+    let p = pair(1, "one")
+    println(p)
+    println(b)
+}
+"##;
+    ok("generics", src, "42\nn=41\n2\nb\n5\n[1, 2, 5, 8, 9]\nx\n9.25\npear\n(1, 2) (3, 4)\n#1 #2\n(0, 0)!\nPair { a: 1, b: \"one\" }\nBox { value: 41 }\n");
+    let bad = |src: &str, msg: &str| {
+        let (code, _, err) = run("generics-bad", src);
+        assert_eq!(code, -1);
+        assert!(err.contains(msg), "{err}");
+    };
+    bad("trait Show { fn show(self) -> str }\nfn f<T: Show>(x: T) -> str { return x.show() }\nfn main() { println(f(1.5)) }", "float doesn't implement `Show`");
+    bad("struct Stack<T> { items: [T] = []\n fn new() -> Stack<T> { return Stack {} } }\nfn main() { let s = Stack.new() }", "can't tell what `T` is");
+    bad("struct Box<T> { v: T }\nfn main() { let b: Box = Box { v: 1 } }", "`Box` needs type arguments");
+    bad("fn bad<T>(x: T) -> T { return x.nope() }\nfn main() { bad(1) }", "(in `bad<int>`)");
+    bad("trait Show { fn show(self) -> str }\nstruct P {}\nimpl Show for P { }\nfn main() {}", "missing `fn show`");
+}
+
 /// The editor grammars are generated from the compiler's keyword table; the copies in `editors/`
 /// must match (regenerate with `stellang grammar textmate|vim`).
 #[test]

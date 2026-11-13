@@ -113,7 +113,7 @@ impl Gen {
         r.map(Some)
     }
 
-    fn variant_index(&self, k: &str, name: &str, pos: Pos) -> R<usize> {
+    pub(super) fn variant_index(&self, k: &str, name: &str, pos: Pos) -> R<usize> {
         match self.enums[k].iter().position(|v| v.name == name) {
             Some(i) => Ok(i),
             None => {
@@ -149,7 +149,7 @@ impl Gen {
     }
 
     /// What `Name { ... }` builds: `Point`, `geo.Point`, `Shape.Rect`, `geo.Shape.Rect` or `.Rect`.
-    pub(super) fn lit_target(&self, name: &str, want: Option<&Type>, pos: Pos) -> R<Lit> {
+    pub(super) fn lit_target(&mut self, name: &str, want: Option<&Type>, pos: Pos) -> R<Lit> {
         if let Some(v) = name.strip_prefix('.') {
             let Some(Type::Enum(k)) = peel_all(want) else {
                 return err(pos, format!("can't tell which enum `.{v}` belongs to; write `Type.{v} {{ ... }}`"));
@@ -163,16 +163,20 @@ impl Gen {
                 Some(_) => return None,
                 None => self.key(n),
             };
-            (self.structs.contains_key(&k) || self.enums.contains_key(&k)).then_some(k)
+            (self.structs.contains_key(&k) || self.enums.contains_key(&k) || self.gtypes.contains_key(&k)).then_some(k)
         };
+        let generic_enum = |k: &str| matches!(self.gtypes.get(k).map(|g| &g.def), Some(super::GDef::Enum(_)));
         if let Some(k) = as_type(name) {
-            if self.enums.contains_key(&k) {
+            if self.enums.contains_key(&k) || generic_enum(&k) {
                 return err(pos, format!("`{name}` is an enum; pick a variant: `{name}.Variant {{ ... }}`"));
             }
             return Ok(Lit::Struct(k));
         }
         if parts.len() >= 2 {
             let (prefix, v) = name.rsplit_once('.').unwrap();
+            if let Some(k) = as_type(prefix).filter(|k| generic_enum(k)) {
+                return Ok(Lit::GVariant(k, v.to_string()));
+            }
             if let Some(k) = as_type(prefix).filter(|k| self.enums.contains_key(k)) {
                 return Ok(Lit::Variant(k.clone(), self.variant_index(&k, v, pos)?));
             }
@@ -381,7 +385,7 @@ impl Gen {
                         self.tag_test(v, i, fail);
                         (self.enums[&k][i].fields.clone(), k, Some(i))
                     }
-                    Type::Struct(k) if k.rsplit('.').next() == Some(last) => (self.structs[k].clone(), k.clone(), None),
+                    Type::Struct(k) if super::generics::base_name(super::short_name(k)) == last => (self.structs[k].clone(), k.clone(), None),
                     _ => return mismatch(&format!("`{}`", path.join("."))),
                 };
                 for (f, sub) in fs {
@@ -418,7 +422,7 @@ impl Gen {
         }
         let prefix = path[..path.len() - 1].join(".");
         let key = if path.len() == 2 { self.key(&prefix) } else { prefix.clone() };
-        if key != k {
+        if key != super::generics::base_name(k) {
             return err(pos, format!("this pattern is for `{prefix}`, but the value is {k}"));
         }
         Ok(())
