@@ -701,7 +701,7 @@ struct Shell {
             wm.Launcher { name: "Notes", icon: "✎", color: 0xf0932b, open: () => notes.open(d, fs, "") },
             wm.Launcher { name: "Calculator", icon: "=", color: 0x6c5ce7, open: () => calculator.open(d) },
             wm.Launcher { name: "Browser", icon: "◎", color: 0x0984e3, open: () => self.browse("") },
-            wm.Launcher { name: "Monitor", icon: "◉", color: 0x00b894, open: () => monitor.open(d) },
+            wm.Launcher { name: "Monitor", icon: "◉", color: 0x00b894, open: () => monitor.open(d, self.procs, () => self.user) },
             wm.Launcher { name: "Snake", icon: "S", color: 0x10ac84, open: () => snake.open(d) },
             wm.Launcher { name: "Bricks", icon: "B", color: 0xff9f43, open: () => breakout.open(d) },
             wm.Launcher { name: "Mines", icon: "✹", color: 0x576574, open: () => mines.open(d) },

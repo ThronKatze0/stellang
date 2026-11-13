@@ -2102,8 +2102,8 @@ fn layout_inline(e: El, cx: int, cy: int, cw: int, u: Ui) -> int {
             x = 0
             continue
         }
-        if it.box && it.el.st.display == "block" {
-            // a block among inline content: its own line(s)
+        if it.box && !it.el.st.inline() && !it.el.st.atomic() {
+            // a block-level box (block, flex, grid, table, ...) among inline content: its own line(s)
             if !line.is_empty() {
                 y = finish_line(e, line, cx, y, cw, 0, u)
                 line = []

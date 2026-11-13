@@ -4,6 +4,7 @@ import web
 import ui
 import wm
 import kernel
+import proc
 
 const CSS = """
     .mon { padding: 14px; display: flex; flex-direction: column; gap: 12px; background: #f6f5fb; height: 100% }
@@ -15,6 +16,12 @@ const CSS = """
     progress { width: 100%; margin-bottom: 8px }
     .row { display: flex; gap: 8px }
     .row button { flex: 1 }
+    .proc { display: flex; align-items: center; gap: 8px; margin-bottom: 6px }
+    .pid { color: #8a879a; width: 28px }
+    .pname { flex: 1; font-weight: bold }
+    .pinfo { color: #8a879a; font-size: 12px }
+    .proc button { padding: 2px 8px; background: white; color: #c0392b; border: 1px solid #f0d4d4 }
+    .none { color: #8a879a }
 """
 
 fn size(n: int) -> str {
@@ -38,8 +45,10 @@ struct Stats {
     }
 }
 
-fn Monitor(d: wm.Desktop, stats: Stats) -> Node {
+fn Monitor(d: wm.Desktop, stats: Stats, procs: proc.Procs, who: fn() -> str) -> Node {
     let tick = signal(0)
+    let running = procs.running()
+    let me = who()
     let m = kernel.memory()
     let used = m.ram - m.free
     return <div class="mon">
@@ -52,6 +61,25 @@ fn Monitor(d: wm.Desktop, stats: Stats) -> Node {
             <div class="line"><span class="k">"Kernel image + stack"</span><span class="v">{size(m.kernel)}</span></div>
             <div class="line"><span class="k">"Device pages"</span><span class="v">{size(m.pages)}</span></div>
             <div class="line"><span class="k">"Garbage collections"</span><span class="v">{str(m.collections)}</span></div>
+        </div>
+        <div class="card">
+            <h3>"Programs"</h3>
+            if running.is_empty() {
+                <div class="none">"No programs running (write one in Code)"</div>
+            }
+            for p in running {
+                <div class="proc" key={str(p.pid)}>
+                    <span class="pid">{str(p.pid)}</span>
+                    <span class="pname">{p.name}</span>
+                    <span class="pinfo">"${p.user} · ${p.state} · ${p.cpu} ms"</span>
+                    if me == "root" || me == p.user {
+                        <button onclick={() => {
+                            p.kill("ended from the System Monitor")
+                            tick.set(tick.get() + 1)
+                        }}>"End"</button>
+                    }
+                </div>
+            }
         </div>
         <div class="card">
             <h3>"System"</h3>
@@ -71,9 +99,9 @@ fn Monitor(d: wm.Desktop, stats: Stats) -> Node {
     </div>
 }
 
-fn open(d: wm.Desktop) {
+fn open(d: wm.Desktop, procs: proc.Procs, who: fn() -> str) {
     let stats = Stats { frames: d.frames, busy: d.busy_ms }
-    let app = ui.styled(() => <Monitor d={d} stats={stats} />, CSS)
+    let app = ui.styled(() => <Monitor d={d} stats={stats} procs={procs} who={who} />, CSS)
     // once a second: measure, and render again (any signal change does)
     let beat = signal(0)
     let timer = web.every(1000, () => {
@@ -81,5 +109,5 @@ fn open(d: wm.Desktop) {
         beat.set(beat.get() + 1)
     })
     app.close = () => web.cancel(timer)
-    d.open("System Monitor", "◉", 0x00b894, 330, 470, app)
+    d.open("System Monitor", "◉", 0x00b894, 360, 600, app)
 }

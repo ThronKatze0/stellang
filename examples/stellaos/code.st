@@ -5,7 +5,8 @@
 //
 // The editor: syntax colors, line numbers, selection (Shift + arrows or the mouse), copy/cut/paste
 // (Ctrl-C/X/V), undo (Ctrl-Z), Ctrl-A, Ctrl-S saves, Ctrl-D duplicates a line, Ctrl-/ comments,
-// Tab indents, Enter keeps the indentation, Ctrl-N new, Ctrl-O the file list.
+// Tab indents, Enter keeps the indentation, Ctrl-F finds (F3 again), Ctrl-G goes to a line, Ctrl-N
+// new, Ctrl-O the file list.
 
 import kernel
 import gfx
@@ -107,6 +108,9 @@ struct Editor {
     cw: int = 8,                  // the monospace font's advance
     lh: int = 18,
     blink: int = 0,
+    bar: str = "",                // "find" or "goto": the little bar at the editor's foot
+    query: str = "",
+    last_find: str = "",
 
     // ---- text ----
 
@@ -307,6 +311,14 @@ struct Editor {
             self.console_key(e)
             return
         }
+        if self.bar != "" {
+            self.bar_key(e)
+            return
+        }
+        if k == "F3" {
+            self.find_next(self.last_find, true)
+            return
+        }
         let sh = e.shift
         if e.ctrl {
             let c = k.lower()
@@ -345,6 +357,12 @@ struct Editor {
             } else if c == "/" {
                 self.snapshot("")
                 self.toggle_comment()
+            } else if c == "f" {
+                self.bar = "find"
+                self.query = if self.has_sel() && !self.sel_text().contains("\n") { self.sel_text() } else { self.last_find }
+            } else if c == "g" {
+                self.bar = "goto"
+                self.query = ""
             } else if c == "n" {
                 self.new_file()
             } else if c == "o" {
@@ -474,6 +492,64 @@ struct Editor {
             return
         }
         self.reveal()
+    }
+
+    // the find / go-to-line bar
+    fn bar_key(self, e: input.Event) {
+        let k = e.key
+        if k == "Escape" {
+            self.bar = ""
+        } else if k == "Enter" || k == "F3" {
+            if self.bar == "find" {
+                self.find_next(self.query, true)
+            } else {
+                let n = int(self.query.trim()) catch 0
+                if n > 0 {
+                    self.move_to(min(n, self.lines.len()) - 1, 0, false)
+                    self.top = max(0, self.row - self.rows() / 2)
+                }
+                self.bar = ""
+            }
+        } else if k == "Backspace" {
+            let cs = self.query.chars()
+            if !cs.is_empty() {
+                cs.pop()
+                self.query = cs.join("")
+            }
+        } else if e.text != "" && !e.ctrl {
+            self.query += e.text
+            // as you type: the first match from where the search started
+            if self.bar == "find" { self.find_next(self.query, false) }
+        }
+    }
+
+    // select the next place `q` is (after the cursor, or at it when `skip` is false), round the end
+    fn find_next(self, q: str, skip: bool) {
+        if q == "" { return }
+        self.last_find = q
+        let want = q.lower()
+        let n = self.lines.len()
+        let start_row = if self.has_sel() { self.sel()[0] } else { self.row }
+        let start_col = if self.has_sel() { self.sel()[1] + (if skip { 1 } else { 0 }) } else { self.col }
+        for step in 0..n + 1 {
+            let r = (start_row + step) % n
+            let l = self.lines[r].lower()
+            var from = if step == 0 { start_col } else { 0 }
+            if step == n { from = 0 }
+            if from > l.len() { continue }
+            let at = l.slice(from, l.len()).find(want)
+            if at >= 0 {
+                let c = from + at
+                self.arow = r
+                self.acol = c
+                self.row = r
+                self.col = c + q.len()
+                self.reveal()
+                self.status = "found \"${q}\" on line ${r + 1} (F3 for the next)"
+                return
+            }
+        }
+        self.status = "\"${q}\" isn't in the file"
     }
 
     fn shift_lines(self, back: bool) {
@@ -638,9 +714,16 @@ struct Editor {
             while self.env.fs.exists(self.env.home() + "/program${n}.st") { n += 1 }
             self.path = self.env.home() + "/program${n}.st"
         }
+        var note = ""
         if !self.env.can_write(self.path) {
-            self.status = "you may not write ${self.path}"
-            return
+            // not yours (an example, say): a copy in your home
+            let mine = self.env.home() + "/" + self.env.fs.name(self.path)
+            if !self.env.can_write(mine) {
+                self.status = "you may not write ${self.path}"
+                return
+            }
+            note = " (a copy: ${self.path} isn't yours to change)"
+            self.path = mine
         }
         var t = self.text()
         if !t.ends_with("\n") { t += "\n" }
@@ -649,7 +732,8 @@ struct Editor {
             return
         }
         self.dirty = false
-        self.status = "saved ${self.path}"
+        self.status = "saved ${self.path}${note}"
+        self.side_dir = self.env.fs.parent(self.path)
         self.title()
     }
 
@@ -849,6 +933,17 @@ struct Editor {
             let col = if r == self.err_line - 1 { ERROR } else if r == self.row { 0xc8cde0 } else { DIM }
             s.text(ex + gw - 8 - gfx.text_width(num, gfx.MONO), y, num, col, gfx.MONO)
             if r == self.err_line - 1 { s.circle(ex + 6, y + self.lh / 2 - 1, 3, ERROR) }
+        }
+        if self.bar != "" {
+            let by = y0 + eh - 34
+            s.rect(ex + gw, by, self.w - ex - gw, 34, 0x2c2e3d)
+            let label = if self.bar == "find" { "Find" } else { "Go to line" }
+            s.text(ex + gw + 12, by + 9, label, 0xaeb4cf, gfx.UI_BOLD)
+            let fx = ex + gw + 20 + gfx.text_width(label, gfx.UI_BOLD)
+            s.round(fx, by + 5, 260, 24, 5, 0x1e1f29)
+            s.text(fx + 8, by + 8, self.query, 0xffffff, gfx.MONO)
+            s.rect(fx + 9 + gfx.text_width(self.query, gfx.MONO), by + 9, 2, 16, 0xffcc00)
+            s.text(fx + 272, by + 9, if self.bar == "find" { "Enter: next · Esc: close" } else { "Enter: go · Esc: close" }, DIM, gfx.UI)
         }
         // the error: after its line if there's room, else under it
         if self.err_line > 0 && self.err_line - 1 >= self.top && self.err_line - 1 < self.top + n {
