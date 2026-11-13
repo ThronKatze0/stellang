@@ -38,7 +38,7 @@ const BAR_H = 38
 const STATUS_H = 22
 const SIDE_W = 190
 
-const KEYWORDS = ["fn", "struct", "const", "let", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "match", "true", "false", "self"]
+const KEYWORDS = ["fn", "struct", "enum", "const", "let", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "match", "true", "false", "self"]
 const TYPES = ["int", "bool", "str", "void", "float"]
 const BUILTINS = ["print", "println", "input", "read_line", "sleep", "now_ms", "random", "exit", "max", "min", "abs",
     "parse_int", "is_number", "char", "window", "clear", "rect", "circle", "line", "text", "big_text", "mono_text",

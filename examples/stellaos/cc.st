@@ -316,10 +316,18 @@ struct GlobalDecl {
     col: int = 0,
 }
 
+struct EnumDecl {
+    name: str,
+    variants: [str] = [],
+    line: int = 0,
+    col: int = 0,
+}
+
 struct Program {
     fns: [FnDecl] = [],
     structs: [StructDecl] = [],
     globals: [GlobalDecl] = [],
+    enums: [EnumDecl] = [],
 }
 
 // ---- the parser ----
@@ -397,7 +405,9 @@ struct Parser {
                 p.globals.push(GlobalDecl { name, ty, init, mutable: kw == "var", constant: kw == "const", crt: self.crt, line: t.line, col: t.col })
             } else if self.is("import") {
                 self.fail("no imports: a program is one file, and the built-in functions are always there")
-            } else if self.is("enum") || self.is("trait") || self.is("impl") {
+            } else if self.accept("enum") {
+                self.enumeration(t, p)
+            } else if self.is("trait") || self.is("impl") {
                 self.fail("`${t.s}` isn't supported by this compiler yet")
             } else {
                 self.fail("expected `fn`, `struct`, `const`, `let` or `var` at the top level, found ${describe(t)}")
@@ -472,6 +482,33 @@ struct Parser {
             self.accept(",")
         }
         return sd
+    }
+
+    // enum Name { A, B, C, fn method(self) ... }: plain named values
+    fn enumeration(self, t: Tok, p: Program) {
+        let name = self.ident()
+        let ed = EnumDecl { name, line: t.line, col: t.col }
+        if name != "?" && !is_upper(st_k_byte(name, 0)) { self.fail_at(t, "enum names start with a capital letter") }
+        self.expect("{")
+        while self.err == "" {
+            self.skip_nl()
+            if self.accept("}") { break }
+            if self.accept("fn") {
+                let f = self.function(name)
+                p.fns.push(f)
+                continue
+            }
+            let vt = self.peek()
+            let v = self.ident()
+            if self.is("(") || self.is("{") {
+                self.fail("enum variants that carry values aren't supported here yet (plain names are)")
+            }
+            if ed.variants.contains(v) { self.fail_at(vt, "${v} is in ${name} twice") }
+            ed.variants.push(v)
+            self.skip_nl()
+            self.accept(",")
+        }
+        p.enums.push(ed)
     }
 
     fn block(self) -> Tree {
@@ -610,6 +647,13 @@ struct Parser {
             self.expect("=>")
             if self.is("{") {
                 arm.kids.push(self.block())
+            } else if self.is("return") || self.is("break") || self.is("continue") {
+                let rt = self.next()
+                let b = self.node("block", rt)
+                let st = self.node(rt.s, rt)
+                if rt.s == "return" && !self.is(",") && !self.is("}") && self.peek().k != "nl" { st.kids.push(self.expr()) }
+                b.kids.push(st)
+                arm.kids.push(b)
             } else {
                 let b = self.node("block", self.peek())
                 let st = self.node("expr", self.peek())
@@ -751,6 +795,17 @@ struct Parser {
             self.expect("]")
             return n
         }
+        if t.k == "op" && t.s == "." && self.peek2().k == "id" {
+            self.next()
+            let n = self.node("variant", t)
+            n.s = self.ident()
+            return n
+        }
+        if self.accept("match") {
+            let n = self.match_statement(t)
+            n.k = "matchx"
+            return n
+        }
         if self.accept("if") {
             let n = self.node("ifx", t)
             n.kids.push(self.head())
@@ -785,7 +840,7 @@ struct Parser {
                 self.fail("`none` isn't supported here yet")
                 return self.node("int", t)
             }
-            if t.s == "fn" || t.s == "match" {
+            if t.s == "fn" {
                 self.fail("`${t.s}` can't go inside an expression here")
                 return self.node("int", t)
             }
@@ -958,6 +1013,7 @@ struct Gen {
     a: rv.Asm = rv.Asm {},
     funcs: {str: FnDecl} = {},
     structs: {str: StructDecl} = {},
+    enums: {str: EnumDecl} = {},
     globals: {str: GlobalInfo} = {},
     rodata: [int] = [],
     strs: {str: int} = {},
@@ -1073,7 +1129,13 @@ struct Gen {
             self.known_type(e, elem(ty))
             return
         }
-        if !self.structs.contains(ty) { self.fail(e, "unknown type ${ty}") }
+        if !self.structs.contains(ty) && !self.enums.contains(ty) { self.fail(e, "unknown type ${ty}") }
+    }
+
+    // the number of a variant of enum `ty`, or -1
+    fn variant(self, ty: str, name: str) -> int {
+        if !self.enums.contains(ty) { return -1 }
+        return self.enums[ty].variants.index_of(name)
     }
 
     // ---- the program ----
@@ -1083,7 +1145,15 @@ struct Gen {
             if self.structs.contains(s.name) { self.fail(Tree { k: "", line: s.line, col: s.col }, "struct ${s.name} is declared twice") }
             self.structs[s.name] = s
         }
+        for en in p.enums {
+            if self.structs.contains(en.name) || self.enums.contains(en.name) { self.fail(Tree { k: "", line: en.line, col: en.col }, "${en.name} is declared twice") }
+            self.enums[en.name] = en
+        }
         for f in p.fns {
+            if f.owner != "" {
+                self.funcs["${f.owner}.${f.name}"] = f
+                continue
+            }
             if self.funcs.contains(f.name) && self.err == "" {
                 let what = if self.funcs[f.name].crt { "a built-in function" } else { "already declared" }
                 self.fail(Tree { k: "", line: f.line, col: f.col }, "fn ${f.name}: ${what}")
@@ -1357,15 +1427,21 @@ struct Gen {
         }
     }
 
-    // match: compare the value with each arm in turn; returns the type for match expressions
-    fn match_(self, st: Tree, want_value: bool, want: str) -> str {
+    // match: compare the value with each arm in turn. As an expression (value), each arm gives a
+    // value and the type is returned.
+    fn match_(self, st: Tree, value: bool, want: str) -> str {
         let a = self.a
         self.scope_in()
         let vt = self.expr(st.kids[0], "")
-        if vt != "int" && vt != "str" && vt != "bool" && vt != "?" { self.fail(st.kids[0], "match works on int, str and bool, not ${vt}") }
+        let is_enum = self.enums.contains(vt)
+        if vt != "int" && vt != "str" && vt != "bool" && vt != "?" && !is_enum { self.fail(st.kids[0], "match works on int, str, bool and enums, not ${vt}") }
         let v = self.declare(st, " match", vt, false)
         self.store_slot(rv.A0, v)
         let end = a.label()
+        var covered: [str] = []
+        var wild = false
+        var ty = if value { want } else { "void" }
+        var first = true
         for k in 1..st.kids.len() {
             let arm = st.kids[k]
             let next = a.label()
@@ -1373,8 +1449,15 @@ struct Gen {
                 let body_l = a.label()
                 for pk in 0..arm.kids.len() - 1 {
                     let pat = arm.kids[pk]
-                    let pt = self.expr(pat, vt)
-                    self.check(pat, pt, vt, "a match pattern")
+                    if is_enum && pat.k == "name" && self.lookup(pat.s) == none && self.variant(vt, pat.s) >= 0 {
+                        a.li(rv.A0, self.variant(vt, pat.s))
+                        covered.push(pat.s)
+                    } else {
+                        let pt = self.expr(pat, vt)
+                        self.check(pat, pt, vt, "a match pattern")
+                        if is_enum && pat.k == "variant" { covered.push(pat.s) }
+                        if is_enum && pat.k == "field" { covered.push(pat.s) }
+                    }
                     self.load_slot(rv.T0, v)
                     if vt == "str" {
                         a.push(rv.T0)
@@ -1388,14 +1471,29 @@ struct Gen {
                 }
                 a.jump(next)
                 a.place(body_l)
+            } else {
+                wild = true
             }
-            self.block(arm.kids[arm.kids.len() - 1])
+            if value {
+                let t = self.value_block(arm.kids[arm.kids.len() - 1], ty)
+                if first || ty == "" || ty == "?" { ty = t } else if !self.same(t, ty) { self.fail(arm, "this arm gives ${t}, the others ${ty}") }
+                first = false
+            } else {
+                self.block(arm.kids[arm.kids.len() - 1])
+            }
             a.jump(end)
             a.place(next)
         }
+        if is_enum && !wild {
+            let missing = self.enums[vt].variants.filter(x => !covered.contains(x))
+            if !missing.is_empty() { self.fail(st, "this match on ${vt} misses ${missing.join(", ")} (or add `_ =>`)") }
+        }
+        if value && !wild && !is_enum {
+            self.die(st, "no arm of the match fits the value")
+        }
         a.place(end)
         self.scope_out()
-        return "void"
+        return ty
     }
 
     fn assign(self, st: Tree) {
@@ -1629,6 +1727,24 @@ struct Gen {
             if e.s == "-" { a.neg(rv.A0, rv.A0) } else { a.xori(rv.A0, rv.A0, -1) }
             return "int"
         }
+        if k == "field" && e.kids[0].k == "name" && self.enums.contains(e.kids[0].s) && self.lookup(e.kids[0].s) == none {
+            let ty = e.kids[0].s
+            let v = self.variant(ty, e.s)
+            if v < 0 { self.fail(e, "${ty} has no variant ${e.s} (it has ${self.enums[ty].variants.join(", ")})") }
+            a.li(rv.A0, max(v, 0))
+            return ty
+        }
+        if k == "variant" {
+            if !self.enums.contains(want) {
+                self.fail(e, "`.${e.s}`: which enum? (write Type.${e.s} where the type isn't clear)")
+                return "?"
+            }
+            let v = self.variant(want, e.s)
+            if v < 0 { self.fail(e, "${want} has no variant ${e.s} (it has ${self.enums[want].variants.join(", ")})") }
+            a.li(rv.A0, max(v, 0))
+            return want
+        }
+        if k == "matchx" { return self.match_(e, true, want) }
         if k == "field" {
             let ot = self.expr(e.kids[0], "")
             if (ot == "str" || ot.starts_with("[")) && e.s == "len" {
@@ -1904,6 +2020,21 @@ struct Gen {
         else if ty == "[float]" { self.rt("__l_float_str", 1) } else if ty == "bool" { self.rt("__bool_str", 1) } else if ty == "[int]" { self.rt("__l_int_str", 1) } else if ty == "[str]" { self.rt("__l_str_str", 1) } else if ty == "[bool]" { self.rt("__l_bool_str", 1) } else if ty == "void" {
             self.fail(e, "this has no value to show")
             a.pop(rv.A0)
+        } else if self.enums.contains(ty) {
+            // its variant's name
+            a.pop(rv.T0)
+            let done = a.label()
+            for k, name in self.enums[ty].variants {
+                let next = a.label()
+                a.li(rv.T1, k)
+                a.xor(rv.T1, rv.T1, rv.T0)
+                a.jump_if_not_zero(rv.T1, next)
+                a.addr_data(rv.A0, self.str_lit(name))
+                a.jump(done)
+                a.place(next)
+            }
+            a.addr_data(rv.A0, self.str_lit("?"))
+            a.place(done)
         } else {
             a.pop(rv.A0)
             a.addr_data(rv.A0, self.str_lit(if ty.starts_with("[") { "[...]" } else { ty }))
