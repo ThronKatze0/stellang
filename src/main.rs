@@ -1,9 +1,13 @@
 mod codegen;
 mod fmt;
+mod grammar;
+mod json;
 mod lexer;
+mod lsp;
 mod parser;
 
 use codegen::Unit;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::{exit, Command, Stdio};
@@ -12,7 +16,7 @@ use std::{env, fs};
 const RUNTIME: &str = include_str!("runtime.c");
 
 /// The standard library, written in stellang and built into the compiler.
-const STD: &[(&str, &str)] = &[
+pub const STD: &[(&str, &str)] = &[
     ("net", include_str!("../std/net.st")),
     ("http", include_str!("../std/http.st")),
     ("fs", include_str!("../std/fs.st")),
@@ -21,7 +25,10 @@ const STD: &[(&str, &str)] = &[
 
 const USAGE: &str = "usage:
   stellang <file.st> [-o <out>] [-O0|-O1|-O2|-O3|-Os] [--emit-llvm]   compile
-  stellang fmt [--emoji|--plain] <file.st>                              re-indent in place";
+  stellang check <file.st>                                             type-check only
+  stellang fmt [--emoji|--plain] <file.st>                              re-indent in place
+  stellang lsp                                                         language server (stdio)
+  stellang grammar textmate|vim                                        print a syntax grammar";
 
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("stellang: {msg}");
@@ -39,9 +46,15 @@ fn report<T>(path: &str, r: Result<T, lexer::Error>) -> T {
     })
 }
 
+/// Where to find sources: std modules, files on disk, and (in the editor) unsaved buffers.
+pub struct Sources<'a> {
+    pub std_dir: Option<&'a str>, // name std files after their copies here (the editor can open them)
+    pub open: &'a HashMap<String, String>,
+}
+
 /// Parse `file` as module `name`, then everything it imports (std modules, or `<name>.st` next to it).
-fn load(units: &mut Vec<Unit>, name: &str, file: String, src: &str) {
-    let module = report(&file, lexer::lex(src).and_then(parser::parse));
+pub fn load(units: &mut Vec<Unit>, name: &str, file: String, src: &str, srcs: &Sources) -> Result<(), (String, lexer::Pos, String)> {
+    let module = lexer::lex(src).and_then(parser::parse).map_err(|(p, m)| (file.clone(), p, m))?;
     let dir = Path::new(&file).parent().map(Path::to_path_buf).unwrap_or_default();
     let imports = module.imports.clone();
     units.push(Unit { name: name.into(), file: file.clone(), module });
@@ -50,20 +63,53 @@ fn load(units: &mut Vec<Unit>, name: &str, file: String, src: &str) {
             continue;
         }
         if let Some((_, src)) = STD.iter().find(|s| s.0 == imp) {
-            load(units, &imp, format!("<std>/{imp}.st"), src);
+            let f = match srcs.std_dir {
+                Some(d) => format!("{d}/{imp}.st"),
+                None => format!("<std>/{imp}.st"),
+            };
+            load(units, &imp, f, src, srcs)?;
             continue;
         }
-        let path = dir.join(format!("{imp}.st"));
-        let Ok(src) = fs::read_to_string(&path) else {
-            report::<()>(&file, Err((pos, format!("cannot find module `{imp}` (looked for {})", path.display()))));
-            unreachable!()
+        let path = dir.join(format!("{imp}.st")).display().to_string();
+        let src = match srcs.open.get(&path) {
+            Some(s) => s.clone(),
+            None => fs::read_to_string(&path).map_err(|_| (file.clone(), pos, format!("cannot find module `{imp}` (looked for {path})")))?,
         };
-        load(units, &imp, path.display().to_string(), &src);
+        load(units, &imp, path, &src, srcs)?;
     }
+    Ok(())
+}
+
+fn load_or_exit(input: &str) -> Vec<Unit> {
+    let mut units = vec![];
+    let none = HashMap::new();
+    load(&mut units, "", input.to_string(), &read(input), &Sources { std_dir: None, open: &none }).unwrap_or_else(|(file, p, m)| {
+        eprintln!("{file}:{}:{}: error: {m}", p.line, p.col);
+        exit(1)
+    });
+    units
 }
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("lsp") => return lsp::run(),
+        Some("grammar") => match args.get(1).map(String::as_str) {
+            Some("textmate") => return print!("{}", grammar::textmate()),
+            Some("vim") => return print!("{}", grammar::vim()),
+            _ => die(USAGE),
+        },
+        Some("check") => {
+            let Some(input) = args.get(1) else { die(USAGE) };
+            let units = load_or_exit(input);
+            if let Err((file, p, m)) = codegen::check(&units, false).0 {
+                eprintln!("{file}:{}:{}: error: {m}", p.line, p.col);
+                exit(1)
+            }
+            return;
+        }
+        _ => {}
+    }
     if args.first().is_some_and(|a| a == "fmt") {
         let (mode, file) = match &args[1..] {
             [f] => (None, f),
@@ -89,8 +135,7 @@ fn main() {
         }
     }
     let Some(input) = input else { die(USAGE) };
-    let mut units = vec![];
-    load(&mut units, "", input.clone(), &read(&input));
+    let units = load_or_exit(&input);
     let ir = codegen::compile(&units).unwrap_or_else(|(file, p, m)| {
         eprintln!("{file}:{}:{}: error: {m}", p.line, p.col);
         exit(1)

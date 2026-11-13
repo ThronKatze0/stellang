@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>A small compiled language that reads like Rust, Swift and TypeScript had a baby.</b><br>
-  Structs with methods · arrow functions · <code>T!</code> results · an Express-style web framework in std.
+  Structs and enums with methods · pattern matching · <code>T?</code> options and <code>T!</code> results · an Express-style web framework with WebSockets in std · a language server for any editor.
 </p>
 
 <p align="center">
@@ -15,7 +15,7 @@
 
 ---
 
-Rust frontend, LLVM backend (via clang), garbage collected (Boehm GC). No crates, ~4.6k lines total.
+Rust frontend, LLVM backend (via clang), garbage collected (Boehm GC). No crates, ~8k lines total.
 
 ## Quick start
 
@@ -23,6 +23,7 @@ Rust frontend, LLVM backend (via clang), garbage collected (Boehm GC). No crates
 cargo install --path .              # puts `stellang` on your PATH (needs clang + libgc)
 stellang examples/server.st         # like cc: -o out, -O0..-O3 (default -O2), --emit-llvm
 ./server                            # http://localhost:8080
+stellang examples/todos.st && ./todos   # a JSON API + WebSocket feed + static page, modeled with enums
 ```
 
 ## A web server
@@ -106,12 +107,104 @@ fn main() {
 - Statements end at the end of the line (`;` is optional). Using a `T!` without handling it is a compile error.
 - `extern fn name(x: int) -> str` calls C. That's how `std/net.st` talks to the sockets in `src/runtime.c`.
 
+## Modeling with structs and enums
+
+```rust
+enum Shape {
+    Circle(radius: float),                 // values in parentheses (names are optional)
+    Rect { w: float, h: float = 1.0 },     // or named fields, with defaults
+    Empty,
+
+    fn area(self) -> float {               // methods can live right in the type (or in `impl Shape`)
+        return match self {
+            Circle(r) => 3.14 * r * r,
+            Rect { w, h } => w * h,
+            Empty => 0.0,
+        }                                  // leave a variant out and it's a compile error
+    }
+
+    fn square(side: float) -> Shape {      // no `self`: a static function, Shape.square(2.0)
+        return .Rect { w: side, h: side }  // `.Variant` when the type is known from context
+    }
+}
+
+enum Expr {                                // recursive is fine
+    Num(int),
+    Add(Expr, Expr),
+    Mul(Expr, Expr),
+}
+
+fn eval(e: Expr) -> int {
+    return match e {
+        Num(n) => n,
+        Add(a, b) => eval(a) + eval(b),
+        Mul(Num(0), _) | Mul(_, Num(0)) => 0,         // nested patterns, `|`
+        Mul(a, b) => eval(a) * eval(b),
+    }
+}
+
+struct User {
+    name: str,
+    email: str?,                           // optional fields default to none
+    role: Role = .Member,                  // fields can have defaults
+}
+
+enum Role { Admin, Member, Guest }
+
+let shapes: [Shape] = [.Circle(1.0), Shape.Rect { w: 2.0 }, Shape.square(3.0), .Empty]
+let bob = User { name: "bob" }             // User { name: "bob", email: none, role: Member }
+println(Shape.Circle(1.0) == .Circle(1.0))   // == compares contents (structs, enums, lists, maps, sets)
+println(to_json(bob))                      // {"name":"bob","email":null,"role":"Member"}
+```
+
+## Options: `T?`, never null
+
+There is no null. A value that might be missing is a `T?`, built into the language just like `T!`:
+
+```rust
+fn find(users: [User], name: str) -> User? {
+    for u in users { if u.name == name { return u } }   // a plain User becomes some(User)
+    return none
+}
+
+fn domain(users: [User], name: str) -> str? {
+    let u = find(users, name)?             // `?` passes none up (like it passes errors up in T!)
+    return u.email?.split("@")[1]          // `?.` chains: none if email is none
+}
+
+let email = bob.email ?? "no email"        // fallback; `catch "no email"` works too
+if let u = find(users, "ada") { println(u.name) }        // look inside
+let u = find(users, "ada") else { return }               // or leave
+while let top = stack.last() { stack.pop() }
+match find(users, "eve") {
+    some(u) => println(u.name),
+    none => println("nobody"),
+}
+let n = ages.get("dave") ?? 0              // map.get, list.get/first/last/find give T?
+```
+
+## Patterns everywhere
+
+```rust
+let label = match code {
+    200 | 201 => "ok",
+    n if n >= 500 => "server error",       // guards
+    _ => "other",
+}
+if let Rect { w } = shape { }              // fields you leave out are ignored
+let Circle(r) = shape else { return err("not a circle") }
+let Point { x, y } = p                     // destructure a struct
+let size = if r > 1.0 { "big" } else { "small" }       // `if` is an expression
+let n = int(s) catch e { -1 }              // a catch block can end with the fallback value
+const MAX_USERS = 100                      // top-level constants
+```
+
 ## Built in (no imports)
 
 ```rust
 let ages = {"alice": 31, "bob": 25}        // {str: int}; keeps insertion order
 ages["carol"] = 40
-let n = ages.get("dave", 0)                 // or ages.get("dave") -> int!, or ages["dave"] (panics if missing)
+let n = ages.get("dave", 0)                 // or ages.get("dave") -> int?, or ages["dave"] (panics if missing)
 for name, age in ages { println("${name} is ${age}") }
 
 let seen = {1, 2, 3}                        // {int}
@@ -127,11 +220,13 @@ let area = 3.14 * r * r                     // int and float mix; int(2.9) == 2,
 println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"pt": Point { x: 1.0, y: 2.0 }}
 ```
 
-- Functions: `print println str int float min max abs env panic`.
+- Functions: `print println str int float min max abs env panic some to_json`.
 - `str`: `len is_empty split lines chars find count slice trim trim_start trim_end lower upper starts_with
   ends_with contains replace repeat reverse`, `s[i]`, `<` `>` compare.
 - `float`: `floor ceil round sqrt abs`.
-- `[T]`: `len is_empty push pop insert remove slice contains index_of sort reverse map filter any all sum join`.
+- `[T]`: `len is_empty push pop insert remove slice contains index_of sort reverse map filter any all sum join`,
+  and `first last get(i) find(pred)` giving `T?`.
+- `T?`: `?`, `?.`, `??`, `catch`, `if let`, `match`, and `is_some is_none unwrap`.
 - `{K: V}`: `m[k]`, `m[k] = v`, `len is_empty get contains remove keys values`. Keys are int, str or bool.
 - `{T}`: `len is_empty add contains remove to_list`.
 - `in` works on strs, lists, maps and sets; `for` loops over all of them (maps and sets loop over a snapshot).
@@ -139,15 +234,59 @@ println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"p
 
 ## Standard library (in `std/`, written in stellang)
 
+- `http`: an Express-style framework on a single-threaded event loop (like Node): many connections at once,
+  HTTP/1.1 keep-alive, WebSockets, timers.
+  - Routes: `app.get/post/put/patch/delete/all(path, (req, res) => ...)` with `:params` and a trailing `*`.
+    Handlers return `void!`, so `?` works inside them; an error becomes a `500`.
+  - Middleware: `app.use((req, res, next) => { ...; next() })`, `app.use_at("/api", ...)`.
+  - `app.static("/public", "./public")`, `app.every(ms, f)`, `app.after(ms, f)`, `app.listen(port) -> void!`.
+  - `req.method path url body`, `req.param(name)`, `req.query` / `req.headers` / `req.cookies` maps,
+    `req.header(name) -> str?`, `req.cookie(name) -> str?`, `req.json() -> json.Json!`.
+  - `res.status(code)`, `res.set(name, value)`, `res.type(ct)` (all chainable), `res.send/html/json(body)`,
+    `res.redirect(url)`, `res.cookie(name, value)`, `res.send_file(path)`, `res.end()`.
+- WebSockets, like express-ws:
+
+  ```rust
+  app.ws("/chat/:room", (ws, req) => {
+      let name = req.query.get("name") ?? "guest"
+      ws.broadcast("${name} joined")              // every other socket on this path
+      ws.on_message(msg => ws.broadcast("${name}: ${msg}"))
+      ws.on_close(() => ws.broadcast("${name} left"))
+  })
+  for ws in app.clients("/chat/lobby") { ws.send("hi all") }   // also ws.close(), ws.peers()
+  ```
+
+- `json`: `json.parse(text) -> Json!` into an enum `Json { Null, Bool, Num, Str, Arr, Obj }` with
+  `get(key) at(i) as_str as_int as_float as_bool as_list -> T?` and `stringify()`.
+  (Your own types go to JSON with the builtin `to_json(value)`.)
+- `fs`: `read write append remove mkdir list -> T!`, `exists is_dir`, `size -> int?`.
 - `net`: `net.listen(port) -> Listener!`, `listener.accept() -> Conn!`, `conn.read() -> str!`,
   `conn.write(s) -> void!`, `conn.close()`. Wraps POSIX sockets from the C runtime.
-- `http`: `http.app()`, `app.get/post(path, (req, res) => ...)` with `:params`, `app.listen(port) -> void!`.
-  `req.method/path/query/body`, `req.param(name)`, `req.header(name)`, `req.params`/`req.headers` maps;
-  `res.send/html/json(body)`, `res.status(code)` (chainable).
+
+## Editor support
+
+`stellang lsp` is a language server built into the compiler: errors as you type, hover types and doc comments,
+completion, go to definition (into `std` too), document symbols, formatting and semantic highlighting.
+It runs the real lexer, parser and type checker, so it keeps up with the language by itself.
+The fallback grammars come out of the compiler's keyword table (`stellang grammar textmate|vim`), and a test
+fails if the copies in `editors/` go stale.
+
+- **Neovim** (0.9+): add `editors/nvim` to your runtimepath, e.g. with lazy.nvim:
+
+  ```lua
+  { dir = "~/src/stellang/editors/nvim", ft = "stellang", opts = { format_on_save = true },
+    config = function(_, opts) require("stellang").setup(opts) end }
+  ```
+
+  or with no plugin manager: `vim.opt.rtp:append("~/src/stellang/editors/nvim")`.
+- **VS Code**: `cd editors/vscode && npm install`, then either symlink the folder into `~/.vscode/extensions/`
+  or package it with `npx @vscode/vsce package` and install the `.vsix`. Set `stellang.path` if `stellang`
+  isn't on your PATH.
+- **Anything else** with LSP support: run `stellang lsp` for `*.st` files.
 
 ## Safety
 
-No null, no pointers, no manual free, no uninitialized values. Out-of-bounds indexing, bad slices,
+No null (use `T?`), no pointers, no manual free, no uninitialized values. Out-of-bounds indexing, bad slices,
 a missing map key with `m[k]`, integer division by zero, `pop()` on an empty list and `panic()` stop the program with exit code 101 and a
 `file:line:col` message. An error returned from `main` prints `error: ...` and exits with 1.
 

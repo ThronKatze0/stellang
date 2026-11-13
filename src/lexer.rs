@@ -38,7 +38,7 @@ pub struct Token {
 
 pub type Error = (Pos, String);
 
-const WORDS: [(&str, Tok); 19] = [
+pub const WORDS: [(&str, Tok); 19] = [
     ("fn", Tok::Fn), ("struct", Tok::Struct), ("enum", Tok::Enum), ("const", Tok::Const), ("impl", Tok::Impl), ("extern", Tok::Extern),
     ("import", Tok::Import), ("let", Tok::Let), ("var", Tok::Var), ("if", Tok::If), ("else", Tok::Else),
     ("while", Tok::While), ("for", Tok::For), ("in", Tok::In), ("return", Tok::Return),

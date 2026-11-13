@@ -736,3 +736,61 @@ fn main() -> void! {
     assert_eq!(who, "2 here");
     assert_eq!(left, "bob left");
 }
+
+/// The editor grammars are generated from the compiler's keyword table; the copies in `editors/`
+/// must match (regenerate with `stellang grammar textmate|vim`).
+#[test]
+fn editor_grammars_are_current() {
+    for (kind, file) in [("textmate", "editors/vscode/syntaxes/stellang.tmLanguage.json"), ("vim", "editors/nvim/syntax/stellang.vim")] {
+        let out = Command::new(BIN).args(["grammar", kind]).output().unwrap();
+        let want = String::from_utf8(out.stdout).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+        assert_eq!(fs::read_to_string(&path).unwrap(), want, "{file} is stale: run `stellang grammar {kind} > {file}`");
+    }
+}
+
+#[test]
+fn language_server() {
+    use std::io::BufRead;
+    let dir = tmpdir("lsp");
+    let file = dir.join("main.st");
+    let uri = format!("file://{}", file.display());
+    let src = "enum Shape { Circle(float), Empty }\n\n// How big it is.\nfn area(s: Shape) -> float {\n    return match s { Circle(r) => r * r, Empty => 0.0 }\n}\n\nfn main() {\n    let s = Shape.Circle(2.0)\n    println(area(s))\n    println(nope)\n}\n";
+    fs::write(&file, src).unwrap();
+    let mut lsp = Command::new(BIN).arg("lsp").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let mut input = lsp.stdin.take().unwrap();
+    let mut output = std::io::BufReader::new(lsp.stdout.take().unwrap());
+    let mut send = |body: String| write!(input, "Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+    let mut recv = || -> String {
+        let mut len = 0;
+        loop {
+            let mut line = String::new();
+            output.read_line(&mut line).unwrap();
+            if line.trim().is_empty() { break }
+            if let Some(n) = line.strip_prefix("Content-Length: ") { len = n.trim().parse().unwrap() }
+        }
+        let mut buf = vec![0; len];
+        output.read_exact(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    };
+    let text = src.replace('\n', "\\n").replace('"', "\\\"");
+    send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#.into());
+    let init = recv();
+    send(format!(r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"stellang","version":1,"text":"{text}"}}}}}}"#));
+    let diags = recv();
+    send(format!(r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{{"textDocument":{{"uri":"{uri}"}},"position":{{"line":9,"character":13}}}}}}"#));
+    let hover = recv();
+    send(format!(r#"{{"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{{"textDocument":{{"uri":"{uri}"}},"position":{{"line":8,"character":9}}}}}}"#));
+    let hover_let = recv();
+    send(format!(r#"{{"jsonrpc":"2.0","id":4,"method":"textDocument/semanticTokens/full","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#));
+    let tokens = recv();
+    send(r#"{"jsonrpc":"2.0","id":5,"method":"shutdown"}"#.into());
+    recv();
+    send(r#"{"jsonrpc":"2.0","method":"exit"}"#.into());
+    lsp.wait().unwrap();
+    assert!(init.contains("semanticTokensProvider") && init.contains("hoverProvider"), "{init}");
+    assert!(diags.contains("unknown name `nope`") && diags.contains(r#""line":10"#), "{diags}");
+    assert!(hover.contains("fn area(s: Shape) -> float") && hover.contains("How big it is."), "{hover}");
+    assert!(hover_let.contains("let s: Shape"), "{hover_let}");
+    assert!(tokens.contains(r#""data":["#) && tokens.len() > 100, "{tokens}");
+}

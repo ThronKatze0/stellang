@@ -21,7 +21,7 @@ pub struct Unit {
     pub module: Module,
 }
 
-const RESERVED: &[&str] = &[
+pub const RESERVED: &[&str] = &[
     "print", "println", "str", "int", "float", "env", "panic", "ok", "err", "bool", "void", "true", "false", "min", "max",
     "abs", "some", "none", "to_json", "self",
 ];
@@ -114,6 +114,12 @@ fn str_method(name: &str) -> Option<(&'static str, Vec<Type>, Type, bool)> {
         "reverse" => ("st_reverse", vec![], Str, false),
         _ => return None,
     })
+}
+
+fn sig_text(name: &str, s: &Sig) -> String {
+    let ps: Vec<String> = s.params.iter().map(|p| p.to_string()).collect();
+    let ret = if s.ret == Type::Void { String::new() } else { format!(" -> {}", s.ret) };
+    format!("fn {name}({}){ret}", ps.join(", "))
 }
 
 fn err<T>(pos: Pos, m: impl Into<String>) -> R<T> {
@@ -342,16 +348,33 @@ struct Gen {
     wrappers: Vec<String>,
     shown: HashSet<String>, // types whose `str()` helper is emitted
     f: FnState,
+    notes: Vec<Note>,
+}
+
+/// What the type checker learned about a spot in the source (for editor hovers).
+#[derive(Clone, Debug)]
+pub struct Note {
+    pub file: String,
+    pub pos: Pos,
+    pub text: String,
 }
 
 pub fn compile(units: &[Unit]) -> Result<String, (String, Pos, String)> {
+    check(units, true).0
+}
+
+/// Type-check (and generate code for) `units`; also returns the notes for editor hovers.
+/// Without `require_main`, a file without `main` is fine (a module being edited).
+pub fn check(units: &[Unit], require_main: bool) -> (Result<String, (String, Pos, String)>, Vec<Note>) {
     let mut g = Gen::default();
     for u in units {
         g.files.insert(u.name.clone(), u.file.clone());
         g.imports.insert(u.name.clone(), u.module.imports.iter().map(|i| i.0.clone()).collect());
     }
-    let r = g.run(units);
-    r.map_err(|(p, m)| (g.files[&g.module].clone(), p, m))
+    let need_main = require_main || units[0].module.funcs.iter().any(|f| f.name == "main");
+    let r = g.run(units, need_main);
+    let r = r.map_err(|(p, m)| (g.files[&g.module].clone(), p, m));
+    (r, mem::take(&mut g.notes))
 }
 
 impl Gen {
@@ -438,7 +461,12 @@ impl Gen {
         Ok(())
     }
 
-    fn run(&mut self, units: &[Unit]) -> R<String> {
+    fn note(&mut self, pos: Pos, text: String) {
+        let file = self.files[&self.module].clone();
+        self.notes.push(Note { file, pos, text });
+    }
+
+    fn run(&mut self, units: &[Unit], need_main: bool) -> R<String> {
         for u in units {
             self.module = u.name.clone();
             let names = u.module.structs.iter().map(|s| (&s.name, s.pos)).chain(u.module.enums.iter().map(|e| (&e.name, e.pos)));
@@ -546,11 +574,12 @@ impl Gen {
         self.module = String::new();
 
         let main = match self.funcs.get("main") {
+            None if !need_main => Type::Void,
             Some(s) if s.params.is_empty() => s.ret.clone(),
             Some(_) => return err(units[0].module.funcs.iter().find(|f| f.name == "main").unwrap().pos, "`main` can't take parameters"),
             None => return err(Pos { line: 1, col: 1 }, "no `main` function (write `fn main() { ... }`)"),
         };
-        let call = format!("call {} @\"st.main\"()", ll(&main));
+        let call = if need_main { format!("call {} @\"st.main\"()", ll(&main)) } else { "call void @st_init()".into() };
         let entry = match &main {
             Type::Void => format!("  {call}\n  ret i32 0"),
             Type::Int => format!("  %r = {call}\n  %c = trunc i64 %r to i32\n  ret i32 %c"),
@@ -1291,6 +1320,7 @@ impl Gen {
                 if v.ty == Type::Void {
                     return err(value.pos, "this has no value");
                 }
+                self.note(*pos, format!("{} {name}: {}", if *mutable { "var" } else { "let" }, v.ty));
                 self.declare(name, &v, *mutable);
             }
             Stmt::Assign(target, value) => {
@@ -1641,12 +1671,19 @@ impl Gen {
             ExprKind::Bool(b) => val(b.to_string(), Type::Bool),
             ExprKind::Str(s) => val(self.str_const(s), Type::Str),
             ExprKind::Var(n) => match self.find(n) {
-                Some(v) => self.load(&v.addr, v.ty),
+                Some(v) => {
+                    self.note(pos, format!("{n}: {}", v.ty));
+                    self.load(&v.addr, v.ty)
+                }
                 None if n == "none" => match peel(want) {
                     Some(t @ Type::Opt(_)) => val("zeroinitializer", t.clone()),
                     _ => return err(pos, "can't tell what kind of `none` this is; write `let x: int? = none`"),
                 },
-                None if self.consts.contains_key(&self.key(n)) => self.const_value(&self.key(n)),
+                None if self.consts.contains_key(&self.key(n)) => {
+                    let k = self.key(n);
+                    self.note(pos, format!("const {n}: {}", self.consts[&k]));
+                    self.const_value(&k)
+                }
                 None if self.funcs.contains_key(&self.key(n)) => self.fn_value(self.key(n), pos)?,
                 None if self.is_module(n) => return err(pos, format!("`{n}` is a module; use `{n}.something`")),
                 None if self.structs.contains_key(&self.key(n)) || self.enums.contains_key(&self.key(n)) => {
@@ -1730,6 +1767,7 @@ impl Gen {
                     return err(pos, format!("`{f}` is a method here; call it: `.{f}()`"));
                 }
                 let (p, t) = self.field_ptr(&b, f, pos)?;
+                self.note(pos, format!("{}.{f}: {t}", b.ty));
                 self.load(&p, t)
             }
             ExprKind::Index(b, i) => {
@@ -2191,6 +2229,7 @@ impl Gen {
                 let Some(sig) = self.funcs.get(&self.key(name)).cloned() else {
                     return err(pos, format!("unknown function `{name}`"));
                 };
+                self.note(callee.pos, sig_text(name, &sig));
                 let argl = self.args(&sig.params, args, pos, name)?;
                 Ok(self.emit_call(&sig.ret, &sig.sym, &argl))
             }
@@ -2223,6 +2262,7 @@ impl Gen {
                     if !self.statics.contains(&k) {
                         return err(pos, format!("`{name}` is a method; call it on a value: `x.{name}(...)`"));
                     }
+                    self.note(callee.pos, sig_text(&format!("{tk}.{name}"), &sig));
                     let argl = self.args(&sig.params, args, pos, name)?;
                     return Ok(self.emit_call(&sig.ret, &sig.sym, &argl));
                 }
@@ -2231,6 +2271,7 @@ impl Gen {
                         let Some(sig) = self.funcs.get(&format!("{m}.{name}")).cloned() else {
                             return err(pos, format!("module `{m}` has no function `{name}`"));
                         };
+                        self.note(callee.pos, sig_text(&format!("{m}.{name}"), &sig));
                         let argl = self.args(&sig.params, args, pos, name)?;
                         return Ok(self.emit_call(&sig.ret, &sig.sym, &argl));
                     }
@@ -2250,6 +2291,7 @@ impl Gen {
                             if self.statics.contains(&k) {
                                 return err(pos, format!("`{name}` is a static function; call it as `{sk}.{name}(...)`"));
                             }
+                            self.note(callee.pos, sig_text(&format!("{sk}.{name}"), &sig));
                             let mut argl = vec![format!("ptr {}", b.v)];
                             argl.extend(self.args(&sig.params[1..], args, pos, name)?);
                             return Ok(self.emit_call(&sig.ret, &sig.sym, &argl));

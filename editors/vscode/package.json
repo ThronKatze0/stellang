@@ -1,0 +1,37 @@
+{
+  "name": "stellang",
+  "displayName": "stellang",
+  "description": "stellang language support: highlighting, errors as you type, hover types, completion, go to definition, formatting",
+  "version": "0.1.0",
+  "publisher": "stellang",
+  "license": "MIT",
+  "engines": { "vscode": "^1.82.0" },
+  "categories": ["Programming Languages", "Formatters"],
+  "main": "./extension.js",
+  "activationEvents": ["onLanguage:stellang"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "stellang",
+        "aliases": ["stellang", "Stellang"],
+        "extensions": [".st"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      { "language": "stellang", "scopeName": "source.stellang", "path": "./syntaxes/stellang.tmLanguage.json" }
+    ],
+    "configuration": {
+      "title": "stellang",
+      "properties": {
+        "stellang.path": {
+          "type": "string",
+          "default": "stellang",
+          "description": "The stellang compiler (it is also the language server: `stellang lsp`)."
+        }
+      }
+    },
+    "commands": [{ "command": "stellang.restart", "title": "stellang: Restart Language Server" }]
+  },
+  "dependencies": { "vscode-languageclient": "^9.0.1" }
+}

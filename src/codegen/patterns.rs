@@ -269,6 +269,7 @@ impl Gen {
                     if binds.iter().any(|b| b.0 == *n) {
                         return err(pos, format!("`{n}` is bound twice in this pattern"));
                     }
+                    self.note(pos, format!("{n}: {}", v.ty));
                     binds.push((n.clone(), v.clone()));
                 }
             }
