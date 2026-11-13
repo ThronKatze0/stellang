@@ -21,6 +21,16 @@ pub struct Unit {
     pub module: Module,
 }
 
+/// The function that computes parameter `i`'s default, for the function `sym` (`@"st.f"` -> `@"def.st.f.1"`).
+fn default_sym(sym: &str, i: usize) -> String {
+    format!("@\"def.{}.{i}\"", sym.trim_start_matches('@').trim_matches('"'))
+}
+
+/// The function that computes field `f`'s default, for a struct or `Enum::Variant`.
+fn field_default_sym(dkey: &str, f: &str) -> String {
+    format!("@\"fdef.{dkey}.{f}\"")
+}
+
 pub const RESERVED: &[&str] = &[
     "print", "println", "str", "int", "float", "env", "panic", "ok", "err", "bool", "void", "true", "false", "min", "max",
     "abs", "some", "none", "to_json", "self", "sleep", "now_ms", "url_encode",
@@ -304,8 +314,7 @@ struct Sig {
     ret: Type,
     sym: String,
     is_extern: bool,
-    defaults: Vec<Option<Expr>>, // per parameter, evaluated in `module` when a call leaves it out
-    module: String,
+    defaults: Vec<Option<Expr>>, // per parameter; each one is compiled into `default_sym(sym, i)`
 }
 
 /// Collects the values of the branches of a `match` that reach its end.
@@ -349,7 +358,7 @@ struct Gen {
     imports: HashMap<String, HashSet<String>>,
     structs: HashMap<String, Vec<(String, Type)>>,
     enums: HashMap<String, Vec<VariantInfo>>,
-    defaults: HashMap<String, (String, Vec<(String, Expr)>)>, // struct or `Enum::Variant` -> (module, field defaults)
+    defaults: HashMap<String, Vec<(String, Expr)>>, // struct or `Enum::Variant` -> field defaults, see `field_default_sym`
     consts: HashMap<String, Type>,
     const_order: Vec<String>,
     statics: HashSet<String>, // `Type::name` functions without `self`
@@ -449,7 +458,7 @@ impl Gen {
             });
         }
         let defaults = f.defaults.clone();
-        Ok(Sig { params, ret: self.resolve(&f.ret, f.pos)?, sym, is_extern: false, defaults, module: self.module.clone() })
+        Ok(Sig { params, ret: self.resolve(&f.ret, f.pos)?, sym, is_extern: false, defaults })
     }
 
     fn type_of_key(&self, k: &str) -> Type {
@@ -533,7 +542,7 @@ impl Gen {
                     let ps: Vec<String> = params.iter().map(ll).collect();
                     writeln!(self.decls, "declare {} @{}({})", ll(&ret), x.name, ps.join(", ")).unwrap();
                 }
-                let sig = Sig { params, ret, sym: format!("@{}", x.name), is_extern: true, defaults: vec![], module: self.module.clone() };
+                let sig = Sig { params, ret, sym: format!("@{}", x.name), is_extern: true, defaults: vec![] };
                 self.add_fn(self.key(&x.name), sig, x.pos, &x.name)?;
             }
             for im in &u.module.impls {
@@ -573,6 +582,39 @@ impl Gen {
                 writeln!(self.globals, "@\"g.{k}\" = internal global {} zeroinitializer", ll(&t)).unwrap();
                 self.consts.insert(k.clone(), t);
                 self.const_order.push(k);
+            }
+        }
+        // default values: each one becomes a small function of its own (like a constant), so its type is
+        // checked here, once, and a call that leaves the value out just calls it
+        for u in units {
+            self.module = u.name.clone();
+            let mut fns: Vec<String> = u.module.funcs.iter().map(|f| self.key(&f.name)).collect();
+            for im in &u.module.impls {
+                let sk = self.key(&im.name);
+                fns.extend(im.methods.iter().map(|m| format!("{sk}::{}", m.name)));
+            }
+            for k in fns {
+                let sig = self.funcs[&k].clone();
+                for (i, d) in sig.defaults.iter().enumerate() {
+                    if let Some(e) = d {
+                        self.default_fn(&default_sym(&sig.sym, i), e, &sig.params[i])?;
+                    }
+                }
+            }
+            let mut holders: Vec<(String, Vec<(String, Type)>)> = vec![];
+            for st in &u.module.structs {
+                let k = self.key(&st.name);
+                holders.push((k.clone(), self.structs[&k].clone()));
+            }
+            for e in &u.module.enums {
+                let k = self.key(&e.name);
+                holders.extend(self.enums[&k].iter().map(|v| (format!("{k}::{}", v.name), v.fields.clone())));
+            }
+            for (dkey, fields) in holders {
+                for (f, e) in self.defaults.get(&dkey).cloned().unwrap_or_default() {
+                    let ft = fields.iter().find(|x| x.0 == f).unwrap().1.clone();
+                    self.default_fn(&field_default_sym(&dkey, &f), &e, &ft)?;
+                }
             }
         }
         for u in units {
@@ -647,6 +689,20 @@ impl Gen {
         // stack-clash protection: big frames touch every page, so they hit the guard page instead of jumping it
         out += "attributes #0 = { \"probe-stack\"=\"inline-asm\" }\n";
         Ok(out)
+    }
+
+    /// A default value as a function of its own, checked against the type it fills in.
+    fn default_fn(&mut self, sym: &str, e: &Expr, t: &Type) -> R<()> {
+        let body = Body::Expr(Box::new(e.clone()));
+        self.function(sym, &[], Some(t.clone()), &body, None, &[], e.pos, "a default value")?;
+        Ok(())
+    }
+
+    /// The value of a default: a call to the function `default_fn` made for it.
+    pub(super) fn call_default(&mut self, sym: &str, t: &Type) -> Val {
+        let r = self.tmp();
+        self.ins(format!("{r} = call {} {sym}(ptr null)", ll(t)));
+        val(r, t.clone())
     }
 
     fn gen_named(&mut self, key: &str, f: &Func) -> R<()> {
@@ -856,7 +912,7 @@ impl Gen {
                 defs.push((f.name.clone(), d.clone()));
             }
         }
-        self.defaults.insert(key.into(), (self.module.clone(), defs));
+        self.defaults.insert(key.into(), defs);
         Ok(out)
     }
 
@@ -2247,16 +2303,8 @@ impl Gen {
         }
         let mut out = self.args(&params[..args.len()], args, pos, name)?;
         for i in skip + args.len()..sig.params.len() {
-            let e = sig.defaults[i].clone().unwrap();
-            let pt = sig.params[i].clone();
-            let module = mem::replace(&mut self.module, sig.module.clone());
-            let scopes = mem::replace(&mut self.f.scopes, vec![HashMap::new()]);
-            let loops = mem::take(&mut self.f.loops);
-            let r = self.typed(&e, &pt);
-            self.module = module;
-            self.f.scopes = scopes;
-            self.f.loops = loops;
-            out.push(format!("{} {}", ll(&pt), r?.v));
+            let v = self.call_default(&default_sym(&sig.sym, i), &sig.params[i]);
+            out.push(format!("{} {}", ll(&v.ty), v.v));
         }
         Ok(out)
     }

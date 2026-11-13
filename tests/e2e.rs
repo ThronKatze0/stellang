@@ -814,10 +814,29 @@ fn main() {
     println(S { x: 5 }.get(10))
 }"#;
     ok("defaults", src, "11\n3\n6\n6\n15\n");
+    let src = r#"
+enum Role { Admin, Member }
+const BASE = 10
+fn twice(x: int) -> int { return x * 2 }
+struct U { name: str, role: Role = .Member, w: float = 1, tags: [str] = [], note: str? }
+enum Shape { Rect { w: float, h: float = twice(BASE) } }
+fn f(a: int = twice(BASE), r: Role = .Admin, m: {str: int} = {}) -> str { return "${a} ${r} ${m.len()}" }
+fn main() {
+    println(f())
+    println(U { name: "x" })
+    println(Shape.Rect { w: 1.0 })
+}"#;
+    ok("defaults_kinds", src, "20 Admin 0\nU { name: \"x\", role: Member, w: 1.0, tags: [], note: none }\nRect { w: 1.0, h: 20.0 }\n");
     for (src, want) in [
         ("fn f(a: int = 1, b: int) {}\nfn main() {}", "needs a default too"),
         ("fn f(a: int, b: int = 2) {}\nfn main() { f() }", "takes 1 to 2 argument(s), got 0"),
         ("fn f(a: int = 2) {}\nfn main() { f(1, 2) }", "takes 0 to 1 argument(s), got 2"),
+        // a wrong default is caught where it's declared, even if no call ever leaves it out
+        ("fn f(a: int = \"x\") {}\nfn main() {}", "1:15: error: expected int, found str"),
+        ("struct S { a: int = \"x\" }\nfn main() {}", "1:21: error: expected int, found str"),
+        ("enum E { V { a: str = 1 } }\nfn main() {}", "1:23: error: expected str, found int"),
+        ("struct S { x: int, fn g(self, a: bool = 3) {} }\nfn main() {}", "1:41: error: expected bool, found int"),
+        ("fn f(a: int, b: int = a) {}\nfn main() {}", "unknown name `a`"),
     ] {
         let (code, _, err) = run("defaults_bad", src);
         assert!(code == -1 && err.contains(want), "{src}\n{err}");
