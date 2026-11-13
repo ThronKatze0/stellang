@@ -111,6 +111,48 @@ char *st_env(const char *name) {
     return v ? mkstr(v, strlen(v)) : "";
 }
 
+// the command line, saved by `main` for the builtin `args()` (empty in the browser)
+static int st_argc;
+static char **st_argv;
+void st_set_args(int32_t argc, char **argv) {
+    st_argc = argc;
+    st_argv = argv;
+}
+
+// `args() -> [str]`: the arguments after the program name
+Vec *st_args(void) {
+    Vec *v = st_vec_new(0, sizeof(char *), 0);
+    for (int i = 1; i < st_argc; i++) st_vec_push_str(v, mkstr(st_argv[i], strlen(st_argv[i])));
+    return v;
+}
+
+// `read_line() -> str?`: one line from stdin without its line break; NULL (none) at the end of input
+char *st_read_line(void) {
+    fflush(stdout); // a prompt printed with `print` shows up before we wait
+    size_t cap = 128, n = 0;
+    char *buf = alloc(cap, 1, 1);
+    int c;
+    while ((c = getchar()) != EOF && c != '\n') {
+        if (n + 1 == cap) {
+            char *b = alloc(cap * 2, 1, 1);
+            memcpy(b, buf, n);
+            buf = b;
+            cap *= 2;
+        }
+        buf[n++] = (char)c;
+    }
+    if (c == EOF && n == 0) return NULL;
+    if (n && buf[n - 1] == '\r') n--;
+    buf[n] = 0;
+    return buf;
+}
+
+// `exit(code)`: end the program now
+_Noreturn void st_exit(int64_t code) {
+    fflush(stdout);
+    exit((int)code);
+}
+
 // ---- strings (immutable, NUL-terminated, GC-allocated) ----
 
 int64_t st_strlen(const char *s) { return strlen(s); }
