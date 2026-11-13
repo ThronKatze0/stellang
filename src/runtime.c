@@ -7,24 +7,29 @@
 #include <math.h>
 #include <dirent.h>
 #include <fcntl.h>
+#ifndef ST_WASM
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/socket.h>
+#endif
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef __linux__
+#if defined(__linux__) && !defined(ST_WASM)
 #include <sys/sendfile.h>
 #endif
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#ifndef ST_WASM
 #include <curl/curl.h>
+#endif
 
+// Boehm GC natively; in the browser the collector in runtime_web.c
 void GC_init(void);
 void *GC_malloc(size_t);
 void *GC_malloc_atomic(size_t);
@@ -64,7 +69,9 @@ void *st_alloc(int64_t size) { return alloc(size, 1, 0); } // objects, closures,
 void st_init(void) {
     GC_init();
     setvbuf(stdout, NULL, _IOLBF, 0);
+#ifndef ST_WASM
     signal(SIGPIPE, SIG_IGN); // a client hanging up must not kill a server
+#endif
 }
 
 Vec *st_vec_new(int64_t n, int64_t esz, int64_t atomic) {
@@ -116,6 +123,45 @@ char *st_concat(const char *a, const char *b) {
     memcpy(r + la, b, lb + 1);
     return r;
 }
+
+// ---- JSX ----
+
+// text -> HTML-safe text
+char *st_html_escape(const char *s) {
+    size_t n = 0;
+    for (const char *p = s; *p; p++) n += *p == '&' ? 5 : *p == '<' || *p == '>' ? 4 : *p == '"' ? 6 : *p == '\'' ? 5 : 1;
+    char *r = alloc(n + 1, 1, 1), *o = r;
+    for (const char *p = s; *p; p++) {
+        const char *e = *p == '&' ? "&amp;" : *p == '<' ? "&lt;" : *p == '>' ? "&gt;" : *p == '"' ? "&quot;" : *p == '\'' ? "&#39;" : NULL;
+        if (e) { size_t k = strlen(e); memcpy(o, e, k); o += k; } else *o++ = *p;
+    }
+    *o = 0;
+    return r;
+}
+
+#ifndef ST_WASM
+// On the server event handlers aren't rendered and state isn't kept between renders.
+int64_t st_on(void *f, int64_t arity) { (void)f; (void)arity; return 0; }
+void **st_hook(void) { return alloc(1, sizeof(void *), 0); }
+void st_invalidate(void) {}
+
+// std/web.st outside the browser: mount renders once to stdout; the rest does nothing.
+void st_mount(const char *selector, void *app) {
+    (void)selector;
+    char *html = ((char *(*)(void *))(*(void **)app))(app);
+    puts(html);
+}
+int64_t st_timer(void *f, int64_t ms, int64_t repeat) { (void)f; (void)ms; (void)repeat; return 0; }
+void st_clear_timer(int64_t id) { (void)id; }
+void st_fetch(const char *m, const char *u, const char *b, void *done) { (void)m; (void)u; (void)b; (void)done; }
+char *st_storage_get(const char *key) { (void)key; return ""; }
+void st_storage_set(const char *key, const char *value) { (void)key; (void)value; }
+char *st_location(void) { return "/"; }
+void st_navigate(const char *path) { (void)path; }
+void st_set_title(const char *t) { (void)t; }
+const char *st_raw(const char *html) { return html; }
+char *st_element_text(const char *id) { (void)id; return ""; }
+#endif
 
 char *st_itoa(int64_t n) {
     char b[24];
@@ -462,12 +508,13 @@ Vec *st_map_list(Map *m, int64_t which, int64_t esz, int64_t atomic) {
     return v;
 }
 
-// ---- sockets, used by std/net.st through `extern fn` ----
 // Each call clears the last error; on failure it returns -1 (or "") and st_error() explains why.
-
 static const char *last_error = "";
 static void failed(void) { last_error = mkstr(strerror(errno), strlen(strerror(errno))); }
 const char *st_error(void) { return last_error; }
+
+#ifndef ST_WASM
+// ---- sockets, used by std/net.st through `extern fn` ----
 
 int64_t st_listen(int64_t port) {
     last_error = "";
@@ -727,6 +774,8 @@ void st_drop(int64_t fd) {
     close((int)fd);
 }
 
+#endif // sockets
+
 int64_t st_now_ms(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -835,6 +884,7 @@ bool st_is_dir(const char *path) {
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+#ifndef ST_WASM
 // write `head`, then the file's bytes (binary-safe)
 int64_t st_send_file(int64_t fd, const char *head, const char *path) {
     int f = open(path, O_RDONLY);
@@ -859,6 +909,7 @@ int64_t st_send_file(int64_t fd, const char *head, const char *path) {
     close(f);
     return r;
 }
+#endif
 
 char *st_read_file(const char *path) {
     last_error = "";
@@ -927,7 +978,8 @@ char *st_chr(int64_t c) {
     return mkstr(b, strlen(b));
 }
 
-// ---- HTTP(S) client on libcurl, for http.fetch / http.request ----
+// ---- HTTP(S) client on libcurl, for http.fetch / http.request (not in the browser: `import http` is server-only) ----
+#ifndef ST_WASM
 
 typedef struct { char *p; size_t len, cap; } Bytes;
 
@@ -1010,7 +1062,7 @@ static size_t on_header(char *p, size_t size, size_t n, void *ud) {
 // [status, body, name, value, name, value, ...] (names lowercase), or ["", error message].
 // Any HTTP status is an answer; only DNS, connect, TLS, timeout and the like are errors. Those start with
 // their kind: `timeout:`, `dns:`, `connect:`, `tls:`, `too_large:` or `other:`.
-Vec *st_fetch(const char *method, const char *url, Vec *headers, const char *body, int64_t timeout_ms) {
+Vec *st_http_fetch(const char *method, const char *url, Vec *headers, const char *body, int64_t timeout_ms) {
     // one handle for the whole program: curl_easy_reset clears the options but keeps its connection cache,
     // so the next fetch to the same host skips the TCP and TLS handshakes
     static CURL *c;
@@ -1079,3 +1131,4 @@ Vec *st_fetch(const char *method, const char *url, Vec *headers, const char *bod
     for (int64_t i = 0; i < hs->len; i++) st_vec_push_str(out, ((char **)hs->data)[i]);
     return out;
 }
+#endif // HTTP(S) client

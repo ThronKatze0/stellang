@@ -158,6 +158,197 @@ exports.run = async () => {
     vscode.window.terminals.forEach((t) => t.dispose());
   });
 
+  // ---- smarter completion, quick fixes ----
+  const scratch = path.join(os.tmpdir(), "stellang-vscode-test", "scratch.st");
+  fs.mkdirSync(path.dirname(scratch), { recursive: true });
+  const base = [
+    "enum Shape { Circle(float), Rect { w: float, h: float }, Empty }",
+    "struct Todo {",
+    "    id: int,",
+    "    title: str,",
+    "    done: bool = false,",
+    "}",
+    "fn area(s: Shape) -> float {",
+    "    return match s {",
+    "        .Empty => 0.0,",
+    "    }",
+    "}",
+    "fn main() {",
+    "    let t = Todo { id: 1, title: \"x\" }",
+    "    println(t.title)",
+    "}",
+    "",
+  ].join("\n");
+  fs.writeFileSync(scratch, base);
+  const sdoc = await vscode.workspace.openTextDocument(scratch);
+  await vscode.window.showTextDocument(sdoc);
+  const typeAt = async (line, text) => {
+    const e = new vscode.WorkspaceEdit();
+    e.insert(sdoc.uri, new vscode.Position(line, 0), text + "\n");
+    await vscode.workspace.applyEdit(e);
+    return new vscode.Position(line, text.length);
+  };
+  const labels = async (pos) => {
+    const r = await vscode.commands.executeCommand("vscode.executeCompletionItemProvider", sdoc.uri, pos);
+    return r.items.map((i) => (typeof i.label === "string" ? i.label : i.label.label));
+  };
+  const reset = async () => {
+    const e = new vscode.WorkspaceEdit();
+    e.replace(sdoc.uri, new vscode.Range(0, 0, sdoc.lineCount, 0), base);
+    await vscode.workspace.applyEdit(e);
+  };
+  await check("completion offers the fields a struct literal still needs", async () => {
+    const pos = await typeAt(14, "    let u = Todo { id: 2, ");
+    const ls = await until("fields", async () => {
+      const l = await labels(pos);
+      return l.includes("title") && l;
+    });
+    assert.ok(!ls.includes("id") && ls.includes("done"), ls.slice(0, 10).join(","));
+    await reset();
+  });
+  await check("completion knows which enum a .Variant needs", async () => {
+    const pos = await typeAt(14, "    let s: Shape = .");
+    const ls = await until("variants", async () => {
+      const l = await labels(pos);
+      return l.includes("Circle") && l;
+    });
+    assert.ok(ls.includes("Rect") && ls.includes("Empty"), ls.join(","));
+    await reset();
+  });
+  await check("postfix completion: value.match writes every arm", async () => {
+    const pos = await typeAt(14, "    area(.Empty).");
+    const r = await until("postfix", async () => {
+      const x = await vscode.commands.executeCommand("vscode.executeCompletionItemProvider", sdoc.uri, pos);
+      return x.items.find((i) => i.label === "match" || i.label?.label === "match") && x;
+    });
+    assert.ok(r.items.some((i) => (i.label.label ?? i.label) === "floor"));
+    await reset();
+  });
+  await check("quick fix adds missing match arms", async () => {
+    const d = await until("match diagnostic", () => vscode.languages.getDiagnostics(sdoc.uri).find((x) => /doesn't handle/.test(x.message)));
+    const actions = await vscode.commands.executeCommand("vscode.executeCodeActionProvider", sdoc.uri, d.range, vscode.CodeActionKind.QuickFix.value);
+    const fix = actions.find((a) => /missing match arms/.test(a.title));
+    assert.ok(fix, actions.map((a) => a.title).join(","));
+    await vscode.workspace.applyEdit(fix.edit);
+    assert.ok(sdoc.getText().includes(".Circle(x) =>") && sdoc.getText().includes(".Rect { w, h } =>"));
+    await until("no errors", () => vscode.languages.getDiagnostics(sdoc.uri).length === 0);
+    await reset();
+  });
+  await check("quick fix imports a std module", async () => {
+    const e = new vscode.WorkspaceEdit();
+    e.replace(sdoc.uri, new vscode.Range(0, 0, sdoc.lineCount, 0), "fn main() {\n    let app = http.app()\n}\n");
+    await vscode.workspace.applyEdit(e);
+    const d = await until("unknown http", () => vscode.languages.getDiagnostics(sdoc.uri).find((x) => /`http`/.test(x.message)));
+    const actions = await vscode.commands.executeCommand("vscode.executeCodeActionProvider", sdoc.uri, d.range, vscode.CodeActionKind.QuickFix.value);
+    const fix = actions.find((a) => a.title === "Import `http`");
+    assert.ok(fix, actions.map((a) => a.title).join(","));
+    await vscode.workspace.applyEdit(fix.edit);
+    assert.ok(sdoc.getText().startsWith("import http\n"));
+    await reset();
+  });
+  await sdoc.save();
+  await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
+
+  // ---- the app: sidebar, runner, templates, IR, themes ----
+  const api = ext.exports;
+  await check("Programs view lists the programs", async () => {
+    const items = await api.trees.programs.getChildren();
+    const names = items.map((i) => i.label);
+    assert.ok(names.includes("todos.st") && names.includes("server.st"), names.join(","));
+  });
+  await check("Types view shows structs and enums with their fields", async () => {
+    const items = await until("types", async () => {
+      const x = await api.trees.model.getChildren();
+      return x.some((i) => i.label === "Todo") && x;
+    });
+    // (examples/fullstack has a Todo of its own)
+    const kids = [];
+    for (const todo of items.filter((i) => i.label === "Todo")) kids.push(...(await api.trees.model.getChildren(todo)).map((i) => i.label));
+    assert.ok(kids.includes("title") && kids.includes("priority"), kids.join(","));
+    assert.ok(items.some((i) => i.label === "Priority"));
+  });
+  await check("HTTP Routes view finds the routes", async () => {
+    const files = await api.trees.routes.getChildren();
+    const all = (await Promise.all(files.map((f) => api.trees.routes.getChildren(f)))).flat().map((i) => i.label);
+    assert.ok(all.includes("GET /todos") && all.includes("WS /feed") && !all.includes("GET status"), all.join(","));
+  });
+  await check("the runner notices a server's address, stops and restarts it", async () => {
+    await vscode.workspace.getConfiguration("stellang").update("run.env", { PORT: "18767" }, vscode.ConfigurationTarget.Global);
+    await vscode.workspace.getConfiguration("stellang").update("run.openBrowser", "never", vscode.ConfigurationTarget.Global);
+    const file = path.join(root, "server.st");
+    api.runner.run(file);
+    const r = await until("the url", () => api.runner.runs.get(file)?.url, 60000);
+    assert.ok(/:18767/.test(r), r);
+    await api.runner.stop(file);
+    await until("stopped", async () => (await get(18767, "/hello/x")) === null);
+    api.runner.runs.get(file).restart();
+    await until("restarted", () => get(18767, "/hello/again"), 60000);
+    vscode.window.terminals.forEach((t) => t.dispose());
+    await until("cleaned up", () => api.runner.runs.size === 0);
+    await vscode.workspace.getConfiguration("stellang").update("run.env", undefined, vscode.ConfigurationTarget.Global);
+  });
+  await check("every project template compiles", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "stellang-templates-"));
+    for (const id of api.templates) {
+      api.createProject(id, path.join(dir, id), `t-${id}`);
+      for (const f of id === "fullstack" ? ["server.st", "client.st"] : ["main.st"]) {
+        const main = path.join(dir, id, f);
+        const done = new Promise((r) => vscode.tasks.onDidEndTaskProcess((e) => r(e.exitCode)));
+        await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(main));
+        await vscode.commands.executeCommand("stellang.check");
+        assert.strictEqual(await done, 0, `${id}/${f} doesn't type-check`);
+      }
+    }
+  });
+  await check("JSX: completion offers components, then their props", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "stellang-jsx-"));
+    const file = path.join(dir, "ui.st");
+    fs.writeFileSync(file, 'import web\n\nfn Badge(count: int, label: str?) -> Node {\n    return <b title={label}>{count}</b>\n}\n\nfn App() -> Node {\n    return <main>\n    </main>\n}\n');
+    const d = await vscode.workspace.openTextDocument(file);
+    const ed = await vscode.window.showTextDocument(d);
+    await until("diagnostics settle", async () => (await vscode.commands.executeCommand("vscode.executeHoverProvider", d.uri, new vscode.Position(2, 4))).length);
+    await ed.edit((e) => e.insert(new vscode.Position(8, 0), "        <\n"));
+    const tags = await until("tag completion", async () => {
+      const r = await vscode.commands.executeCommand("vscode.executeCompletionItemProvider", d.uri, new vscode.Position(8, 9));
+      return r.items.some((i) => i.label === "Badge" || i.label.label === "Badge") && r;
+    });
+    const badge = tags.items.find((i) => (i.label.label || i.label) === "Badge");
+    assert.match(badge.insertText.value, /^Badge count=\{\$\{1\}\} \/>$/, badge.insertText.value);
+    assert.ok(tags.items.some((i) => (i.label.label || i.label) === "div"));
+    await ed.edit((e) => e.replace(new vscode.Range(8, 0, 9, 0), "        <Badge \n"));
+    const props = await until("prop completion", async () => {
+      const r = await vscode.commands.executeCommand("vscode.executeCompletionItemProvider", d.uri, new vscode.Position(8, 15));
+      return r.items.some((i) => (i.label.label || i.label) === "count") && r;
+    });
+    assert.ok(props.items.some((i) => (i.label.label || i.label) === "label"));
+    await vscode.commands.executeCommand("workbench.action.revertAndCloseActiveEditor");
+  });
+  await check("the runner builds a browser app and serves it", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "stellang-browser-"));
+    api.createProject("browser", path.join(dir, "app"), "app");
+    const file = path.join(dir, "app", "main.st");
+    api.runner.run(file);
+    const url = await until("the url", () => api.runner.runs.get(file)?.url, 90000);
+    const port = +new URL(url).port;
+    assert.match(await get(port, "/"), /<script src="\/main\.js"><\/script>/);
+    assert.match(await get(port, "/main.js"), /stellang web loader/);
+    await api.runner.stop(file);
+    vscode.window.terminals.forEach((t) => t.dispose());
+    await until("cleaned up", () => api.runner.runs.size === 0);
+  });
+  await check("Show LLVM IR opens the generated code", async () => {
+    await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(path.join(root, "server.st")));
+    await vscode.commands.executeCommand("stellang.showIr");
+    const ir = await until("the .ll", () => vscode.workspace.textDocuments.find((d) => d.fileName.endsWith("server.ll")));
+    assert.ok(ir.getText().includes("define"));
+  });
+  await check("the star themes load", async () => {
+    for (const t of ["Stellang Nebula", "Stellang Daybreak"]) {
+      await vscode.workspace.getConfiguration("workbench").update("colorTheme", t, vscode.ConfigurationTarget.Global);
+      await until(t, () => vscode.window.activeColorTheme.kind === (t.includes("Nebula") ? vscode.ColorThemeKind.Dark : vscode.ColorThemeKind.Light));
+    }
+  });
+
   await vscode.commands.executeCommand("workbench.action.files.revert");
   const report = results.join("\n");
   console.log(`\n${report}\n`);

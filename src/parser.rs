@@ -17,6 +17,8 @@ pub enum Type {
     Fn(Vec<Type>, Box<Type>), // fn(A, B) -> R
     Result(Box<Type>),       // T!  = a T or an error message
     Opt(Box<Type>),          // T?  = a T or `none`
+    Generic(String, Vec<Type>), // Box<int>: a generic type applied to arguments (resolved to a Struct/Enum instance)
+    Node,                    // a JSX element (an HTML fragment on the server, a DOM node in the browser)
 }
 
 impl fmt::Display for Type {
@@ -33,6 +35,11 @@ impl fmt::Display for Type {
             Type::Opt(t) => write!(f, "{t}?"),
             Type::List(t) => write!(f, "[{t}]"),
             Type::Result(t) => write!(f, "{t}!"),
+            Type::Node => write!(f, "Node"),
+            Type::Generic(n, args) => {
+                let a: Vec<String> = args.iter().map(|t| t.to_string()).collect();
+                write!(f, "{n}<{}>", a.join(", "))
+            }
             Type::Fn(ps, r) => {
                 let ps: Vec<String> = ps.iter().map(|p| p.to_string()).collect();
                 write!(f, "fn({})", ps.join(", "))?;
@@ -74,6 +81,7 @@ pub enum Cond {
     Let(Pat, Expr),
 }
 
+#[derive(Clone)]
 pub struct Arm {
     pub pat: Pat,
     pub guard: Option<Expr>,
@@ -118,6 +126,34 @@ pub enum ExprKind {
     Member(String),                      // `.Circle`: a variant of the enum the context expects
     // `a?.b.c`: if `a` is none the whole thing is none; otherwise `rest` with the value of `a` as `name`
     Chain(String, Box<Expr>, Box<Expr>),
+    Element(Box<Element>), // <div class="x">"text" {value}</div>
+    JsxPush(Vec<Child>),   // (made by the compiler) add these children to the element being built
+}
+
+/// A JSX element: `<tag attr="v" on_click={f}>children</tag>`, a component `<Card title="x" />`, or a
+/// fragment `<>...</>` (empty tag).
+#[derive(Clone)]
+pub struct Element {
+    pub tag: String,
+    pub attrs: Vec<Attr>,
+    pub children: Vec<Child>,
+    pub pos: Pos,
+}
+
+#[derive(Clone)]
+pub struct Attr {
+    pub name: String,
+    pub value: Option<Expr>, // `disabled` alone has none
+    pub pos: Pos,
+}
+
+#[derive(Clone)]
+pub enum Child {
+    Text(Expr),           // "text" (escaped)
+    Value(Expr),          // {value}: text, a Node, a list of Nodes, ...
+    Elem(Element),
+    For(Box<Stmt>),       // for x in xs { children } (a `for` whose body is a JsxPush)
+    If(Box<Stmt>),        // if c { children } else { children }
 }
 
 #[derive(Clone)]
@@ -136,11 +172,20 @@ pub enum Stmt {
     Continue(Pos),
 }
 
+/// `T` or `T: Show + Eq` in `fn f<...>` / `struct Box<...>`.
+#[derive(Clone, Debug)]
+pub struct TParam {
+    pub name: String,
+    pub bounds: Vec<String>,
+}
+
 /// A parameter: its name and type (only `self` may omit the type).
 pub type Param = (String, Option<Type>);
 
+#[derive(Clone)]
 pub struct Func {
     pub name: String,
+    pub tparams: Vec<TParam>,
     pub params: Vec<Param>,
     pub defaults: Vec<Option<Expr>>,         // one per parameter: `timeout: int = 8000`
     pub ret: Type,
@@ -155,12 +200,15 @@ pub struct Field {
     pub default: Option<Expr>,
 }
 
+#[derive(Clone)]
 pub struct StructDef {
     pub name: String,
+    pub tparams: Vec<TParam>,
     pub fields: Vec<Field>,
     pub pos: Pos,
 }
 
+#[derive(Clone)]
 pub struct Variant {
     pub name: String,
     pub fields: Vec<Field>, // tuple variants get the names "0", "1", ... unless named
@@ -168,8 +216,10 @@ pub struct Variant {
     pub pos: Pos,
 }
 
+#[derive(Clone)]
 pub struct EnumDef {
     pub name: String,
+    pub tparams: Vec<TParam>,
     pub variants: Vec<Variant>,
     pub pos: Pos,
 }
@@ -183,7 +233,15 @@ pub struct Const {
 
 pub struct Impl {
     pub name: String,
+    pub trait_: Option<String>, // `impl Show for Point`
     pub methods: Vec<Func>,
+    pub pos: Pos,
+}
+
+/// `trait Show { fn show(self) -> str; fn twice(self) -> str { ... } }`
+pub struct Trait {
+    pub name: String,
+    pub methods: Vec<(Func, bool)>, // (method, has a default body)
     pub pos: Pos,
 }
 
@@ -201,6 +259,7 @@ pub struct Module {
     pub enums: Vec<EnumDef>,
     pub consts: Vec<Const>,
     pub impls: Vec<Impl>,
+    pub traits: Vec<Trait>,
     pub funcs: Vec<Func>,
     pub externs: Vec<Extern>,
     /// (token index, opens?) for every block brace; `stellang fmt` uses it to tell ⭐ apart
@@ -210,7 +269,7 @@ pub struct Module {
 type P<T> = Result<T, Error>;
 
 pub fn parse(toks: Vec<Token>) -> P<Module> {
-    let mut p = Parser { toks, i: 0, braces: vec![], no_struct: false };
+    let mut p = Parser { toks, i: 0, braces: vec![], no_struct: false, jsx_end: usize::MAX };
     let mut m = Module::default();
     loop {
         p.nl();
@@ -224,14 +283,14 @@ pub fn parse(toks: Vec<Token>) -> P<Module> {
             Tok::Struct => {
                 let (s, methods) = p.structdef()?;
                 if !methods.is_empty() {
-                    m.impls.push(Impl { name: s.name.clone(), methods, pos: s.pos });
+                    m.impls.push(Impl { name: s.name.clone(), trait_: None, methods, pos: s.pos });
                 }
                 m.structs.push(s);
             }
             Tok::Enum => {
                 let (e, methods) = p.enumdef()?;
                 if !methods.is_empty() {
-                    m.impls.push(Impl { name: e.name.clone(), methods, pos: e.pos });
+                    m.impls.push(Impl { name: e.name.clone(), trait_: None, methods, pos: e.pos });
                 }
                 m.enums.push(e);
             }
@@ -246,7 +305,12 @@ pub fn parse(toks: Vec<Token>) -> P<Module> {
             Tok::Impl => {
                 let pos = p.pos();
                 p.next();
-                let name = p.ident()?;
+                let mut name = p.impl_name()?;
+                let mut trait_ = None;
+                if p.eat(&Tok::For) {
+                    trait_ = Some(name);
+                    name = p.impl_name()?;
+                }
                 p.open()?;
                 let mut methods = vec![];
                 loop {
@@ -257,7 +321,23 @@ pub fn parse(toks: Vec<Token>) -> P<Module> {
                     }
                     methods.push(p.func(true)?);
                 }
-                m.impls.push(Impl { name, methods, pos });
+                m.impls.push(Impl { name, trait_, methods, pos });
+            }
+            Tok::Trait => {
+                let pos = p.pos();
+                p.next();
+                let name = p.ident()?;
+                p.open()?;
+                let mut methods = vec![];
+                loop {
+                    p.nl();
+                    if p.closes() { break }
+                    if *p.peek() != Tok::Fn {
+                        return p.fail(format!("expected `fn` inside trait, found {}", p.peek()));
+                    }
+                    methods.push(p.func_decl()?);
+                }
+                m.traits.push(Trait { name, methods, pos });
             }
             Tok::Extern => {
                 let pos = p.pos();
@@ -276,7 +356,7 @@ pub fn parse(toks: Vec<Token>) -> P<Module> {
                 m.braces = p.braces;
                 return Ok(m);
             }
-            t => return p.fail(format!("expected `fn`, `struct`, `enum`, `impl`, `const` or `import`, found {t}")),
+            t => return p.fail(format!("expected `fn`, `struct`, `enum`, `trait`, `impl`, `const` or `import`, found {t}")),
         }
     }
 }
@@ -289,7 +369,7 @@ fn interp(parts: Vec<Part>, pos: Pos) -> P<Expr> {
             Part::Lit(s) if s.is_empty() => continue,
             Part::Lit(s) => Expr { kind: ExprKind::Str(s), pos },
             Part::Code(toks, at) => {
-                let mut p = Parser { toks, i: 0, braces: vec![], no_struct: false };
+                let mut p = Parser { toks, i: 0, braces: vec![], no_struct: false, jsx_end: usize::MAX };
                 p.nl();
                 if *p.peek() == Tok::Eof {
                     return Err((at, "empty `${}` in string".into()));
@@ -316,6 +396,7 @@ struct Parser {
     i: usize,
     braces: Vec<(usize, bool)>,
     no_struct: bool, // in `if x {`, `{` starts the block, not a struct literal
+    jsx_end: usize,  // token index right after the last JSX element (its line counts as ended)
 }
 
 impl Parser {
@@ -386,7 +467,7 @@ impl Parser {
             self.nl();
             if self.close(&close) { break }
             v.push(item(self)?);
-            let broke = self.nl();
+            let broke = self.nl() || self.i == self.jsx_end;
             if !self.eat(&Tok::Comma) && !broke {
                 if self.close(&close) { break }
                 return self.fail(format!("expected `,` or {close}, found {}", self.peek()));
@@ -423,8 +504,16 @@ impl Parser {
                 "bool" => Type::Bool,
                 "str" => Type::Str,
                 "void" => Type::Void,
-                _ if self.eat(&Tok::Dot) => Type::Struct(format!("{name}.{}", self.ident()?)),
-                _ => Type::Struct(name),
+                _ => {
+                    let name = if self.eat(&Tok::Dot) { format!("{name}.{}", self.ident()?) } else { name };
+                    if name == "Node" {
+                        Type::Node
+                    } else if *self.peek() == Tok::Lt {
+                        Type::Generic(name, self.type_args()?)
+                    } else {
+                        Type::Struct(name)
+                    }
+                }
             }
         };
         let mut t = t;
@@ -437,6 +526,57 @@ impl Parser {
                 return Ok(t);
             }
         }
+    }
+
+    /// `<int, str>` after a generic type's name.
+    fn type_args(&mut self) -> P<Vec<Type>> {
+        self.expect(Tok::Lt)?;
+        let mut v = vec![];
+        loop {
+            v.push(self.ty()?);
+            if self.eat(&Tok::Comma) { continue }
+            // `Box<int>= x` lexes as `>=`: take the `>` and leave a `=`
+            if *self.peek() == Tok::Ge {
+                self.toks[self.i].tok = Tok::Assign;
+                return Ok(v);
+            }
+            self.expect(Tok::Gt)?;
+            return Ok(v);
+        }
+    }
+
+    /// `<T, U: Show + Eq>` after a function or type name (or nothing).
+    fn tparams(&mut self) -> P<Vec<TParam>> {
+        if !self.eat(&Tok::Lt) {
+            return Ok(vec![]);
+        }
+        let mut v: Vec<TParam> = vec![];
+        loop {
+            let name = self.ident()?;
+            let mut bounds = vec![];
+            if self.eat(&Tok::Colon) {
+                loop {
+                    let mut b = self.ident()?;
+                    if self.eat(&Tok::Dot) { b = format!("{b}.{}", self.ident()?) }
+                    bounds.push(b);
+                    if !self.eat(&Tok::Plus) { break }
+                }
+            }
+            v.push(TParam { name, bounds });
+            if self.eat(&Tok::Comma) { continue }
+            self.expect(Tok::Gt)?;
+            return Ok(v);
+        }
+    }
+
+    /// The type named after `impl` / `for`: `Point`, `Box<T>` (the arguments just repeat the type's parameters), `int`.
+    fn impl_name(&mut self) -> P<String> {
+        let mut name = self.ident()?;
+        if self.eat(&Tok::Dot) { name = format!("{name}.{}", self.ident()?) }
+        if *self.peek() == Tok::Lt {
+            self.type_args()?;
+        }
+        Ok(name)
     }
 
     /// `name: Type`, `name: Type = default`, or a bare `self` when `allow_self`.
@@ -452,9 +592,26 @@ impl Parser {
     }
 
     fn func(&mut self, method: bool) -> P<Func> {
+        let mut f = self.signature(method)?;
+        f.body = self.block()?;
+        Ok(f)
+    }
+
+    /// A trait method: a signature, with or without a default body.
+    fn func_decl(&mut self) -> P<(Func, bool)> {
+        let mut f = self.signature(true)?;
+        if self.at_open() {
+            f.body = self.block()?;
+            return Ok((f, true));
+        }
+        Ok((f, false))
+    }
+
+    fn signature(&mut self, method: bool) -> P<Func> {
         let pos = self.pos();
         self.next();
         let name = self.ident()?;
+        let tparams = self.tparams()?;
         self.expect(Tok::LParen)?;
         let mut first = method;
         let all = self.list(Tok::RParen, |p| {
@@ -468,7 +625,7 @@ impl Parser {
             return Err((pos, format!("parameter `{}` needs a default too (it comes after one that has one)", params[first + j].0)));
         }
         let ret = if self.eat(&Tok::Arrow) { self.ty()? } else { Type::Void };
-        Ok(Func { name, params, defaults, ret, body: self.block()?, pos })
+        Ok(Func { name, tparams, params, defaults, ret, body: vec![], pos })
     }
 
     /// `name: Type` or `name: Type = default`.
@@ -493,7 +650,7 @@ impl Parser {
                 continue;
             }
             items.push(item(self)?);
-            let broke = self.nl();
+            let broke = self.nl() || self.i == self.jsx_end;
             if !self.eat(&Tok::Comma) && !broke {
                 if self.closes() { break }
                 return self.fail(format!("expected `,` or `}}`, found {}", self.peek()));
@@ -507,14 +664,16 @@ impl Parser {
         let pos = self.pos();
         self.next();
         let name = self.ident()?;
+        let tparams = self.tparams()?;
         let (fields, methods) = self.body(|p| p.field())?;
-        Ok((StructDef { name, fields, pos }, methods))
+        Ok((StructDef { name, tparams, fields, pos }, methods))
     }
 
     fn enumdef(&mut self) -> P<(EnumDef, Vec<Func>)> {
         let pos = self.pos();
         self.next();
         let name = self.ident()?;
+        let tparams = self.tparams()?;
         let (variants, methods) = self.body(|p| {
             let pos = p.pos();
             let name = p.ident()?;
@@ -536,7 +695,7 @@ impl Parser {
                 Ok(Variant { name, fields: vec![], braces: false, pos })
             }
         })?;
-        Ok((EnumDef { name, variants, pos }, methods))
+        Ok((EnumDef { name, tparams, variants, pos }, methods))
     }
 
     fn block(&mut self) -> P<Vec<Stmt>> {
@@ -547,7 +706,7 @@ impl Parser {
             self.nl();
             if self.closes() { break }
             v.push(self.stmt()?);
-            if !matches!(self.peek(), Tok::Newline | Tok::Semi | Tok::Star | Tok::RBrace) {
+            if !matches!(self.peek(), Tok::Newline | Tok::Semi | Tok::Star | Tok::RBrace) && self.i != self.jsx_end {
                 return self.fail(format!("expected the end of the line, found {}", self.peek()));
             }
         }
@@ -778,7 +937,197 @@ impl Parser {
 
     fn postfix(&mut self) -> P<Expr> {
         let e = self.primary()?;
+        if matches!(e.kind, ExprKind::Element(_)) {
+            return Ok(e);
+        }
         self.postfix_from(e)
+    }
+
+    /// A tag or attribute name: `div`, `my-widget`, `aria-label`, `ui.Card`.
+    fn tag_name(&mut self) -> P<String> {
+        let mut name = self.ident()?;
+        loop {
+            let glued = self.toks[self.i].start == self.toks[self.i - 1].end;
+            match self.peek() {
+                Tok::Minus if glued && matches!(self.peek_at(1), Tok::Ident(_)) => {
+                    self.next();
+                    name.push('-');
+                    name += &self.ident()?;
+                }
+                Tok::Dot if glued && matches!(self.peek_at(1), Tok::Ident(_)) => {
+                    self.next();
+                    name.push('.');
+                    name += &self.ident()?;
+                }
+                _ => return Ok(name),
+            }
+        }
+    }
+
+    /// After `<`: an element up to its closing tag.
+    fn element(&mut self, pos: Pos) -> P<Element> {
+        let saved = std::mem::replace(&mut self.no_struct, false);
+        let tag = if *self.peek() == Tok::Gt { String::new() } else { self.tag_name()? };
+        let mut attrs = vec![];
+        loop {
+            self.nl();
+            match self.peek().clone() {
+                Tok::Gt => {
+                    self.next();
+                    break;
+                }
+                Tok::Slash => {
+                    self.next();
+                    if *self.peek() != Tok::Gt {
+                        return self.fail(format!("expected `>` after `/`, found {}", self.peek()));
+                    }
+                    self.jsx_end = self.i + 1;
+                    self.next();
+                    self.no_struct = saved;
+                    return Ok(Element { tag, attrs, children: vec![], pos });
+                }
+                Tok::Ident(_) => {
+                    let apos = self.pos();
+                    let name = self.tag_name()?;
+                    let value = if self.eat(&Tok::Assign) {
+                        Some(match self.peek().clone() {
+                            Tok::Str(_) | Tok::Interp(_) => self.primary()?,
+                            Tok::LBrace => {
+                                self.next();
+                                self.nl();
+                                let e = self.expr()?;
+                                self.nl();
+                                self.expect(Tok::RBrace)?;
+                                e
+                            }
+                            t => return self.fail(format!("an attribute value is a \"string\" or a {{value}}, found {t}")),
+                        })
+                    } else {
+                        None
+                    };
+                    attrs.push(Attr { name, value, pos: apos });
+                }
+                t => return self.fail(format!("expected an attribute, `>` or `/>` in <{tag}>, found {t}")),
+            }
+        }
+        let children = self.children(&tag)?;
+        // `</tag>`
+        self.expect(Tok::Slash)?;
+        if !tag.is_empty() || *self.peek() != Tok::Gt {
+            let close = self.tag_name()?;
+            if close != tag {
+                return self.fail(format!("`</{close}>` doesn't close `<{tag}>`"));
+            }
+        }
+        if *self.peek() != Tok::Gt {
+            return self.fail(format!("expected `>`, found {}", self.peek()));
+        }
+        self.jsx_end = self.i + 1;
+        self.next();
+        self.no_struct = saved;
+        Ok(Element { tag, attrs, children, pos })
+    }
+
+    /// The children of `<tag>`, up to (and eating) the `<` of `</tag>`.
+    fn children(&mut self, tag: &str) -> P<Vec<Child>> {
+        let mut out = vec![];
+        loop {
+            self.nl();
+            let pos = self.pos();
+            match self.peek().clone() {
+                Tok::Lt if *self.peek_at(1) == Tok::Slash => {
+                    self.next();
+                    return Ok(out);
+                }
+                Tok::Lt => {
+                    self.next();
+                    out.push(Child::Elem(self.element(pos)?));
+                }
+                Tok::Str(_) | Tok::Interp(_) => out.push(Child::Text(self.primary()?)),
+                Tok::LBrace => {
+                    self.next();
+                    self.nl();
+                    let e = self.expr()?;
+                    self.nl();
+                    self.expect(Tok::RBrace)?;
+                    out.push(Child::Value(e));
+                }
+                Tok::For => {
+                    self.next();
+                    let var = self.ident()?;
+                    let var2 = if self.eat(&Tok::Comma) { Some(self.ident()?) } else { None };
+                    self.expect(Tok::In)?;
+                    let iter = self.head()?;
+                    let end = if self.eat(&Tok::DotDot) { Some(self.head()?) } else { None };
+                    let body = self.child_block()?;
+                    out.push(Child::For(Box::new(Stmt::For { var, var2, iter, end, body })));
+                }
+                Tok::If => out.push(Child::If(Box::new(self.child_if()?))),
+                Tok::Eof => return self.fail(format!("`<{tag}>` is never closed (expected `</{tag}>`)")),
+                t => return self.fail(format!("inside <{tag}>: expected an element, \"text\", {{value}}, `for` or `if`, found {t}")),
+            }
+        }
+    }
+
+    /// `{ children }` of a `for` / `if` inside an element, as a statement list.
+    fn child_block(&mut self) -> P<Vec<Stmt>> {
+        let pos = self.pos();
+        self.open()?;
+        let mut out = vec![];
+        loop {
+            self.nl();
+            if self.closes() { break }
+            let cpos = self.pos();
+            match self.peek().clone() {
+                Tok::Lt => {
+                    self.next();
+                    out.push(Child::Elem(self.element(cpos)?));
+                }
+                Tok::Str(_) | Tok::Interp(_) => out.push(Child::Text(self.primary()?)),
+                Tok::LBrace => {
+                    self.next();
+                    let e = self.expr()?;
+                    self.nl();
+                    self.expect(Tok::RBrace)?;
+                    out.push(Child::Value(e));
+                }
+                Tok::For | Tok::If => {
+                    // nested: reuse `children` logic on a one-item basis
+                    let mut more = self.children_one()?;
+                    out.append(&mut more);
+                }
+                t => return self.fail(format!("expected an element, \"text\", {{value}}, `for` or `if`, found {t}")),
+            }
+        }
+        Ok(vec![Stmt::Expr(Expr { kind: ExprKind::JsxPush(out), pos })])
+    }
+
+    fn children_one(&mut self) -> P<Vec<Child>> {
+        if *self.peek() == Tok::If {
+            return Ok(vec![Child::If(Box::new(self.child_if()?))]);
+        }
+        self.next();
+        let var = self.ident()?;
+        let var2 = if self.eat(&Tok::Comma) { Some(self.ident()?) } else { None };
+        self.expect(Tok::In)?;
+        let iter = self.head()?;
+        let end = if self.eat(&Tok::DotDot) { Some(self.head()?) } else { None };
+        let body = self.child_block()?;
+        Ok(vec![Child::For(Box::new(Stmt::For { var, var2, iter, end, body }))])
+    }
+
+    fn child_if(&mut self) -> P<Stmt> {
+        self.next();
+        let c = self.cond()?;
+        let then = self.child_block()?;
+        let els = if !self.eat(&Tok::Else) {
+            vec![]
+        } else if *self.peek() == Tok::If {
+            vec![self.child_if()?]
+        } else {
+            self.child_block()?
+        };
+        Ok(Stmt::If(c, then, els))
     }
 
     fn postfix_from(&mut self, mut e: Expr) -> P<Expr> {
@@ -885,6 +1234,10 @@ impl Parser {
         }
         if *self.peek() == Tok::If {
             return self.if_expr();
+        }
+        if *self.peek() == Tok::Lt && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Gt) {
+            self.next();
+            return Ok(Expr { kind: ExprKind::Element(Box::new(self.element(pos)?)), pos });
         }
         let kind = match self.next() {
             Tok::Dot => ExprKind::Member(self.ident()?),

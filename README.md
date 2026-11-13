@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>A small compiled language that reads like Rust, Swift and TypeScript had a baby.</b><br>
-  Structs and enums with methods · pattern matching · <code>T?</code> options and <code>T!</code> results · an Express-style web framework with WebSockets in std · a language server for any editor.
+  Structs and enums with methods · generics and traits · pattern matching · <code>T?</code> options and <code>T!</code> results · JSX in the language · full stack: native servers and WebAssembly browser apps from the same code · a language server for any editor.
 </p>
 
 <p align="center">
@@ -15,7 +15,8 @@
 
 ---
 
-Rust frontend, LLVM backend (via clang), garbage collected (Boehm GC), HTTPS client on libcurl. No crates, ~9k lines total.
+Rust frontend, LLVM backend (via clang), garbage collected (Boehm GC natively, its own collector in WebAssembly),
+HTTPS client on libcurl. No crates.
 
 ## Quick start
 
@@ -24,7 +25,12 @@ cargo install --path .              # puts `stellang` on your PATH (needs clang,
 stellang examples/server.st         # like cc: -o out, -O0..-O3 (default -O2), --emit-llvm
 ./server                            # http://localhost:8080
 stellang examples/todos.st && ./todos   # a JSON API + WebSocket feed + static page, modeled with enums
+stellang dev examples/fullstack     # server rendering + a WebAssembly client, rebuilt on every save
+stellang --web app.st               # a browser app: app.wasm + app.js (+ app.html to open)
 ```
+
+Browser builds also need the WASI C library and clang's wasm32 runtime
+(Debian/Ubuntu: `apt install wasi-libc libclang-rt-18-dev-wasm32`; `./setup.sh` installs everything).
 
 ## A web server
 
@@ -53,6 +59,98 @@ fn main() -> void! {
     app.listen(8080)?
 }
 ```
+
+## Full stack, one language
+
+Components are functions that return JSX. The server renders them to HTML; the browser runs the same
+code compiled to WebAssembly, takes over the page and re-renders when a `signal` changes. Types go
+over the wire with `to_json` and come back with `from_json`.
+
+```rust
+// shared.st: used by both sides
+import web
+import json
+
+struct Todo { id: int, title: str, done: bool = false }
+
+fn App(initial: [Todo]) -> Node {
+    let todos = signal(initial)              // state that survives re-rendering
+    let draft = signal("")
+    let add = () => web.post("/api/todos", to_json(Todo { id: 0, title: draft.get() }), r => {
+        todos.set(from_json(r.body) catch todos.get())   // decoded into [Todo]
+        draft.set("")
+    })
+    return <main>
+        <form onsubmit={_ => add()}>
+            <input value={draft.get()} oninput={v => draft.set(v)} placeholder="What next?" />
+            <button disabled={draft.get() == ""}>"Add"</button>
+        </form>
+        <ul>
+            for t in todos.get() {
+                <li key={t.id} class={if t.done { "done" } else { "" }}>{t.title}</li>
+            }
+        </ul>
+    </main>
+}
+```
+
+```rust
+// server.st
+import http
+import json
+import web
+import shared
+
+fn main() -> void! {
+    var todos: [shared.Todo] = []
+    let app = http.app()
+    app.get("/", (req, res) => res.page(
+        <html>
+            <body>
+                <div id="app"><shared.App initial={todos} /></div>
+                {web.data("todos", to_json(todos))}
+                <script src="/client.js"></script>
+            </body>
+        </html>))
+    app.post("/api/todos", (req, res) => {
+        let t: shared.Todo = from_json(req.body)?   // a bad body becomes a 500
+        todos.push(shared.Todo { id: todos.len() + 1, title: t.title })
+        res.json(to_json(todos))
+    })
+    app.static("/", "./public")
+    app.listen(8080)?
+}
+```
+
+```rust
+// client.st
+import web
+import shared
+
+fn main() {
+    let todos: [shared.Todo] = from_json(web.read_data("todos")) catch []
+    web.mount("#app", () => <shared.App initial={todos} />)
+}
+```
+
+`stellang dev` builds `client.st` into `public/client.wasm` + `client.js`, builds and runs `server.st`, and does
+it again whenever a `.st` file changes. The whole thing is in [examples/fullstack](examples/fullstack).
+
+**JSX.** Text is a string literal (`<p>"Hello, ${name}"</p>`); `{value}` shows a value (text, numbers, a `Node`,
+a `[Node]`, an optional); children can also be `for x in xs { ... }` and `if c { ... } else { ... }`.
+Attributes take `"text"`, `{value}` or nothing (`disabled`); a `bool` attribute is there or not; `key={id}`
+keeps list items apart. `<Card title="x">children</Card>` calls `fn Card(title: str, children: Node) -> Node`,
+or fills the fields (and their defaults) of its one props struct. Text and values are escaped; `web.raw(html)`
+is the way around that. Events: `onclick={() => ...}`, `oninput={value => ...}`, `onchange`, `onkeydown={key => ...}`,
+`onsubmit={fields => ...}`, `onfocus`, `onblur`, ...
+
+**In the browser** (`import web`): `web.mount(selector, () => <App />)`; `signal(x)` gives a `Signal<T>` with
+`get set update`, kept from render to render (call them at the top of a component, the same way each time);
+`web.every(ms, f)`, `web.after(ms, f)`, `web.cancel(id)`; `web.get/post/request(..., r => ...)` with
+`r.status r.body r.is_ok() r.json()`; `web.location() navigate(path) set_title(t)`; `web.load(key)`/`save(key, value)`
+(localStorage); `web.data(id, json)` / `web.read_data(id)` to hand server data to the app. The page is patched in
+place, so focus, selection and what's typed survive a re-render; a panic shows up on the page.
+`print` goes to the browser console. A typical app is 30–60 KB of WebAssembly.
 
 ## Calling an API
 
@@ -183,6 +281,46 @@ println(Shape.Circle(1.0) == .Circle(1.0))   // == compares contents (structs, e
 println(to_json(bob))                      // {"name":"bob","email":null,"role":"Member"}
 ```
 
+## Generics and traits
+
+```rust
+struct Stack<T> {
+    items: [T] = []
+
+    fn push(self, x: T) { self.items.push(x) }
+    fn pop(self) -> T? { return self.items.pop() }
+    fn map<U>(self, f: fn(T) -> U) -> Stack<U> { return Stack { items: self.items.map(f) } }
+}
+
+enum Tree<T> {
+    Leaf
+    Node(Tree<T>, T, Tree<T>)
+}
+
+fn largest<T>(xs: [T]) -> T? {                  // checked for each type it's used with
+    var best = xs.first()?
+    for x in xs { if x > best { best = x } }
+    return best
+}
+
+trait Show {
+    fn show(self) -> str
+    fn shout(self) -> str { return self.show().upper() + "!" }   // a default
+}
+impl Show for Point { fn show(self) -> str { return "(${self.x}, ${self.y})" } }
+impl Show for int { fn show(self) -> str { return "#${self}" } }
+
+fn all<T: Show>(xs: [T]) -> str { return xs.map(x => x.show()).join(", ") }
+
+let s: Stack<str> = Stack {}                     // or inferred: Stack { items: ["a"] }
+let t: Tree<int> = .Node(.Leaf, 1, .Leaf)
+println("${largest([3, 9, 4]) ?? 0} ${all([Point { x: 1, y: 2 }])} ${all([1, 2])}")   // 9 (1, 2) #1, #2
+```
+
+Type arguments are inferred from the arguments, field values and the type the result goes into. Each use with
+new types makes a specialized copy (like Rust and C++), so generic code is as fast as hand-written code.
+A bound like `T: Show + Eq` is checked where the function is used, with an error that says what's missing.
+
 ## Options: `T?`, never null
 
 There is no null. A value that might be missing is a `T?`, built into the language just like `T!`:
@@ -246,8 +384,10 @@ let area = 3.14 * r * r                     // int and float mix; int(2.9) == 2,
 println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"pt": Point { x: 1.0, y: 2.0 }}
 ```
 
-- Functions: `print println str int float min max abs env panic some to_json sleep now_ms url_encode
+- Functions: `print println str int float min max abs env panic some to_json from_json sleep now_ms url_encode
   url_decode`.
+  `from_json(text)` decodes into the type the code expects (`let t: Todo = from_json(body)?`): structs (missing
+  fields take their defaults), enums, lists, maps, sets and optionals, the reverse of `to_json`.
   - `sleep(ms)` blocks; `now_ms() -> int` reads a monotonic clock (for timing, TTL caches, uptime).
   - `url_encode(s) -> str` percent-encodes UTF-8 bytes for a URL path segment or query value; only
     `A-Z a-z 0-9 - _ . ~` stay as they are (a bit stricter than JavaScript's `encodeURIComponent`,
@@ -310,14 +450,19 @@ println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"p
   `get(key) at(i) as_str as_int as_float as_bool as_list -> T?` and `stringify()`.
   (Your own types go to JSON with the builtin `to_json(value)`.)
 - `fs`: `read write append remove mkdir list -> T!`, `exists is_dir`, `size -> int?`.
+- `web`: browser apps (see *Full stack* above). On the server the same components render to HTML: `mount` prints
+  the page once, and `signal`, timers and requests are inert. `res.page(<html>...</html>)` sends a whole page.
 - `net`: `net.listen(port) -> Listener!`, `listener.accept() -> Conn!`, `conn.read() -> str!`,
   `conn.write(s) -> void!`, `conn.close()`. Wraps POSIX sockets from the C runtime.
 
 ## Editor support
 
 `stellang lsp` is a language server built into the compiler: errors as you type, hover types and doc comments,
-inlay type hints, completion, signature help, go to definition (into `std` too), references, rename, symbols,
-folding, formatting and semantic highlighting.
+inlay type and parameter hints, completion that asks the type checker (members of any expression, the variants an
+enum slot needs, missing struct fields, match arms, postfix snippets like `x.match`, auto-import), quick fixes
+(add missing match arms, import a module, did-you-mean), signature help, go to definition (into `std` too),
+references, rename, symbols, folding, formatting and semantic highlighting. In JSX it completes components (with
+their required props), HTML elements, props, attributes and events, and the tag to close.
 It runs the real lexer, parser and type checker, so it keeps up with the language by itself.
 The fallback grammars come out of the compiler's keyword table (`stellang grammar textmate|vim`), and a test
 fails if the copies in `editors/` go stale.
@@ -333,8 +478,10 @@ fails if the copies in `editors/` go stale.
 - **VS Code**: run `editors/vscode/install.sh` (builds the compiler, packages the extension with it inside, and installs
   it with `code`; pass `codium` or `cursor` for those). Or build a `.vsix` to share (`cd editors/vscode && npm install && npm run package`; it includes the
   compiler) and install it from Extensions → `…` → *Install from VSIX…*. Besides the server features
-  it adds Run (`Ctrl+F5`, ▶ in the title bar, `▶ Run | Build` above `main`), build/check tasks with a problem
-  matcher, snippets, a file icon and Markdown code-block highlighting. See [editors/vscode](editors/vscode/README.md).
+  it adds two star themes (Stellang Nebula and Daybreak), a sidebar with your programs, types and HTTP routes, a runner
+  that spots server addresses (Open in Browser, stop, restart), runs full-stack apps under `stellang dev` and serves
+  browser apps, project templates (including full-stack and browser apps), a Get Started walkthrough,
+  Show LLVM IR, build/check tasks with a problem matcher, a file icon and Markdown code-block highlighting. See [editors/vscode](editors/vscode/README.md).
 - **Anything else** with LSP support: run `stellang lsp` for `*.st` files.
 
 ## Safety
@@ -342,9 +489,6 @@ fails if the copies in `editors/` go stale.
 No null (use `T?`), no pointers, no manual free, no uninitialized values. Out-of-bounds indexing, bad slices,
 a missing map key with `m[k]`, integer division by zero, `pop()` on an empty list and `panic()` stop the program with exit code 101 and a
 `file:line:col` message. An error returned from `main` prints `error: ...` and exits with 1.
-
-The emoji keywords from the beginning still work as a joke: `stellang fmt --emoji file.st` turns
-`fn struct if else while let var return break { } ;` into `🦍 🦧 🦅 🐒 🐭 🦦 🦁 🐺 🦭 ⭐ ❤️` (and `--plain` back).
 
 ## License
 

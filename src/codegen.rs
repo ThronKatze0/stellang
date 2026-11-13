@@ -10,8 +10,13 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::mem;
 
+mod fromjson;
+mod generics;
 mod helpers;
+mod jsx;
 mod patterns;
+
+use generics::{prim_name, short_name, GDef, GFn, GType, Pending, TraitInfo};
 
 type R<T> = Result<T, (Pos, String)>;
 
@@ -58,6 +63,9 @@ declare void @st_nl()
 declare i64 @st_strlen(ptr)
 declare zeroext i1 @st_streq(ptr, ptr)
 declare ptr @st_concat(ptr, ptr)
+declare ptr @st_html_escape(ptr)
+declare i64 @st_on(ptr, i64)
+declare ptr @st_hook()
 declare ptr @st_itoa(i64)
 declare ptr @st_parse_int(ptr, ptr)
 declare ptr @st_env(ptr)
@@ -155,7 +163,7 @@ fn ll(t: &Type) -> String {
         Type::Float => "double".into(),
         Type::Bool => "i1".into(),
         Type::Void => "void".into(),
-        Type::Str | Type::List(_) | Type::Map(..) | Type::Set(_) | Type::Struct(_) | Type::Enum(_) | Type::Fn(..) => "ptr".into(),
+        Type::Str | Type::List(_) | Type::Map(..) | Type::Set(_) | Type::Struct(_) | Type::Enum(_) | Type::Fn(..) | Type::Node | Type::Generic(..) => "ptr".into(),
         Type::Result(t) => format!("{{ i1, {}, ptr }}", if **t == Type::Void { "i1".into() } else { ll(t) }),
         Type::Opt(t) => format!("{{ i1, {} }}", ll(t)),
     }
@@ -277,12 +285,39 @@ fn names_expr(e: &Expr, inl: bool, out: &mut HashSet<String>) {
             names_expr(x, inl, out);
             names_stmts(ss, inl, out);
         }
+        ExprKind::Element(el) => names_element(el, inl, out),
+        ExprKind::JsxPush(cs) => names_children(cs, inl, out),
         ExprKind::Match(s, arms) => {
             names_expr(s, inl, out);
             for a in arms.iter() {
                 if let Some(g) = &a.guard { names_expr(g, inl, out) }
                 names_body(&a.body, inl, out);
             }
+        }
+    }
+}
+
+fn is_call_to(e: &Expr, name: &str) -> bool {
+    matches!(&e.kind, ExprKind::Call(c, _) if matches!(&c.kind, ExprKind::Var(n) if n == name))
+}
+
+fn names_element(el: &crate::parser::Element, inl: bool, out: &mut HashSet<String>) {
+    if el.tag.starts_with(|c: char| c.is_ascii_uppercase()) && inl {
+        out.insert(el.tag.clone());
+    }
+    for a in &el.attrs {
+        if let Some(v) = &a.value { names_expr(v, inl, out) }
+    }
+    names_children(&el.children, inl, out);
+}
+
+fn names_children(cs: &[crate::parser::Child], inl: bool, out: &mut HashSet<String>) {
+    use crate::parser::Child;
+    for c in cs {
+        match c {
+            Child::Text(e) | Child::Value(e) => names_expr(e, inl, out),
+            Child::Elem(el) => names_element(el, inl, out),
+            Child::For(s) | Child::If(s) => names_stmts(std::slice::from_ref(&**s), inl, out),
         }
     }
 }
@@ -311,10 +346,12 @@ struct Var {
 #[derive(Clone)]
 struct Sig {
     params: Vec<Type>,
+    names: Vec<String>, // parameter names (for JSX props); empty for externs
     ret: Type,
     sym: String,
     is_extern: bool,
     defaults: Vec<Option<Expr>>, // per parameter; each one is compiled into `default_sym(sym, i)`
+    module: String,              // where the defaults are evaluated
 }
 
 /// Collects the values of the branches of a `match` that reach its end.
@@ -338,6 +375,7 @@ struct VariantInfo {
 enum Lit {
     Struct(String),
     Variant(String, usize),
+    GVariant(String, String), // a variant of a generic enum (the instance is still to be inferred)
 }
 
 #[derive(Default)]
@@ -358,7 +396,8 @@ struct Gen {
     imports: HashMap<String, HashSet<String>>,
     structs: HashMap<String, Vec<(String, Type)>>,
     enums: HashMap<String, Vec<VariantInfo>>,
-    defaults: HashMap<String, Vec<(String, Expr)>>, // struct or `Enum::Variant` -> field defaults, see `field_default_sym`
+    defaults: HashMap<String, (String, Vec<(String, Expr)>)>, // struct or `Enum::Variant` -> (module, field defaults), see `field_default_sym`
+    default_fns: HashSet<String>, // the default-value functions made so far
     consts: HashMap<String, Type>,
     const_order: Vec<String>,
     statics: HashSet<String>, // `Type::name` functions without `self`
@@ -373,6 +412,17 @@ struct Gen {
     shown: HashSet<String>, // types whose `str()` helper is emitted
     f: FnState,
     notes: Vec<Note>,
+    // generics
+    tparams: HashMap<String, Type>, // the type parameters bound in the instance being generated
+    gtypes: HashMap<String, GType>,
+    gfns: HashMap<String, GFn>,
+    inst_of: HashMap<String, (String, Vec<Type>)>, // instance key -> (template, type arguments)
+    pending: Vec<Pending>,
+    traits: HashMap<String, TraitInfo>,
+    impls_of: HashSet<(String, String)>, // (type key, trait key)
+    impl_methods: Vec<(String, String, Vec<Func>)>, // (module, type key, methods incl. trait defaults)
+    jsx: Vec<jsx::JsxBuf>, // elements being built
+    web: bool,             // compiling for the browser (WebAssembly)
 }
 
 /// What the type checker learned about a spot in the source (for editor hovers).
@@ -385,6 +435,17 @@ pub struct Note {
 
 pub fn compile(units: &[Unit]) -> Result<String, (String, Pos, String)> {
     check(units, true).0
+}
+
+/// Compile for the browser (WebAssembly): the entry point is `st_start`, event handlers are kept.
+pub fn compile_web(units: &[Unit]) -> Result<String, (String, Pos, String)> {
+    let mut g = Gen { web: true, ..Gen::default() };
+    for u in units {
+        g.files.insert(u.name.clone(), u.file.clone());
+        g.imports.insert(u.name.clone(), u.module.imports.iter().map(|i| i.0.clone()).collect());
+    }
+    let r = g.run(units, true);
+    r.map_err(|(p, m)| (g.files[&g.module].clone(), p, m))
 }
 
 /// Type-check (and generate code for) `units`; also returns the notes for editor hovers.
@@ -410,8 +471,28 @@ impl Gen {
         self.find(name).is_none() && self.imports[&self.module].contains(name)
     }
 
-    fn resolve(&self, t: &Type, pos: Pos) -> R<Type> {
+    fn resolve(&mut self, t: &Type, pos: Pos) -> R<Type> {
         Ok(match t {
+            Type::Struct(n) | Type::Enum(n) if self.tparams.contains_key(n) => self.tparams[n].clone(),
+            Type::Generic(n, args) => {
+                let Some(tk) = self.template_key(n) else {
+                    let plain = self.resolve(&Type::Struct(n.clone()), pos)?;
+                    return err(pos, format!("`{plain}` isn't generic; write just `{n}`"));
+                };
+                let args = args.iter().map(|a| self.resolve(a, pos)).collect::<R<Vec<_>>>()?;
+                self.instantiate_type(&tk, args, pos)?
+            }
+            Type::Struct(n) | Type::Enum(n) if self.template_key(n).is_some() => {
+                // `Box` inside Box's own methods means `Box<T>`
+                let tk = self.template_key(n).unwrap();
+                let ps = self.gtypes[&tk].params.clone();
+                if !ps.iter().all(|p| self.tparams.contains_key(&p.name)) {
+                    let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
+                    return err(pos, format!("`{n}` needs type arguments, like `{n}<{}>`", names.join(", ")));
+                }
+                let args = ps.iter().map(|p| self.tparams[&p.name].clone()).collect();
+                self.instantiate_type(&tk, args, pos)?
+            }
             Type::Struct(n) | Type::Enum(n) => {
                 let k = match n.split_once('.') {
                     Some((m, s)) if self.imports[&self.module].contains(m) => format!("{m}.{s}"),
@@ -448,7 +529,7 @@ impl Gen {
         })
     }
 
-    fn sig(&self, f: &Func, self_ty: Option<&Type>, sym: String) -> R<Sig> {
+    fn sig(&mut self, f: &Func, self_ty: Option<&Type>, sym: String) -> R<Sig> {
         let mut params = vec![];
         for (i, (n, t)) in f.params.iter().enumerate() {
             params.push(match (t, self_ty) {
@@ -458,7 +539,7 @@ impl Gen {
             });
         }
         let defaults = f.defaults.clone();
-        Ok(Sig { params, ret: self.resolve(&f.ret, f.pos)?, sym, is_extern: false, defaults })
+        Ok(Sig { params, names: f.params.iter().map(|p| p.0.clone()).collect(), ret: self.resolve(&f.ret, f.pos)?, sym, is_extern: false, defaults, module: self.module.clone() })
     }
 
     fn type_of_key(&self, k: &str) -> Type {
@@ -475,15 +556,22 @@ impl Gen {
             },
             _ => return None,
         };
-        (self.structs.contains_key(&k) || self.enums.contains_key(&k)).then_some(k)
+        (self.structs.contains_key(&k) || self.enums.contains_key(&k) || self.gtypes.contains_key(&k)).then_some(k)
     }
 
     fn add_fn(&mut self, key: String, sig: Sig, pos: Pos, name: &str) -> R<()> {
-        if RESERVED.contains(&name) || self.funcs.contains_key(&key) {
+        if RESERVED.contains(&name) || self.funcs.contains_key(&key) || self.gfns.contains_key(&key) {
             return err(pos, format!("`{name}` is already defined"));
         }
         self.funcs.insert(key, sig);
         Ok(())
+    }
+
+    /// For completion: the type a `.Variant` shorthand is expected to have.
+    fn probe_want(&mut self, pos: Pos, want: Option<&Type>) {
+        if let Some(t) = peel_all(want) {
+            self.note(pos, format!("@want {t}"));
+        }
     }
 
     fn note(&mut self, pos: Pos, text: String) {
@@ -497,41 +585,86 @@ impl Gen {
             let names = u.module.structs.iter().map(|s| (&s.name, s.pos)).chain(u.module.enums.iter().map(|e| (&e.name, e.pos)));
             for (name, pos) in names {
                 let k = self.key(name);
-                if RESERVED.contains(&name.as_str()) || self.structs.contains_key(&k) || self.enums.contains_key(&k) {
+                if RESERVED.contains(&name.as_str()) || self.structs.contains_key(&k) || self.enums.contains_key(&k) || self.gtypes.contains_key(&k) || name == "Node" {
                     return err(pos, format!("`{name}` is already defined"));
                 }
-                if u.module.structs.iter().any(|s| s.name == *name) {
-                    self.structs.insert(k, vec![]);
+                let module = u.name.clone();
+                if let Some(s) = u.module.structs.iter().find(|s| s.name == *name) {
+                    if !s.tparams.is_empty() {
+                        let g = GType { module, params: s.tparams.clone(), def: GDef::Struct(s.clone()), methods: vec![], traits: vec![] };
+                        self.gtypes.insert(k, g);
+                    } else {
+                        self.structs.insert(k, vec![]);
+                    }
                 } else {
-                    self.enums.insert(k, vec![]);
+                    let e = u.module.enums.iter().find(|e| e.name == *name).unwrap();
+                    if !e.tparams.is_empty() {
+                        let g = GType { module, params: e.tparams.clone(), def: GDef::Enum(e.clone()), methods: vec![], traits: vec![] };
+                        self.gtypes.insert(k, g);
+                    } else {
+                        self.enums.insert(k, vec![]);
+                    }
                 }
+            }
+            for t in &u.module.traits {
+                let k = self.key(&t.name);
+                if self.traits.contains_key(&k) || self.structs.contains_key(&k) || self.enums.contains_key(&k) || self.gtypes.contains_key(&k) {
+                    return err(t.pos, format!("`{}` is already defined", t.name));
+                }
+                self.traits.insert(k, TraitInfo { methods: t.methods.clone() });
+            }
+        }
+        // the methods of generic types (complete before the first instance is made)
+        for u in units {
+            self.module = u.name.clone();
+            for im in &u.module.impls {
+                let sk = self.key(&im.name);
+                if !self.gtypes.contains_key(&sk) {
+                    continue;
+                }
+                let methods = match &im.trait_ {
+                    Some(t) => {
+                        let (tk, ms) = self.trait_methods(t, &im.methods, &im.name, im.pos)?;
+                        self.gtypes.get_mut(&sk).unwrap().traits.push(tk);
+                        ms
+                    }
+                    None => im.methods.clone(),
+                };
+                for m in &methods {
+                    if self.gtypes[&sk].methods.iter().any(|o| o.name == m.name) {
+                        return err(m.pos, format!("`{}` is already defined", m.name));
+                    }
+                }
+                self.gtypes.get_mut(&sk).unwrap().methods.extend(methods);
             }
         }
         for u in units {
             self.module = u.name.clone();
             for s in &u.module.structs {
+                if !s.tparams.is_empty() {
+                    continue;
+                }
                 let k = self.key(&s.name);
                 let fields = self.fields(&k, &s.fields, s.pos)?;
                 self.structs.insert(k, fields);
             }
             for e in &u.module.enums {
-                let k = self.key(&e.name);
-                let mut vs: Vec<VariantInfo> = vec![];
-                for v in &e.variants {
-                    if vs.iter().any(|o| o.name == v.name) {
-                        return err(v.pos, format!("duplicate variant `{}`", v.name));
-                    }
-                    if ["ok", "err", "some", "none"].contains(&v.name.as_str()) {
-                        return err(v.pos, format!("`{}` is a builtin pattern; pick another variant name", v.name));
-                    }
-                    let fields = self.fields(&format!("{k}::{}", v.name), &v.fields, v.pos)?;
-                    let named = v.braces || v.fields.iter().any(|f| f.name.parse::<usize>().is_err());
-                    vs.push(VariantInfo { name: v.name.clone(), fields, braces: v.braces, named });
+                if !e.tparams.is_empty() {
+                    continue;
                 }
+                let k = self.key(&e.name);
+                let vs = self.variants(&k, &e.variants)?;
                 self.enums.insert(k, vs);
             }
             for f in &u.module.funcs {
                 let k = self.key(&f.name);
+                if !f.tparams.is_empty() {
+                    if RESERVED.contains(&f.name.as_str()) || self.funcs.contains_key(&k) || self.gfns.contains_key(&k) {
+                        return err(f.pos, format!("`{}` is already defined", f.name));
+                    }
+                    self.gfns.insert(k, GFn { module: u.name.clone(), func: f.clone(), outer: HashMap::new(), self_ty: None });
+                    continue;
+                }
                 let sig = self.sig(f, None, format!("@\"st.{k}\""))?;
                 self.add_fn(k, sig, f.pos, &f.name)?;
             }
@@ -542,20 +675,49 @@ impl Gen {
                     let ps: Vec<String> = params.iter().map(ll).collect();
                     writeln!(self.decls, "declare {} @{}({})", ll(&ret), x.name, ps.join(", ")).unwrap();
                 }
-                let sig = Sig { params, ret, sym: format!("@{}", x.name), is_extern: true, defaults: vec![] };
+                let sig = Sig { params, names: vec![], ret, sym: format!("@{}", x.name), is_extern: true, defaults: vec![], module: self.module.clone() };
                 self.add_fn(self.key(&x.name), sig, x.pos, &x.name)?;
             }
             for im in &u.module.impls {
-                let sk = self.key(&im.name);
-                if !self.structs.contains_key(&sk) && !self.enums.contains_key(&sk) {
+                let prim = match im.name.as_str() {
+                    "int" => Some(Type::Int),
+                    "float" => Some(Type::Float),
+                    "str" => Some(Type::Str),
+                    "bool" => Some(Type::Bool),
+                    _ => None,
+                };
+                let sk = if prim.is_some() { im.name.clone() } else { self.key(&im.name) };
+                if self.gtypes.contains_key(&sk) {
+                    continue;
+                }
+                if prim.is_none() && !self.structs.contains_key(&sk) && !self.enums.contains_key(&sk) {
                     return err(im.pos, format!("`impl` for unknown type `{}`", im.name));
                 }
-                let self_ty = self.type_of_key(&sk);
-                for m in &im.methods {
+                let self_ty = prim.unwrap_or_else(|| self.type_of_key(&sk));
+                let methods = match &im.trait_ {
+                    Some(t) => {
+                        let (tk, ms) = self.trait_methods(t, &im.methods, &im.name, im.pos)?;
+                        self.impls_of.insert((sk.clone(), tk));
+                        ms
+                    }
+                    None => im.methods.clone(),
+                };
+                for m in &methods {
                     let k = format!("{sk}::{}", m.name);
                     let is_static = m.params.first().is_none_or(|p| p.0 != "self" || p.1.is_some());
                     if !is_static && self.enums.get(&sk).is_some_and(|vs| vs.iter().any(|v| v.name == m.name)) {
                         return err(m.pos, format!("`{}` is already a variant of `{}`", m.name, im.name));
+                    }
+                    if !m.tparams.is_empty() {
+                        if self.funcs.contains_key(&k) || self.gfns.contains_key(&k) {
+                            return err(m.pos, format!("`{}` is already defined", m.name));
+                        }
+                        let st = (!is_static).then(|| self_ty.clone());
+                        self.gfns.insert(k.clone(), GFn { module: u.name.clone(), func: m.clone(), outer: HashMap::new(), self_ty: st });
+                        if is_static {
+                            self.statics.insert(k);
+                        }
+                        continue;
                     }
                     let sig = self.sig(m, (!is_static).then_some(&self_ty), format!("@\"st.{k}\""))?;
                     if is_static {
@@ -563,6 +725,7 @@ impl Gen {
                     }
                     self.add_fn(k, sig, m.pos, &m.name)?;
                 }
+                self.impl_methods.push((u.name.clone(), sk, methods));
             }
         }
         // constants: dependencies (later units) first, each in order of declaration
@@ -585,50 +748,60 @@ impl Gen {
             }
         }
         // default values: each one becomes a small function of its own (like a constant), so its type is
-        // checked here, once, and a call that leaves the value out just calls it
+        // checked here, once, and a call that leaves the value out just calls it. Generic instances get
+        // theirs when they're made, since only then are the types known.
+        let mut fns: Vec<String> = vec![];
         for u in units {
             self.module = u.name.clone();
-            let mut fns: Vec<String> = u.module.funcs.iter().map(|f| self.key(&f.name)).collect();
-            for im in &u.module.impls {
-                let sk = self.key(&im.name);
-                fns.extend(im.methods.iter().map(|m| format!("{sk}::{}", m.name)));
-            }
-            for k in fns {
-                let sig = self.funcs[&k].clone();
-                for (i, d) in sig.defaults.iter().enumerate() {
-                    if let Some(e) = d {
-                        self.default_fn(&default_sym(&sig.sym, i), e, &sig.params[i])?;
-                    }
+            fns.extend(u.module.funcs.iter().filter(|f| f.tparams.is_empty()).map(|f| self.key(&f.name)));
+        }
+        for (_, sk, methods) in &self.impl_methods {
+            fns.extend(methods.iter().filter(|m| m.tparams.is_empty()).map(|m| format!("{sk}::{}", m.name)));
+        }
+        for k in fns {
+            let sig = self.funcs[&k].clone();
+            for (i, d) in sig.defaults.iter().enumerate() {
+                if let Some(e) = d {
+                    self.default_fn(&default_sym(&sig.sym, i), e, &sig.module, &sig.params[i])?;
                 }
             }
+        }
+        for u in units {
+            self.module = u.name.clone();
             let mut holders: Vec<(String, Vec<(String, Type)>)> = vec![];
-            for st in &u.module.structs {
+            for st in u.module.structs.iter().filter(|st| st.tparams.is_empty()) {
                 let k = self.key(&st.name);
                 holders.push((k.clone(), self.structs[&k].clone()));
             }
-            for e in &u.module.enums {
+            for e in u.module.enums.iter().filter(|e| e.tparams.is_empty()) {
                 let k = self.key(&e.name);
                 holders.extend(self.enums[&k].iter().map(|v| (format!("{k}::{}", v.name), v.fields.clone())));
             }
             for (dkey, fields) in holders {
-                for (f, e) in self.defaults.get(&dkey).cloned().unwrap_or_default() {
+                let Some((m, defs)) = self.defaults.get(&dkey).cloned() else { continue };
+                for (f, e) in defs {
                     let ft = fields.iter().find(|x| x.0 == f).unwrap().1.clone();
-                    self.default_fn(&field_default_sym(&dkey, &f), &e, &ft)?;
+                    self.default_fn(&field_default_sym(&dkey, &f), &e, &m, &ft)?;
                 }
             }
         }
         for u in units {
             self.module = u.name.clone();
             for f in &u.module.funcs {
-                self.gen_named(&self.key(&f.name), f)?;
+                if f.tparams.is_empty() {
+                    self.gen_named(&self.key(&f.name), f)?;
+                }
             }
-            for im in &u.module.impls {
-                let sk = self.key(&im.name);
-                for m in &im.methods {
+        }
+        for (module, sk, methods) in mem::take(&mut self.impl_methods) {
+            self.module = module;
+            for m in &methods {
+                if m.tparams.is_empty() {
                     self.gen_named(&format!("{sk}::{}", m.name), m)?;
                 }
             }
         }
+        self.gen_pending()?;
         self.module = String::new();
 
         let main = match self.funcs.get("main") {
@@ -684,25 +857,37 @@ impl Gen {
             let t = ll(&self.consts[k]);
             write!(init, "  %c{i} = call {t} @\"const.{k}\"(ptr null)\n  store {t} %c{i}, ptr @\"g.{k}\"\n").unwrap();
         }
-        writeln!(out, "define i32 @main() {{\n  call void @st_init()\n{init}{entry}\n}}").unwrap();
+        let entry_sym = if self.web { "st_start" } else { "main" };
+        writeln!(out, "define i32 @{entry_sym}() {{\n  call void @st_init()\n{init}{entry}\n}}").unwrap();
         out += &self.globals;
-        // stack-clash protection: big frames touch every page, so they hit the guard page instead of jumping it
-        out += "attributes #0 = { \"probe-stack\"=\"inline-asm\" }\n";
+        if self.web {
+            out += "attributes #0 = { nounwind }\n";
+        } else {
+            // stack-clash protection: big frames touch every page, so they hit the guard page instead of jumping it
+            out += "attributes #0 = { \"probe-stack\"=\"inline-asm\" }\n";
+        }
         Ok(out)
     }
 
-    /// A default value as a function of its own, checked against the type it fills in.
-    fn default_fn(&mut self, sym: &str, e: &Expr, t: &Type) -> R<()> {
+    /// A default value as a function of its own, evaluated in `module` and checked against the type it fills in.
+    fn default_fn(&mut self, sym: &str, e: &Expr, module: &str, t: &Type) -> R<()> {
+        self.default_fns.insert(sym.into());
+        let saved = mem::replace(&mut self.module, module.into());
         let body = Body::Expr(Box::new(e.clone()));
+        // on an error, `module` stays put so the message names the file the default is written in
         self.function(sym, &[], Some(t.clone()), &body, None, &[], e.pos, "a default value")?;
+        self.module = saved;
         Ok(())
     }
 
-    /// The value of a default: a call to the function `default_fn` made for it.
-    pub(super) fn call_default(&mut self, sym: &str, t: &Type) -> Val {
+    /// The value of a default: a call to its function (made here, for a generic instance, if it isn't yet).
+    pub(super) fn call_default(&mut self, sym: &str, e: &Expr, module: &str, t: &Type) -> R<Val> {
+        if !self.default_fns.contains(sym) {
+            self.default_fn(sym, e, module, t)?;
+        }
         let r = self.tmp();
         self.ins(format!("{r} = call {} {sym}(ptr null)", ll(t)));
-        val(r, t.clone())
+        Ok(val(r, t.clone()))
     }
 
     fn gen_named(&mut self, key: &str, f: &Func) -> R<()> {
@@ -912,7 +1097,7 @@ impl Gen {
                 defs.push((f.name.clone(), d.clone()));
             }
         }
-        self.defaults.insert(key.into(), defs);
+        self.defaults.insert(key.into(), (self.module.clone(), defs));
         Ok(out)
     }
 
@@ -923,6 +1108,9 @@ impl Gen {
                 let v = self.coerce(v, t, pos)?;
                 return Ok(self.some_of(&v));
             }
+        }
+        if *want == Type::Str && v.ty == Type::Node {
+            return Ok(val(v.v, Type::Str)); // a Node is its HTML
         }
         if *want == Type::Float && v.ty == Type::Int {
             let t = self.tmp();
@@ -1139,6 +1327,7 @@ impl Gen {
         let p = format!("{} {}", ll(&v.ty), v.v);
         Ok(match &v.ty {
             Type::Str if !nested => v.clone(),
+            Type::Node => val(v.v.clone(), Type::Str),
             Type::Str => self.rt(Type::Str, "st_quote", &[p]),
             Type::Int => self.rt(Type::Str, "st_itoa", &[format!("i64 {}", v.v)]),
             Type::Float => self.rt(Type::Str, "st_ftoa", &[format!("double {}", v.v)]),
@@ -1222,7 +1411,7 @@ impl Gen {
                     let s = self.rt(Type::Str, "st_concat", &[format!("ptr {label}"), format!("ptr {}", s.v)]);
                     add(self, s);
                 }
-                let name = k.rsplit('.').next().unwrap();
+                let name = generics::base_name(short_name(k));
                 if self.structs[k].is_empty() { (format!("{name} {{"), "}") } else { (format!("{name} {{ "), " }") }
             }
             _ => unreachable!("show() handles scalars"),
@@ -1765,6 +1954,7 @@ impl Gen {
                 None => return err(pos, format!("unknown name `{n}`")),
             },
             ExprKind::Member(name) => {
+                self.probe_want(pos, want);
                 let Some(Type::Enum(k)) = peel_all(want).cloned() else {
                     return err(pos, format!("can't tell which enum `.{name}` belongs to; write `Type.{name}`"));
                 };
@@ -1817,6 +2007,17 @@ impl Gen {
             }
             ExprKind::Field(b, f) => {
                 if let Some(tk) = self.type_path(b) {
+                    let tk = if self.gtypes.contains_key(&tk) {
+                        match self.instance_from_want(&tk, want) {
+                            Some(k) => k,
+                            None => {
+                                let n = short_name(&tk);
+                                return err(pos, format!("can't tell which `{n}` this is; give it a type, like `let x: {n}<int> = {n}.{f}`"));
+                            }
+                        }
+                    } else {
+                        tk
+                    };
                     let k = format!("{tk}::{f}");
                     if self.statics.contains(&k) {
                         return self.fn_value(k, pos);
@@ -1836,6 +2037,7 @@ impl Gen {
                     }
                 }
                 let b = self.expr(b, None)?;
+                self.note(pos, format!("@recv {}", b.ty));
                 if !matches!(b.ty, Type::Struct(_) | Type::Opt(_) | Type::Enum(_)) {
                     return err(pos, format!("`{f}` is a method here; call it: `.{f}()`"));
                 }
@@ -1962,6 +2164,25 @@ impl Gen {
                 val(m, Type::Set(Box::new(et)))
             }
             ExprKind::StructLit(name, fields) => match self.lit_target(name, want, pos)? {
+                Lit::Struct(k) if self.gtypes.contains_key(&k) => {
+                    let tf = self.template_fields(&k, None);
+                    let given: Vec<(Type, &Expr)> = fields.iter().filter_map(|(f, e)| tf.iter().find(|x| x.0 == *f).map(|x| (x.1.clone(), e))).collect();
+                    let k = self.infer_type(&k, &given, want, pos)?;
+                    let decl = self.structs[&k].clone();
+                    let vals = self.fill(name, &k, &decl, Some(fields), None, pos)?;
+                    let obj = self.build(&format!("%\"S.{k}\""), None, &vals);
+                    val(obj, Type::Struct(k))
+                }
+                Lit::GVariant(tk, v) => {
+                    let tf = self.template_fields(&tk, Some(&v));
+                    let given: Vec<(Type, &Expr)> = fields.iter().filter_map(|(f, e)| tf.iter().find(|x| x.0 == *f).map(|x| (x.1.clone(), e))).collect();
+                    let k = self.infer_type(&tk, &given, want, pos)?;
+                    let i = self.variant_index(&k, &v, pos)?;
+                    if !self.enums[&k][i].braces {
+                        return err(pos, format!("`{v}` takes its values in parentheses: `{v}(...)`"));
+                    }
+                    self.make_variant(&k, i, Some(fields), None, pos)?
+                }
                 Lit::Struct(k) => {
                     let decl = self.structs[&k].clone();
                     let vals = self.fill(name, &k, &decl, Some(fields), None, pos)?;
@@ -1978,11 +2199,14 @@ impl Gen {
             },
             ExprKind::Lambda(l) => self.lambda(l, peel(want), pos)?,
             ExprKind::Try(x) => {
-                let v = self.expr(x, None)?;
+                // `let t: Todo = from_json(s)?`: the call is asked for a Todo!
+                let w = want.filter(|_| is_call_to(x, "from_json")).map(|w| Type::Result(Box::new(w.clone())));
+                let v = self.expr(x, w.as_ref())?;
                 self.try_val(v, pos)?
             }
             ExprKind::CatchValue(x, fallback) => {
-                let v = self.expr(x, None)?;
+                let w = want.filter(|_| is_call_to(x, "from_json")).map(|w| Type::Result(Box::new(w.clone())));
+                let v = self.expr(x, w.as_ref())?;
                 let (e, t) = self.failed(&v, pos)?;
                 if t == Type::Void {
                     return err(pos, "this has no value to fall back from; use `catch e { ... }`");
@@ -2001,7 +2225,8 @@ impl Gen {
                 self.load(&slot, t)
             }
             ExprKind::CatchBlock(x, name, block) => {
-                let v = self.expr(x, None)?;
+                let w = want.filter(|_| is_call_to(x, "from_json")).map(|w| Type::Result(Box::new(w.clone())));
+                let v = self.expr(x, w.as_ref())?;
                 let (e, t) = self.failed(&v, pos)?;
                 let is_opt = matches!(v.ty, Type::Opt(_));
                 if is_opt && name != "_" {
@@ -2043,6 +2268,15 @@ impl Gen {
                 }
             }
             ExprKind::Match(subject, arms) => self.match_expr(subject, arms, want)?,
+            ExprKind::Element(el) => self.element_value(el)?,
+            ExprKind::JsxPush(cs) => {
+                if self.jsx.is_empty() {
+                    return err(pos, "JSX children outside an element");
+                }
+                self.jsx_children(cs)?;
+                self.jsx_flush();
+                void()
+            }
         })
     }
 
@@ -2303,7 +2537,8 @@ impl Gen {
         }
         let mut out = self.args(&params[..args.len()], args, pos, name)?;
         for i in skip + args.len()..sig.params.len() {
-            let v = self.call_default(&default_sym(&sig.sym, i), &sig.params[i]);
+            let e = sig.defaults[i].clone().unwrap();
+            let v = self.call_default(&default_sym(&sig.sym, i), &e, &sig.module, &sig.params[i])?;
             out.push(format!("{} {}", ll(&v.ty), v.v));
         }
         Ok(out)
@@ -2318,6 +2553,9 @@ impl Gen {
                 if let Some(v) = self.builtin(name, args, pos, want)? {
                     return Ok(v);
                 }
+                if self.gfns.contains_key(&self.key(name)) {
+                    return self.call_generic(&self.key(name), None, args, pos, want);
+                }
                 let Some(sig) = self.funcs.get(&self.key(name)).cloned() else {
                     return err(pos, format!("unknown function `{name}`"));
                 };
@@ -2326,11 +2564,15 @@ impl Gen {
                 Ok(self.emit_call(&sig.ret, &sig.sym, &argl))
             }
             ExprKind::Member(name) => {
+                self.probe_want(callee.pos, want);
                 let target = peel_all(want).cloned();
                 match target {
                     Some(Type::Enum(k)) if self.enums[&k].iter().any(|v| v.name == *name) => {
                         let i = self.enums[&k].iter().position(|v| v.name == *name).unwrap();
                         self.make_variant(&k, i, None, Some(args), pos)
+                    }
+                    Some(Type::Enum(k) | Type::Struct(k)) if self.gfns.contains_key(&format!("{k}::{name}")) && self.statics.contains(&format!("{k}::{name}")) => {
+                        self.call_generic(&format!("{k}::{name}"), None, args, pos, want)
                     }
                     Some(Type::Enum(k) | Type::Struct(k)) if self.statics.contains(&format!("{k}::{name}")) => {
                         let sig = self.funcs[&format!("{k}::{name}")].clone();
@@ -2343,10 +2585,28 @@ impl Gen {
             }
             ExprKind::Field(base, name) => {
                 if let Some(tk) = self.type_path(base) {
+                    let tk = if self.gtypes.contains_key(&tk) {
+                        let variant = matches!(&self.gtypes[&tk].def, GDef::Enum(e) if e.variants.iter().any(|v| v.name == *name));
+                        let pats: Vec<Type> = if variant {
+                            self.template_fields(&tk, Some(name)).into_iter().map(|f| f.1).collect()
+                        } else {
+                            match self.gtypes[&tk].methods.iter().find(|m| m.name == *name) {
+                                Some(m) if m.tparams.is_empty() => m.params.iter().map(|p| p.1.clone().unwrap_or_default()).collect(),
+                                _ => vec![],
+                            }
+                        };
+                        let given: Vec<(Type, &Expr)> = pats.into_iter().zip(args.iter()).collect();
+                        self.infer_type(&tk, &given, want, pos)?
+                    } else {
+                        tk
+                    };
                     if let Some(i) = self.enums.get(&tk).and_then(|vs| vs.iter().position(|v| v.name == *name)) {
                         return self.make_variant(&tk, i, None, Some(args), pos);
                     }
                     let k = format!("{tk}::{name}");
+                    if self.gfns.contains_key(&k) && self.statics.contains(&k) {
+                        return self.call_generic(&k, None, args, pos, want);
+                    }
                     let Some(sig) = self.funcs.get(&k).cloned() else {
                         let what = if self.enums.contains_key(&tk) { "variant or function" } else { "function" };
                         return err(pos, format!("`{tk}` has no {what} `{name}`"));
@@ -2360,6 +2620,9 @@ impl Gen {
                 }
                 if let ExprKind::Var(m) = &base.kind {
                     if self.is_module(m) {
+                        if self.gfns.contains_key(&format!("{m}.{name}")) {
+                            return self.call_generic(&format!("{m}.{name}"), None, args, pos, want);
+                        }
                         let Some(sig) = self.funcs.get(&format!("{m}.{name}")).cloned() else {
                             return err(pos, format!("module `{m}` has no function `{name}`"));
                         };
@@ -2369,11 +2632,32 @@ impl Gen {
                     }
                 }
                 let b = self.expr(base, None)?;
+                self.note(callee.pos, format!("@recv {}", b.ty));
                 if name == "is_empty" && args.is_empty() {
                     if let Some(n) = self.len_of(&b) {
                         let t = self.tmp();
                         self.ins(format!("{t} = icmp eq i64 {n}, 0"));
                         return Ok(val(t, Type::Bool));
+                    }
+                }
+                if let Some(owner) = Self::method_owner(&b.ty) {
+                    let k = format!("{owner}::{name}");
+                    if self.gfns.contains_key(&k) {
+                        if self.statics.contains(&k) {
+                            return err(pos, format!("`{name}` is a static function; call it as `{}.{name}(...)`", short_name(&owner)));
+                        }
+                        return self.call_generic(&k, Some(b), args, pos, want);
+                    }
+                    if prim_name(&b.ty).is_some() {
+                        if let Some(sig) = self.funcs.get(&k).cloned() {
+                            if self.statics.contains(&k) {
+                                return err(pos, format!("`{name}` is a static function; call it as `{owner}.{name}(...)`"));
+                            }
+                            self.note(callee.pos, sig_text(&format!("{owner}.{name}"), &sig));
+                            let mut argl = vec![format!("{} {}", ll(&b.ty), b.v)];
+                            argl.extend(self.sig_args(&sig, 1, args, pos, name)?);
+                            return Ok(self.emit_call(&sig.ret, &sig.sym, &argl));
+                        }
                     }
                 }
                 match b.ty.clone() {
@@ -2901,6 +3185,35 @@ impl Gen {
                 }
                 self.some_of(&v)
             }
+            "signal" if !self.funcs.contains_key(&self.key("signal")) => {
+                if !self.gtypes.contains_key("web.Signal") {
+                    return err(pos, "`signal` comes with `import web`");
+                }
+                let inner = match peel(want) {
+                    Some(Type::Struct(k)) if self.inst_of.get(k).is_some_and(|i| i.0 == "web.Signal") => Some(self.inst_of[k].1[0].clone()),
+                    _ => None,
+                };
+                let v = one(self, inner.as_ref())?;
+                let v = match &inner {
+                    Some(t) => self.coerce(v, t, args[0].pos)?,
+                    None => v,
+                };
+                let st = self.instantiate_type("web.Signal", vec![v.ty.clone()], pos)?;
+                let Type::Struct(k) = st.clone() else { unreachable!() };
+                // the render's next state cell: empty the first time
+                let cell = self.rt(Type::Str, "st_hook", &[]).v;
+                let old = self.load(&cell, Type::Str).v;
+                let (fresh, lnew, ldone) = (self.tmp(), self.lbl("newsig"), self.lbl("sig"));
+                self.ins(format!("{fresh} = icmp eq ptr {old}, null"));
+                self.term(format!("br i1 {fresh}, label %{lnew}, label %{ldone}"));
+                self.label(&lnew);
+                let obj = self.build(&format!("%\"S.{k}\""), None, &[v]);
+                self.ins(format!("store ptr {obj}, ptr {cell}"));
+                self.label(&ldone);
+                let r = self.load(&cell, st);
+                r
+            }
+            "from_json" if !self.funcs.contains_key(&self.key("from_json")) => self.from_json(args, pos, want)?,
             "to_json" => {
                 let v = one(self, None)?;
                 self.json(&v, args[0].pos)?

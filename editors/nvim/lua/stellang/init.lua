@@ -13,6 +13,19 @@ function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 end
 
+-- `var`s underlined (they can change), parameters in italics; colors come from your colorscheme
+local function highlights()
+  local set = function(group, spec)
+    spec.default = true
+    vim.api.nvim_set_hl(0, group, spec)
+  end
+  set("@lsp.mod.mutable.stellang", { underline = true })
+  set("@lsp.type.parameter.stellang", { italic = true })
+  set("@lsp.typemod.function.declaration.stellang", { bold = true })
+end
+highlights()
+vim.api.nvim_create_autocmd("ColorScheme", { callback = highlights })
+
 function M.attach(buf)
   buf = buf == 0 and vim.api.nvim_get_current_buf() or buf
   if vim.fn.executable(M.config.cmd[1]) == 0 then

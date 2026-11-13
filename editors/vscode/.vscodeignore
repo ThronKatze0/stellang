@@ -9,3 +9,5 @@ node_modules/@vscode/test-electron/**
 .vscode-test/**
 PUBLISHING.md
 install.sh
+templates/**/main
+themes/*.py

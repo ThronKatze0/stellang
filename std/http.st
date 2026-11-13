@@ -43,7 +43,7 @@ extern fn st_now_ms() -> int
 extern fn st_url_decode(s: str) -> str
 extern fn st_file_size(path: str) -> int
 extern fn st_send_file(fd: int, head: str, path: str) -> int
-extern fn st_fetch(method: str, url: str, headers: [str], body: str, timeout_ms: int) -> [str]
+extern fn st_http_fetch(method: str, url: str, headers: [str], body: str, timeout_ms: int) -> [str]
 
 const IDLE_MS = 30000
 
@@ -113,6 +113,11 @@ struct Response {
 
     fn html(self, body: str) {
         self.type("text/html; charset=utf-8").send(body)
+    }
+
+    // Send a whole page: a Node from JSX like `<html>...</html>` (gets the <!doctype>).
+    fn page(self, doc: Node) {
+        self.html("<!doctype html>\n" + str(doc))
     }
 
     // Send JSON text, e.g. `res.json(to_json(user))`.
@@ -513,7 +518,7 @@ fn request(method: str, url: str, headers: {str: str} = {}, body: str = "", time
         flat.push(name)
         flat.push(value)
     }
-    let r = st_fetch(method.upper(), url, flat, body, timeout_ms)
+    let r = st_http_fetch(method.upper(), url, flat, body, timeout_ms)
     if r[0] == "" {
         return err(r[1])
     }
