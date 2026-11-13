@@ -932,7 +932,7 @@ impl Server {
                 tok if WORDS.iter().any(|w| w.1 == *tok) || lexer::EMOJI.iter().any(|e| e.0 == *tok) => continue,
                 Tok::Arrow | Tok::FatArrow | Tok::Question | Tok::QuestionQuestion | Tok::Bang | Tok::Pipe | Tok::Eq | Tok::Ne
                 | Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge | Tok::AndAnd | Tok::OrOr | Tok::Plus | Tok::Minus | Tok::Times
-                | Tok::Slash | Tok::Percent | Tok::Assign | Tok::PlusEq | Tok::MinusEq | Tok::TimesEq | Tok::SlashEq | Tok::DotDot => ("operator", 0),
+                | Tok::Slash | Tok::Percent | Tok::Amp | Tok::Caret | Tok::Tilde | Tok::Shl | Tok::Assign | Tok::PlusEq | Tok::MinusEq | Tok::TimesEq | Tok::SlashEq | Tok::DotDot => ("operator", 0),
                 Tok::Ident(n) => {
                     let decl = matches!(prev, Some(Tok::Fn | Tok::Struct | Tok::Enum | Tok::Const | Tok::Let | Tok::Var)) as u32;
                     let prev2 = k.checked_sub(2).map(|i| &flat[i].tok);

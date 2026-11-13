@@ -15,6 +15,11 @@ use std::{env, fs};
 
 const RUNTIME: &str = include_str!("runtime.c");
 const RUNTIME_WEB: &str = include_str!("runtime_web.c");
+const RUNTIME_GC: &str = include_str!("runtime_gc.c");
+const RUNTIME_KLIBC: &str = include_str!("runtime_klibc.c");
+const RUNTIME_KERNEL: &str = include_str!("runtime_kernel.c");
+const RUNTIME_FONT: &str = include_str!("runtime_font.c");
+const KERNEL_LD: &str = include_str!("kernel.ld");
 const LOADER: &str = include_str!("loader.js");
 
 /// The standard library, written in stellang and built into the compiler.
@@ -24,11 +29,16 @@ pub const STD: &[(&str, &str)] = &[
     ("fs", include_str!("../std/fs.st")),
     ("json", include_str!("../std/json.st")),
     ("web", include_str!("../std/web.st")),
+    ("kernel", include_str!("../std/kernel.st")),
+    ("gfx", include_str!("../std/gfx.st")),
 ];
 
 const USAGE: &str = "usage:
   stellang <file.st> [-o <out>] [-O0|-O1|-O2|-O3|-Os] [--emit-llvm]   compile
   stellang --web <app.st> [-o <out>]                                   compile for the browser (out.wasm + out.js)
+  stellang --kernel <os.st> [-o <out>]                                 compile an operating system kernel (RISC-V 64, out.elf)
+  stellang boot [--gui] [--disk f.img] <os.st|os.elf> [qemu args]      build it and boot it in QEMU (--gui: with a display,
+                                                                        keyboard and mouse; a disk image keeps files)
   stellang dev [dir]                                                    full-stack dev loop: client.st -> public/, server.st; rebuild on change
   stellang check <file.st>                                             type-check only
   stellang fmt [--emoji|--plain] <file.st>                              re-indent in place
@@ -100,6 +110,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("lsp") => return lsp::run(),
         Some("dev") => return dev(args.get(1).map(String::as_str).unwrap_or(".")),
+        Some("boot") => return boot(&args[1..]),
         Some("--version" | "-V") => return println!("stellang {}", env!("CARGO_PKG_VERSION")),
         Some("grammar") => match args.get(1).map(String::as_str) {
             Some("textmate") => return print!("{}", grammar::textmate()),
@@ -129,13 +140,14 @@ fn main() {
         return;
     }
 
-    let (mut input, mut out, mut opt, mut emit, mut web) = (None, None, "-O2".to_string(), false, false);
+    let (mut input, mut out, mut opt, mut emit, mut web, mut kernel) = (None, None, "-O2".to_string(), false, false, false);
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
             "-o" => out = Some(args.next().unwrap_or_else(|| die("-o needs a file name"))),
             "--emit-llvm" | "-S" => emit = true,
             "--web" => web = true,
+            "--kernel" => kernel = true,
             "-O0" | "-O1" | "-O2" | "-O3" | "-Os" | "-Oz" => opt = a.clone(),
             "-h" | "--help" => return println!("{USAGE}"),
             _ if a.starts_with('-') => die(format!("unknown option {a}\n{USAGE}")),
@@ -145,6 +157,10 @@ fn main() {
     let Some(input) = input else { die(USAGE) };
     if web {
         return build_web(&input, out, &opt, emit);
+    }
+    if kernel {
+        build_kernel(&input, out, &opt, emit);
+        return;
     }
     let units = load_or_exit(&input);
     let ir = codegen::compile(&units).unwrap_or_else(|(file, p, m)| {
@@ -200,7 +216,7 @@ fn build_web(input: &str, out: Option<String>, opt: &str, emit: bool) {
         return;
     }
     let rt = env::temp_dir().join(format!("stellang-rt-web-{}.c", std::process::id()));
-    fs::write(&rt, format!("{RUNTIME}\n{RUNTIME_WEB}")).unwrap_or_else(|e| die(e));
+    fs::write(&rt, format!("{RUNTIME}\n{RUNTIME_GC}\n{RUNTIME_WEB}")).unwrap_or_else(|e| die(e));
     let sysroot = env::var("STELLANG_WASI_SYSROOT").unwrap_or_else(|_| "/usr".into());
     let wasm = format!("{base}.wasm");
     let mut cmd = Command::new("clang");
@@ -224,6 +240,131 @@ fn build_web(input: &str, out: Option<String>, opt: &str, emit: bool) {
         );
         fs::write(&html, page).unwrap_or_else(|e| die(e));
     }
+}
+
+/// `stellang --kernel os.st`: os.elf, a kernel for QEMU's RISC-V `virt` machine. The program, the C
+/// runtime (with a small libc, runtime_klibc.c, and the boot code, runtime_kernel.c) and the
+/// collector (runtime_gc.c) are compiled freestanding and linked with kernel.ld. Returns the .elf path.
+fn build_kernel(input: &str, out: Option<String>, opt: &str, emit: bool) -> String {
+    let units = load_or_exit(input);
+    for u in &units {
+        for (imp, pos) in &u.module.imports {
+            if ["net", "http", "fs"].contains(&imp.as_str()) {
+                eprintln!("{}:{}:{}: error: `import {imp}` needs a host operating system; a --kernel program has `import kernel`", u.file, pos.line, pos.col);
+                exit(1)
+            }
+        }
+    }
+    let ir = codegen::compile_kernel(&units).unwrap_or_else(|(file, p, m)| {
+        eprintln!("{file}:{}:{}: error: {m}", p.line, p.col);
+        exit(1)
+    });
+    let stem = Path::new(input).file_stem().unwrap().to_string_lossy().into_owned();
+    let base = out.map(|o| o.trim_end_matches(".elf").to_string()).unwrap_or(stem);
+    if let Some(dir) = Path::new(&base).parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::create_dir_all(dir).unwrap_or_else(|e| die(format!("{}: {e}", dir.display())));
+    }
+    if emit {
+        fs::write(format!("{base}.ll"), ir).unwrap_or_else(|e| die(e));
+        return format!("{base}.ll");
+    }
+    let tmp = env::temp_dir().join(format!("stellang-kernel-{}", std::process::id()));
+    fs::create_dir_all(&tmp).unwrap_or_else(|e| die(e));
+    let rt = tmp.join("runtime.c");
+    let ld = tmp.join("kernel.ld");
+    fs::write(&rt, format!("{RUNTIME_KLIBC}\n{RUNTIME}\n{RUNTIME_GC}\n{RUNTIME_FONT}\n{RUNTIME_KERNEL}")).unwrap_or_else(|e| die(e));
+    fs::write(&ld, KERNEL_LD).unwrap_or_else(|e| die(e));
+    let elf = format!("{base}.elf");
+    let mut cmd = Command::new("clang");
+    cmd.args(["--target=riscv64-unknown-elf", "-march=rv64gc", "-mabi=lp64d", "-mcmodel=medany", "-mno-relax"]);
+    cmd.args(["-ffreestanding", "-fno-builtin", "-nostdlib", "-static", "-fuse-ld=lld", opt, "-Wno-override-module"]);
+    cmd.args(["-x", "ir", "-", "-x", "c", "-DST_KERNEL", "-DGC_AUTO", "-Wno-unused-function"]).arg(&rt);
+    cmd.arg(format!("-Wl,-T,{}", ld.display())).args(["-Wl,--gc-sections", "-ffunction-sections", "-fdata-sections", "-o", &elf]);
+    let mut child = cmd.stdin(Stdio::piped()).spawn().unwrap_or_else(|e| die(format!("cannot run clang: {e}")));
+    child.stdin.take().unwrap().write_all(ir.as_bytes()).unwrap_or_else(|e| die(e));
+    let ok = child.wait().is_ok_and(|s| s.success());
+    let _ = fs::remove_dir_all(&tmp);
+    if !ok {
+        die("clang couldn't build the kernel. It needs clang with the RISC-V target and lld \
+             (Debian/Ubuntu: `apt install clang lld`)");
+    }
+    elf
+}
+
+/// `stellang boot os.st` (or os.elf): build the kernel if needed and boot it in QEMU, the console on
+/// this terminal. QEMU's exit code is the kernel's (main's return value, 101 for a panic).
+fn boot(args: &[String]) {
+    let mut gui = false;
+    let mut disk: Option<String> = None;
+    let mut no_disk = false;
+    let mut i = 0;
+    while i < args.len() && args[i].starts_with("--") {
+        match args[i].as_str() {
+            "--gui" => gui = true,
+            "--no-disk" => no_disk = true,
+            "--disk" if i + 1 < args.len() => {
+                i += 1;
+                disk = Some(args[i].clone());
+            }
+            other => die(format!("boot: unknown option {other}\n{USAGE}")),
+        }
+        i += 1;
+    }
+    let args = &args[i..];
+    let Some(input) = args.first() else { die(USAGE) };
+    let elf = if input.ends_with(".elf") {
+        input.clone()
+    } else {
+        let out = env::temp_dir().join(format!("stellang-boot-{}", std::process::id())).display().to_string();
+        build_kernel(input, Some(out), "-O2", false)
+    };
+    // the disk: a file that keeps what the kernel writes, from one boot to the next
+    let disk = if no_disk {
+        None
+    } else {
+        let path = disk.map(std::path::PathBuf::from).unwrap_or_else(|| {
+            let cache = env::var_os("XDG_CACHE_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))
+                .unwrap_or_else(env::temp_dir);
+            let stem = Path::new(input).file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            cache.join("stellang").join(format!("{stem}.img"))
+        });
+        if !path.exists() {
+            if let Some(dir) = path.parent() {
+                fs::create_dir_all(dir).unwrap_or_else(|e| die(format!("{}: {e}", dir.display())));
+            }
+            let f = fs::File::create(&path).unwrap_or_else(|e| die(format!("{}: {e}", path.display())));
+            f.set_len(16 << 20).unwrap_or_else(|e| die(format!("{}: {e}", path.display())));
+        }
+        eprintln!("disk: {} (`--no-disk` to boot without one)", path.display());
+        Some(path)
+    };
+    let qemu = env::var("STELLANG_QEMU").unwrap_or_else(|_| "qemu-system-riscv64".into());
+    let mut cmd = Command::new(&qemu);
+    cmd.args(["-machine", "virt", "-m", "512M", "-bios", "default", "-kernel", &elf, "-rtc", "base=localtime"]);
+    cmd.args(["-global", "virtio-mmio.force-legacy=false"]); // virtio 1.x devices (what the drivers speak)
+    if let Some(d) = &disk {
+        cmd.arg("-drive").arg(format!("file={},if=none,format=raw,id=disk0", d.display()));
+        cmd.args(["-device", "virtio-blk-device,drive=disk0"]);
+    }
+    if gui {
+        // a window with the display (a ramfb framebuffer), a keyboard and a mouse (virtio-input; the
+        // tablet reports absolute positions, so the pointer follows the host's); the console stays
+        // on this terminal
+        cmd.args(["-device", "ramfb", "-device", "virtio-keyboard-device", "-device", "virtio-tablet-device"]);
+        cmd.args(["-serial", "mon:stdio"]);
+    } else {
+        cmd.arg("-nographic");
+    }
+    cmd.args(&args[1..]);
+    let status = cmd.status().unwrap_or_else(|e| {
+        die(format!("cannot run {qemu}: {e} (Debian/Ubuntu: `apt install qemu-system-misc`, macOS: `brew install qemu`)"))
+    });
+    if !input.ends_with(".elf") {
+        let _ = fs::remove_file(&elf);
+    }
+    exit(status.code().unwrap_or(1));
 }
 
 /// `stellang dev [dir]`: build `client.st` for the browser (into `public/client.wasm` + `.js`) and

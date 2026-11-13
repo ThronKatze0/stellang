@@ -16,12 +16,15 @@ syn keyword stellangType int float bool str void
 syn keyword stellangConstant true false none
 syn match stellangBuiltin "\<\(print\|println\|env\|panic\|ok\|err\|min\|max\|abs\|some\|to_json\|sleep\|now_ms\|url_encode\|url_decode\|args\|read_line\|exit\)\ze\s*("
 syn keyword stellangSelf self
+syn match stellangNumber "\<0[xX][0-9a-fA-F_]\+\>"
+syn match stellangNumber "\<0[bB][01_]\+\>"
 syn match stellangNumber "\<\d[0-9_]*\(\.\d[0-9_]*\)\=\([eE][+-]\=\d\+\)\=\>"
 syn match stellangTypeName "\<[A-Z][A-Za-z0-9_]*\>"
 syn match stellangFunction "\<[a-z_][A-Za-z0-9_]*\ze\s*("
 syn region stellangInterp matchgroup=stellangInterpDelim start="\${" end="}" contained contains=TOP
 syn match stellangEscape "\\[nrt\\\"$]" contained
 syn region stellangString start=+"+ skip=+\\\\\|\\"+ end=+"+ contains=stellangEscape,stellangInterp
+syn region stellangString start=+"""+ end=+"""+ contains=stellangEscape,stellangInterp
 syn match stellangComment "//.*$" contains=@Spell
 syn match stellangTag "\(\w\)\@<!</\=\zs[a-z][a-z0-9-]*\ze[ \t/>]"
 syn match stellangComponent "\(\w\)\@<!</\=\zs\([a-z_]\w*\.\)*[A-Z]\w*\ze[ \t/>]"

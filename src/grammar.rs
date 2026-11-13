@@ -97,7 +97,7 @@ pub fn textmate() -> String {
         rule("support.type.primitive.stellang", alt(&w.types)),
         rule("support.function.builtin.stellang", format!("(?:{})(?=\\s*\\()", alt(&w.builtins))),
         rule("constant.numeric.float.stellang", "\\b\\d[\\d_]*\\.\\d[\\d_]*(?:[eE][+-]?\\d+)?\\b".into()),
-        rule("constant.numeric.integer.stellang", "\\b\\d[\\d_]*\\b".into()),
+        rule("constant.numeric.integer.stellang", "\\b(?:0[xX][\\da-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|\\d[\\d_]*)\\b".into()),
         // `Shape.Circle`, `.Circle` (the type comes from context), field names, method calls
         caps(format!("\\b({upper})(\\.)({upper})\\b"), &["entity.name.type.stellang", "punctuation.accessor.stellang", "variable.other.enummember.stellang"]),
         caps(format!("(?<![\\w\\)\\]\"])(\\.)({upper})\\b"), &["punctuation.accessor.shorthand.stellang", "variable.other.enummember.stellang"]),
@@ -144,9 +144,9 @@ pub fn textmate() -> String {
     ]);
     let string = obj([
         ("name", "string.quoted.double.stellang".into()),
-        ("begin", "\"".into()),
+        ("begin", "(\"\"\"|\")".into()), // """ over several lines """, or "one line"
         ("beginCaptures", obj([("0", obj([("name", "punctuation.definition.string.begin.stellang".into())]))])),
-        ("end", "\"".into()),
+        ("end", "\\1".into()), // the same quotes it began with
         ("endCaptures", obj([("0", obj([("name", "punctuation.definition.string.end.stellang".into())]))])),
         (
             "patterns",
@@ -237,12 +237,15 @@ pub fn vim() -> String {
     s += &kw("stellangConstant", &w.constants);
     s += &format!("syn match stellangBuiltin \"\\<\\({}\\)\\ze\\s*(\"\n", w.builtins.join("\\|"));
     s += "syn keyword stellangSelf self\n";
+    s += "syn match stellangNumber \"\\<0[xX][0-9a-fA-F_]\\+\\>\"\n";
+    s += "syn match stellangNumber \"\\<0[bB][01_]\\+\\>\"\n";
     s += "syn match stellangNumber \"\\<\\d[0-9_]*\\(\\.\\d[0-9_]*\\)\\=\\([eE][+-]\\=\\d\\+\\)\\=\\>\"\n";
     s += "syn match stellangTypeName \"\\<[A-Z][A-Za-z0-9_]*\\>\"\n";
     s += "syn match stellangFunction \"\\<[a-z_][A-Za-z0-9_]*\\ze\\s*(\"\n";
     s += "syn region stellangInterp matchgroup=stellangInterpDelim start=\"\\${\" end=\"}\" contained contains=TOP\n";
     s += "syn match stellangEscape \"\\\\[nrt\\\\\\\"$]\" contained\n";
     s += "syn region stellangString start=+\"+ skip=+\\\\\\\\\\|\\\\\"+ end=+\"+ contains=stellangEscape,stellangInterp\n";
+    s += "syn region stellangString start=+\"\"\"+ end=+\"\"\"+ contains=stellangEscape,stellangInterp\n";
     s += "syn match stellangComment \"//.*$\" contains=@Spell\n";
     s += "syn match stellangTag \"\\(\\w\\)\\@<!</\\=\\zs[a-z][a-z0-9-]*\\ze[ \\t/>]\"\n";
     s += "syn match stellangComponent \"\\(\\w\\)\\@<!</\\=\\zs\\([a-z_]\\w*\\.\\)*[A-Z]\\w*\\ze[ \\t/>]\"\n";

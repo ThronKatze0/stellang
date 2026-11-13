@@ -306,6 +306,9 @@ fn compile_errors() {
         ("fn main() { let x = [] }", "empty list"),
         ("fn main() { let f = x => x }", "can't tell the type of `x`"),
         ("fn main() { nope(1) }", "unknown function"),
+        ("fn main() { println(1.5 & 1) }", "works on ints, not float"),
+        ("fn main() { println(0x) }", "expected digits after the number prefix"),
+        ("fn main() { println(0b102) }", "not a valid base-2 number"),
         ("fn main() { break }", "outside of a loop"),
         ("struct P { x: int }\nfn main() { let p = P { y: 1 } }", "has no field `y`"),
         ("struct P { x: int }\nfn main() { let p = P {} }", "missing field `x`"),
@@ -1451,4 +1454,218 @@ fn main() {
         let (code, _, err) = run("defaults_generic_bad", src);
         assert!(code == -1 && err.contains(want), "{src}\n{err}");
     }
+}
+
+/// `chars()` splits by character (UTF-8 aware), and """strings""" span lines.
+#[test]
+fn chars_and_long_strings() {
+    let src = "const CSS = \"\"\"\n  a { color: \"red\" }\n  b ${1 + 1}\n\"\"\"\nfn main() {\n    let cs = \"aß€✦\".chars()\n    println(\"${cs.len()} ${cs[1]} ${cs[3]}\")\n    print(CSS)\n}\n";
+    assert_eq!(run("chars_long", src), (0, "4 ß ✦\n  a { color: \"red\" }\n  b 2\n".into(), "".into()));
+}
+
+#[test]
+fn bitwise_and_hex() {
+    let src = r#"
+struct Box<T> { v: T }
+fn main() {
+    let b: Box<Box<int>> = Box { v: Box { v: 0xff } }   // `>>` still closes two type arguments
+    println(b.v.v)
+    println(0x10 | 0b0011 & 0b10)        // & binds tighter than |
+    println(1 << 40 >> 38)
+    println(~0 ^ 0xF0)
+    println(0xFFFF_FFFF_FFFF_FFFF)       // 64 bits: -1
+    println(0o755)
+    println(5 & 4 == 4)                  // and tighter than ==
+    println(1 << 64)                     // shift amounts wrap at 64
+    println(-16 >> 2)                    // arithmetic shift
+}
+"#;
+    ok("bitwise", src, "255\n18\n4\n-241\n-1\n493\ntrue\n1\n-4\n");
+}
+
+/// `stellang --kernel`: StellaOS boots in QEMU, runs shell commands typed on the serial console,
+/// and powers off with main's exit code. Skipped when QEMU isn't installed.
+#[test]
+fn kernel_boots_stellaos() {
+    use std::io::Write;
+    use std::process::Stdio;
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-riscv64");
+        return;
+    }
+    let dir = tmpdir("kernel");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let elf = dir.join("os.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(root.join("examples/stellaos/os.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+
+    let mut q = Command::new("qemu-system-riscv64")
+        .args(["-machine", "virt", "-m", "128M", "-nographic", "-bios", "default", "-kernel"])
+        .arg(&elf)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = q.stdin.take().unwrap();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        for cmd in ["write a.txt hi there", "cat a.txt", "calc (1 << 10) | 0x0f", "ls", "mem", "nope", "shutdown"] {
+            stdin.write_all(format!("{cmd}\r").as_bytes()).unwrap();
+            stdin.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    });
+    let out = q.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    for want in ["StellaOS 0.2", "hi there\n", "1039  (0x40f)", "a.txt  (9 B)", "hello.st", "RAM      128.0 MiB", "unknown command: nope", "bye!"] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+
+    // a panic in the kernel: QEMU exits with 101, like a native program
+    let file = dir.join("boom.st");
+    fs::write(&file, "import kernel\nfn main() {\n let xs = [1]\n println(xs[3])\n}\n").unwrap();
+    let c = Command::new(BIN).arg("--kernel").arg(&file).arg("-o").arg(dir.join("boom.elf")).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let out = Command::new("qemu-system-riscv64")
+        .args(["-machine", "virt", "-m", "64M", "-nographic", "-bios", "default", "-kernel"])
+        .arg(dir.join("boom.elf"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(101));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("boom.st:4:12: panic: index out of bounds"));
+
+    // host-only modules are refused
+    fs::write(&file, "import http\nfn main() {}\n").unwrap();
+    let c = Command::new(BIN).arg("--kernel").arg(&file).output().unwrap();
+    assert!(String::from_utf8_lossy(&c.stderr).contains("needs a host operating system"));
+}
+
+/// StellaOS's desktop, driven like a person would: keys typed on the (virtio) keyboard go to the
+/// focused Terminal window and from there to the shell; a double click on a desktop icon opens an
+/// app; files written in one boot are on the disk in the next.
+#[test]
+fn stellaos_desktop() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+    use std::time::Duration;
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-riscv64");
+        return;
+    }
+    let dir = tmpdir("desktop");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let elf = dir.join("os.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(root.join("examples/stellaos/os.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let disk = dir.join("disk.img");
+    fs::File::create(&disk).unwrap().set_len(4 << 20).unwrap();
+
+    let boot = |steps: &dyn Fn(&mut dyn FnMut(&str), &mut dyn FnMut(&str)), tag: &str| -> String {
+        let sock = dir.join(format!("qmp-{tag}"));
+        let mut q = Command::new("qemu-system-riscv64")
+            .args(["-machine", "virt", "-m", "256M", "-bios", "default", "-display", "none", "-serial", "stdio"])
+            .args(["-global", "virtio-mmio.force-legacy=false", "-device", "ramfb"])
+            .args(["-device", "virtio-keyboard-device", "-device", "virtio-tablet-device"])
+            .arg("-drive")
+            .arg(format!("file={},if=none,format=raw,id=d0", disk.display()))
+            .args(["-device", "virtio-blk-device,drive=d0", "-qmp"])
+            .arg(format!("unix:{},server,nowait", sock.display()))
+            .arg("-kernel")
+            .arg(&elf)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = q.stdin.take().unwrap();
+        // a watchdog: if something goes wrong, QEMU mustn't outlive the test
+        let pid = q.id();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(90));
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        });
+        std::thread::sleep(Duration::from_millis(3000));
+        let qmp = UnixStream::connect(&sock).unwrap();
+        let mut reader = BufReader::new(qmp.try_clone().unwrap());
+        let mut w = qmp;
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap(); // the greeting
+        let mut cmd = move |json: String| {
+            w.write_all(json.as_bytes()).unwrap();
+            w.write_all(b"\n").unwrap();
+            loop {
+                let mut l = String::new();
+                reader.read_line(&mut l).unwrap();
+                if l.contains("\"return\"") || l.contains("\"error\"") {
+                    assert!(!l.contains("error"), "QMP: {l}");
+                    break;
+                }
+            }
+        };
+        cmd(r#"{"execute": "qmp_capabilities"}"#.into());
+        // keys: by QEMU's key names
+        let mut keys = |text: &str| {
+            for ch in text.chars() {
+                let k = match ch {
+                    ' ' => "spc".to_string(),
+                    '-' => "minus".to_string(),
+                    '.' => "dot".to_string(),
+                    '/' => "slash".to_string(),
+                    '\n' => "ret".to_string(),
+                    c => c.to_string(),
+                };
+                for down in [true, false] {
+                    cmd(format!(r#"{{"execute": "input-send-event", "arguments": {{"events": [{{"type": "key", "data": {{"down": {down}, "key": {{"type": "qcode", "data": "{k}"}}}}}}]}}}}"#));
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        };
+        let mut serial = |text: &str| {
+            stdin.write_all(text.as_bytes()).unwrap();
+            stdin.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        steps(&mut keys, &mut serial);
+        let out = q.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+        assert_eq!(out.status.code(), Some(0), "{text}");
+        text
+    };
+
+    let text = boot(
+        &|keys, serial| {
+            serial("windows\r");
+            // typed into the Terminal window (focused at boot), run by the shell
+            keys("echo typed on the desktop\n");
+            std::thread::sleep(Duration::from_millis(400));
+            keys("write kept.txt from the first boot\n");
+            std::thread::sleep(Duration::from_millis(400));
+            serial("open snake\r");
+            serial("windows\r");
+            serial("shutdown\r");
+        },
+        "a",
+    );
+    for want in ["1  Terminal", "(focused)", "\ntyped on the desktop\n", "Snake  432x364", "bye!"] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    let text = boot(
+        &|_keys, serial| {
+            serial("cat kept.txt\r");
+            serial("shutdown\r");
+        },
+        "b",
+    );
+    assert!(text.contains("\nfrom the first boot\n"), "the file didn't survive the reboot:\n{text}");
+}
+
+/// A field default that builds another struct with defaults (from another module) makes that
+/// struct's default functions once, not twice.
+#[test]
+fn nested_field_defaults() {
+    let m = "struct E {\n    h: [str] = [],\n    n: int = 2,\n}\n";
+    let src = "import m\nstruct Outer {\n    e: m.E = m.E {},\n}\nfn main() {\n    let o = Outer {}\n    println(o.e.n + m.E {}.h.len())\n}\n";
+    assert_eq!(run_with("nested_defaults", src, &[("m", m)]), (0, "2\n".into(), "".into()));
 }

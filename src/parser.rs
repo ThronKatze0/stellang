@@ -909,19 +909,35 @@ impl Parser {
                 Tok::OrOr => 1,
                 Tok::AndAnd => 2,
                 Tok::Eq | Tok::Ne => 3,
+                Tok::Gt if self.shr_ahead() => 9,
                 Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge | Tok::In => 4,
                 Tok::QuestionQuestion => 5,
-                Tok::Plus | Tok::Minus => 6,
-                Tok::Times | Tok::Slash | Tok::Percent => 7,
+                Tok::Pipe => 6,
+                Tok::Caret => 7,
+                Tok::Amp => 8,
+                Tok::Shl => 9,
+                Tok::Plus | Tok::Minus => 10,
+                Tok::Times | Tok::Slash | Tok::Percent => 11,
                 _ => 0,
             };
             if prec < min { return Ok(lhs) }
             let pos = self.pos();
-            let op = self.next();
+            let op = if self.shr_ahead() {
+                self.next();
+                self.next();
+                Tok::Shr
+            } else {
+                self.next()
+            };
             // `a ?? b ?? c` groups to the right
             let rhs = self.binary(if op == Tok::QuestionQuestion { prec } else { prec + 1 })?;
             lhs = Expr { kind: ExprKind::Binary(op, Box::new(lhs), Box::new(rhs)), pos };
         }
+    }
+
+    /// `>>`: two `>` with nothing between them (lexed apart so `Box<Box<int>>` closes)
+    fn shr_ahead(&self) -> bool {
+        *self.peek() == Tok::Gt && *self.peek_at(1) == Tok::Gt && self.toks[self.i].end == self.toks[(self.i + 1).min(self.toks.len() - 1)].start
     }
 
     fn unary(&mut self) -> P<Expr> {
@@ -929,6 +945,7 @@ impl Parser {
         let op = match self.peek() {
             Tok::Minus => '-',
             Tok::Bang => '!',
+            Tok::Tilde => '~',
             _ => return self.postfix(),
         };
         self.next();

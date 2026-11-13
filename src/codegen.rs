@@ -430,6 +430,7 @@ struct Gen {
     impl_methods: Vec<(String, String, Vec<Func>)>, // (module, type key, methods incl. trait defaults)
     jsx: Vec<jsx::JsxBuf>, // elements being built
     web: bool,             // compiling for the browser (WebAssembly)
+    kernel: bool,          // compiling for bare metal (stellang --kernel)
 }
 
 /// What the type checker learned about a spot in the source (for editor hovers).
@@ -447,6 +448,17 @@ pub fn compile(units: &[Unit]) -> Result<String, (String, Pos, String)> {
 /// Compile for the browser (WebAssembly): the entry point is `st_start`, event handlers are kept.
 pub fn compile_web(units: &[Unit]) -> Result<String, (String, Pos, String)> {
     let mut g = Gen { web: true, ..Gen::default() };
+    for u in units {
+        g.files.insert(u.name.clone(), u.file.clone());
+        g.imports.insert(u.name.clone(), u.module.imports.iter().map(|i| i.0.clone()).collect());
+    }
+    let r = g.run(units, true);
+    r.map_err(|(p, m)| (g.files[&g.module].clone(), p, m))
+}
+
+/// Compile for bare metal (`stellang --kernel`): like a native program, minus the host-only attributes.
+pub fn compile_kernel(units: &[Unit]) -> Result<String, (String, Pos, String)> {
+    let mut g = Gen { kernel: true, ..Gen::default() };
     for u in units {
         g.files.insert(u.name.clone(), u.file.clone());
         g.imports.insert(u.name.clone(), u.module.imports.iter().map(|i| i.0.clone()).collect());
@@ -870,7 +882,7 @@ impl Gen {
             writeln!(out, "define i32 @main(i32 %argc, ptr %argv) {{\n  call void @st_set_args(i32 %argc, ptr %argv)\n  call void @st_init()\n{init}{entry}\n}}").unwrap();
         }
         out += &self.globals;
-        if self.web {
+        if self.web || self.kernel {
             out += "attributes #0 = { nounwind }\n";
         } else {
             // stack-clash protection: big frames touch every page, so they hit the guard page instead of jumping it
@@ -881,7 +893,10 @@ impl Gen {
 
     /// A default value as a function of its own, evaluated in `module` and checked against the type it fills in.
     fn default_fn(&mut self, sym: &str, e: &Expr, module: &str, t: &Type) -> R<()> {
-        self.default_fns.insert(sym.into());
+        // once: another default may already have made it (`a: E = E {}` needs E's field defaults)
+        if !self.default_fns.insert(sym.into()) {
+            return Ok(());
+        }
         let saved = mem::replace(&mut self.module, module.into());
         let body = Body::Expr(Box::new(e.clone()));
         // on an error, `module` stays put so the message names the file the default is written in
@@ -2083,6 +2098,7 @@ impl Gen {
                 let (want, code) = match (*op, &v.ty) {
                     ('-', Type::Float) => (Type::Float, format!("fneg double {}", v.v)),
                     ('-', _) => (Type::Int, format!("sub i64 0, {}", v.v)),
+                    ('~', _) => (Type::Int, format!("xor i64 {}, -1", v.v)),
                     _ => (Type::Bool, format!("xor i1 {}, true", v.v)),
                 };
                 expect_ty(&want, &v.ty, x.pos)?;
@@ -2476,6 +2492,29 @@ impl Gen {
             let t = self.tmp();
             self.ins(format!("{t} = xor i1 {e}, true"));
             return Ok(val(t, Type::Bool));
+        }
+        if matches!(op, Tok::Amp | Tok::Pipe | Tok::Caret | Tok::Shl | Tok::Shr) {
+            for (v, e) in [(&a, l), (&b, r)] {
+                if v.ty != Type::Int {
+                    return err(e.pos, format!("{op} works on ints, not {}", v.ty));
+                }
+            }
+            let t = self.tmp();
+            let inst = match op {
+                Tok::Amp => "and",
+                Tok::Pipe => "or",
+                Tok::Caret => "xor",
+                Tok::Shl => "shl",
+                _ => "ashr",
+            };
+            let mut amount = b.v.clone();
+            if matches!(op, Tok::Shl | Tok::Shr) {
+                // shifting by 64 or more is undefined in LLVM; use the low 6 bits (like Java and x86)
+                amount = self.tmp();
+                self.ins(format!("{amount} = and i64 {}, 63", b.v));
+            }
+            self.ins(format!("{t} = {inst} i64 {}, {amount}", a.v));
+            return Ok(val(t, Type::Int));
         }
         let (a, b) = self.promote(a, b, pos)?;
         let cmp = matches!(op, Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge);

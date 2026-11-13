@@ -14,7 +14,7 @@ fn main() -> void! {
 
     app.get("/hello/:name", (req, res) => res.send("hello, ${req.param("name")}!"))
 
-    app.get("/time", (req, res) => res.json("{\"ms\": ${http.now_ms()}}"))
+    app.get("/time", (req, res) => res.json("{\"ms\": ${now_ms()}}"))
 
     let port = int(env("PORT")) catch 8080
     app.listen(port)?

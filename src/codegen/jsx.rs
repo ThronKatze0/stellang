@@ -174,7 +174,7 @@ impl Gen {
         if f.ty != want {
             return err(pos, format!("an event handler is a fn() or a fn(str) (the input's value), not {}", f.ty));
         }
-        if self.web {
+        if self.web || self.kernel {
             let id = self.rt(Type::Int, "st_on", &[format!("ptr {}", f.v), format!("i64 {arity}")]);
             let s = self.rt(Type::Str, "st_itoa", &[format!("i64 {}", id.v)]);
             self.jsx_text(&format!(" data-on-{event}=\""));
