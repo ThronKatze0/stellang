@@ -1,2 +1,4 @@
 /target
 .omc/
+editors/vscode/node_modules
+*.vsix

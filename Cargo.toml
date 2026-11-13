@@ -2,5 +2,8 @@
 name = "stellang"
 version = "0.1.0"
 edition = "2024"
+description = "A small compiled language with structs, enums, options and results, an Express-style web framework, and a built-in language server"
+license = "MIT"
+repository = "https://github.com/ThronKatze0/stellang"
 
 [dependencies]

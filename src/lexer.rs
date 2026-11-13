@@ -3,12 +3,12 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     // keywords
-    Fn, Struct, Impl, Extern, Import, Let, Var, If, Else, While, For, In, Return, Break, Continue, Match, Catch,
+    Fn, Struct, Enum, Const, Impl, Extern, Import, Let, Var, If, Else, While, For, In, Return, Break, Continue, Match, Catch,
     Star, // ⭐ (emoji twin of `{` and `}`; the parser knows which)
     Ident(String), Int(i64), Float(f64), Str(String),
     Interp(Vec<Part>), // a string with `${...}` in it
     LParen, RParen, LBrace, RBrace, LBrack, RBrack, Comma, Colon, Semi, Dot, DotDot,
-    Arrow, FatArrow, Question, Bang,
+    Arrow, FatArrow, Question, QuestionQuestion, Bang, Pipe,
     Assign, PlusEq, MinusEq, TimesEq, SlashEq,
     Plus, Minus, Times, Slash, Percent, Eq, Ne, Lt, Le, Gt, Ge, AndAnd, OrOr,
     Newline,
@@ -38,8 +38,8 @@ pub struct Token {
 
 pub type Error = (Pos, String);
 
-const WORDS: [(&str, Tok); 17] = [
-    ("fn", Tok::Fn), ("struct", Tok::Struct), ("impl", Tok::Impl), ("extern", Tok::Extern),
+pub const WORDS: [(&str, Tok); 19] = [
+    ("fn", Tok::Fn), ("struct", Tok::Struct), ("enum", Tok::Enum), ("const", Tok::Const), ("impl", Tok::Impl), ("extern", Tok::Extern),
     ("import", Tok::Import), ("let", Tok::Let), ("var", Tok::Var), ("if", Tok::If), ("else", Tok::Else),
     ("while", Tok::While), ("for", Tok::For), ("in", Tok::In), ("return", Tok::Return),
     ("break", Tok::Break), ("continue", Tok::Continue), ("match", Tok::Match), ("catch", Tok::Catch),
@@ -76,7 +76,7 @@ impl fmt::Display for Tok {
             Tok::LParen => "(", Tok::RParen => ")", Tok::LBrace => "{", Tok::RBrace => "}",
             Tok::LBrack => "[", Tok::RBrack => "]", Tok::Comma => ",", Tok::Colon => ":", Tok::Semi => ";",
             Tok::Dot => ".", Tok::DotDot => "..", Tok::Arrow => "->", Tok::FatArrow => "=>",
-            Tok::Question => "?", Tok::Bang => "!", Tok::Assign => "=", Tok::PlusEq => "+=",
+            Tok::Question => "?", Tok::QuestionQuestion => "??", Tok::Pipe => "|", Tok::Bang => "!", Tok::Assign => "=", Tok::PlusEq => "+=",
             Tok::MinusEq => "-=", Tok::TimesEq => "*=", Tok::SlashEq => "/=",
             Tok::Plus => "+", Tok::Minus => "-", Tok::Times => "*", Tok::Slash => "/", Tok::Percent => "%",
             Tok::Eq => "==", Tok::Ne => "!=", Tok::Lt => "<", Tok::Le => "<=", Tok::Gt => ">", Tok::Ge => ">=",
@@ -94,14 +94,14 @@ fn continues_after(t: &Tok) -> bool {
         t,
         Plus | Minus | Times | Slash | Percent | Eq | Ne | Lt | Le | Gt | Ge | AndAnd | OrOr | Bang | Comma
             | LParen | LBrack | Dot | DotDot | Colon | Arrow | FatArrow | Assign | PlusEq | MinusEq | TimesEq
-            | SlashEq | Catch
+            | SlashEq | Catch | Pipe | QuestionQuestion
     )
 }
 
 /// A line starting with one of these continues the previous line.
 pub fn continues_before(t: &Tok) -> bool {
     use Tok::*;
-    matches!(t, Plus | Times | Slash | Percent | Eq | Ne | Lt | Le | Gt | Ge | AndAnd | OrOr | Dot | Else | Catch)
+    matches!(t, Plus | Times | Slash | Percent | Eq | Ne | Lt | Le | Gt | Ge | AndAnd | OrOr | Dot | Else | Catch | Pipe | QuestionQuestion)
 }
 
 /// Position `p` inside a `${...}` snippet, moved to where the snippet sits in the file.
@@ -242,7 +242,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 ('=', '=') => Some(Tok::Eq), ('!', '=') => Some(Tok::Ne), ('<', '=') => Some(Tok::Le),
                 ('>', '=') => Some(Tok::Ge), ('&', '&') => Some(Tok::AndAnd), ('|', '|') => Some(Tok::OrOr),
                 ('+', '=') => Some(Tok::PlusEq), ('-', '=') => Some(Tok::MinusEq),
-                ('*', '=') => Some(Tok::TimesEq), ('/', '=') => Some(Tok::SlashEq),
+                ('*', '=') => Some(Tok::TimesEq), ('/', '=') => Some(Tok::SlashEq), ('?', '?') => Some(Tok::QuestionQuestion),
                 _ => None,
             };
             if let Some(t) = two {
@@ -255,7 +255,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                     '%' => Tok::Percent, '<' => Tok::Lt, '>' => Tok::Gt, '!' => Tok::Bang, '=' => Tok::Assign,
                     '(' => Tok::LParen, ')' => Tok::RParen, '{' => Tok::LBrace, '}' => Tok::RBrace,
                     '[' => Tok::LBrack, ']' => Tok::RBrack, ',' => Tok::Comma, ':' => Tok::Colon,
-                    ';' => Tok::Semi, '.' => Tok::Dot, '?' => Tok::Question,
+                    ';' => Tok::Semi, '.' => Tok::Dot, '?' => Tok::Question, '|' => Tok::Pipe,
                     _ => return Err((pos, format!("unexpected character '{c}'"))),
                 }
             }
