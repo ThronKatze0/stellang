@@ -519,8 +519,9 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
 <p align="center"><img src=".github/stellaos-browser.png" alt="the StellaOS browser showing a page, the Terminal behind it after ping, host and firewall" width="720"></p>
 
 - **Code: write programs inside the OS** (`code.st`, `cc.st`, `rv.st`, `proc.st`). An editor (syntax colors,
-  line numbers, selection with Shift or the mouse, copy/cut/paste, undo/redo, auto-indent, Ctrl-/ comments, a
-  file sidebar) with a **Run** button (F5): the program is compiled right there to RISC-V machine code (a 30 KB
+  line numbers, selection with Shift or the mouse, copy/cut/paste, undo/redo, auto-indent and closing braces,
+  Ctrl-/ comments, completion as you type, find and go-to-line, a file sidebar; the program is checked a
+  moment after you stop typing, so mistakes show at their line before you run it) with a **Run** button (F5): the program is compiled right there to RISC-V machine code (a 30 KB
   program in about 40 ms) and runs as a process. Its output and questions are in the console under the editor,
   its graphics in a window of its own; a compile error is marked at its line, a crash ends the program with a
   message and nothing else. From the shell: `run hello.st`, `run tool.st a b` (the words come back from

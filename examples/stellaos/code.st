@@ -6,7 +6,8 @@
 // The editor: syntax colors, line numbers, selection (Shift + arrows or the mouse), copy/cut/paste
 // (Ctrl-C/X/V), undo (Ctrl-Z), Ctrl-A, Ctrl-S saves, Ctrl-D duplicates a line, Ctrl-/ comments,
 // Tab indents, Enter keeps the indentation, Ctrl-F finds (F3 again), Ctrl-G goes to a line, Ctrl-N
-// new, Ctrl-O the file list.
+// new, Ctrl-O the file list. Names complete as you type (Tab or Enter takes one, Ctrl-Space asks),
+// and the program is checked a moment after you stop typing: problems show at their line.
 
 import kernel
 import gfx
@@ -108,6 +109,11 @@ struct Editor {
     cw: int = 8,                  // the monospace font's advance
     lh: int = 18,
     blink: int = 0,
+    edits: int = 0,               // bumped by every change; `checked` is the one last compiled
+    checked: int = 0,
+    words: [str] = [],            // names in the file, for completion (refreshed when checking)
+    comp: [str] = [],             // completions on offer
+    comp_sel: int = 0,
     bar: str = "",                // "find" or "goto": the little bar at the editor's foot
     query: str = "",
     last_find: str = "",
@@ -140,6 +146,7 @@ struct Editor {
         self.last_edit = now
         self.dirty = true
         self.err_line = 0
+        self.edits += 1
     }
 
     fn restore(self, from: [Snap], to: [Snap]) {
@@ -209,6 +216,25 @@ struct Editor {
         self.row += parts.len() - 1
         self.col = self.lines[self.row].len()
         self.lines[self.row] = self.lines[self.row] + tail
+    }
+
+    // more { than } in the file (outside strings and comments, roughly)?
+    fn unclosed(self) -> bool {
+        var depth = 0
+        for l in self.lines {
+            var in_str = false
+            var i = 0
+            while i < l.len() {
+                let c = l[i]
+                if !in_str && c == "/" && i + 1 < l.len() && l[i + 1] == "/" { break }
+                if c == "\"" { in_str = !in_str }
+                if c == "\\" { i += 1 }
+                if !in_str && c == "{" { depth += 1 }
+                if !in_str && c == "}" { depth -= 1 }
+                i += 1
+            }
+        }
+        return depth > 0
     }
 
     fn indent_of(self, l: str) -> str {
@@ -315,6 +341,21 @@ struct Editor {
             self.bar_key(e)
             return
         }
+        if !self.comp.is_empty() {
+            if k == "ArrowDown" || k == "ArrowUp" {
+                let n = self.comp.len()
+                self.comp_sel = (self.comp_sel + if k == "ArrowDown" { 1 } else { n - 1 }) % n
+                return
+            }
+            if k == "Enter" || k == "Tab" {
+                self.accept_completion()
+                return
+            }
+            if k == "Escape" {
+                self.comp = []
+                return
+            }
+        }
         if k == "F3" {
             self.find_next(self.last_find, true)
             return
@@ -363,6 +404,8 @@ struct Editor {
             } else if c == "g" {
                 self.bar = "goto"
                 self.query = ""
+            } else if k == " " {
+                self.complete()
             } else if c == "n" {
                 self.new_file()
             } else if c == "o" {
@@ -456,8 +499,15 @@ struct Editor {
             let before = l.slice(0, self.col).trim()
             if before.ends_with("{") || before.ends_with("(") || before.ends_with("[") { ind += "    " }
             let after = l.slice(self.col, l.len())
-            // between { and }: the } goes on a line of its own
-            if (before.ends_with("{") && after.trim().starts_with("}")) {
+            // after an unmatched {: its } comes along
+            if before.ends_with("{") && after.trim() == "" && self.unclosed() {
+                self.lines[self.row] = l.slice(0, self.col)
+                self.lines.insert(self.row + 1, ind)
+                self.lines.insert(self.row + 2, self.indent_of(l) + "}")
+                self.row += 1
+                self.col = ind.len()
+            } else if (before.ends_with("{") && after.trim().starts_with("}")) {
+                // between { and }: the } goes on a line of its own
                 self.lines[self.row] = l.slice(0, self.col)
                 self.lines.insert(self.row + 1, ind)
                 self.lines.insert(self.row + 2, self.indent_of(l) + after.trim())
@@ -488,10 +538,92 @@ struct Editor {
             }
             self.insert(t)
             self.want_x = -1
+            self.complete()
+            self.reveal()
+            return
         } else {
             return
         }
+        self.comp = []
         self.reveal()
+    }
+
+    // ---- completion: names that start with what's before the cursor ----
+
+    fn prefix(self) -> str {
+        let l = self.line()
+        var c = self.col
+        while c > 0 && is_word(l, c - 1) { c -= 1 }
+        return l.slice(c, self.col)
+    }
+
+    fn complete(self) {
+        let p = self.prefix()
+        self.comp = []
+        self.comp_sel = 0
+        if p.len() < 2 || is_digit_s(p[0]) { return }
+        self.words = self.names()
+        var seen: [str] = []
+        for group in [self.words, BUILTINS, KEYWORDS, TYPES] {
+            for w in group {
+                if w.starts_with(p) && w != p && !seen.contains(w) {
+                    seen.push(w)
+                    if seen.len() >= 8 { break }
+                }
+            }
+        }
+        self.comp = seen
+    }
+
+    // the names in the file (not the word being typed)
+    fn names(self) -> [str] {
+        var ws: [str] = []
+        for r, l in self.lines {
+            if r > 3000 { break }
+            var i = 0
+            while i < l.len() {
+                if is_word(l, i) && !is_digit_s(l[i]) {
+                    var j = i
+                    while j < l.len() && is_word(l, j) { j += 1 }
+                    let w = l.slice(i, j)
+                    let typing = r == self.row && j == self.col
+                    if w.len() >= 3 && !typing && !ws.contains(w) && ws.len() < 400 { ws.push(w) }
+                    i = j
+                } else {
+                    i += 1
+                }
+            }
+        }
+        return ws
+    }
+
+    fn accept_completion(self) {
+        let w = self.comp[self.comp_sel]
+        let p = self.prefix()
+        self.snapshot("")
+        self.insert(w.slice(p.len(), w.len()))
+        if BUILTINS.contains(w) && !self.line().slice(self.col, self.line().len()).starts_with("(") {
+            self.insert("()")
+            self.col -= 1
+        }
+        self.comp = []
+    }
+
+    // Compile quietly after a pause in typing: problems show at their line as you go.
+    fn check(self) {
+        self.checked = self.edits
+        let text = self.text()
+        let res = cc.compile(text, () => kernel.uptime())
+        if res.errors.is_empty() {
+            self.err_line = 0
+            if !self.running() { self.status = "✓ no problems" }
+        } else {
+            let e = res.errors[0]
+            self.err_line = e.line
+            self.err_msg = e.msg
+            self.status = "line ${e.line}: ${e.msg}"
+        }
+        self.changed = true
     }
 
     // the find / go-to-line bar
@@ -808,6 +940,7 @@ struct Editor {
     // ---- painting ----
 
     fn tick(self, t: wm.Tick) -> bool {
+        if self.edits != self.checked && kernel.uptime() - self.last_edit > 800 { self.check() }
         // the cursor blinks; a running program waiting for input wants the console's attention
         if let p = self.p {
             if p.state == "input" && !self.con_focus && kernel.uptime() - self.blink > 0 {
@@ -830,6 +963,7 @@ struct Editor {
         self.paint_bar(s)
         if self.sidebar { self.paint_side(s) }
         self.paint_text(s)
+        self.paint_completions(s)
         self.paint_console(s)
         self.paint_status(s)
     }
@@ -960,6 +1094,24 @@ struct Editor {
             let w = min(mw, self.w - x - 8)
             s.round(x, y - 1, w, self.lh, 4, 0x5c1f2a)
             s.text(x, y + 1, wm.fit(msg, gfx.UI, w), 0xffd5dc, gfx.UI)
+        }
+    }
+
+    fn paint_completions(self, s: gfx.Surface) {
+        if self.comp.is_empty() || self.row < self.top || self.row >= self.top + self.rows() { return }
+        let ex = self.edit_x()
+        let x = ex + self.gutter_w() + 8 - self.left + self.x_of(self.row, self.col - self.prefix().len())
+        let y = BAR_H + 4 + (self.row - self.top + 1) * self.lh
+        var w = 120
+        for c in self.comp { w = max(w, gfx.text_width(c, gfx.MONO) + 24) }
+        let h = self.comp.len() * (self.lh + 2) + 6
+        s.round_shade(x + 3, y + 4, w, h, 6, 0x000000, 90)
+        s.round(x, y, w, h, 6, 0x2c2e3d)
+        for k, c in self.comp {
+            let iy = y + 3 + k * (self.lh + 2)
+            if k == self.comp_sel { s.round(x + 3, iy, w - 6, self.lh + 2, 4, 0x3b4f7a) }
+            let color = if BUILTINS.contains(c) { BUILTIN } else if KEYWORDS.contains(c) { KEYWORD } else if TYPES.contains(c) { TYPE } else { TEXT }
+            s.text(x + 10, iy + 2, c, color, gfx.MONO)
         }
     }
 
