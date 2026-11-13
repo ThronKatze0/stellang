@@ -153,6 +153,35 @@ char *st_quote(const char *s) {
     return r;
 }
 
+// JSON string literal: quotes, backslashes and control characters escaped
+char *st_json_quote(const char *s) {
+    size_t n = strlen(s);
+    char *r = alloc(n * 6 + 3, 1, 1), *p = r;
+    *p++ = '"';
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        switch (c) {
+        case '"': *p++ = '\\'; *p++ = '"'; break;
+        case '\\': *p++ = '\\'; *p++ = '\\'; break;
+        case '\n': *p++ = '\\'; *p++ = 'n'; break;
+        case '\r': *p++ = '\\'; *p++ = 'r'; break;
+        case '\t': *p++ = '\\'; *p++ = 't'; break;
+        default:
+            if (c < 0x20) p += sprintf(p, "\\u%04x", c);
+            else *p++ = (char)c;
+        }
+    }
+    *p++ = '"';
+    *p = 0;
+    return r;
+}
+
+// a JSON number (JSON has no nan or infinity: those become null)
+char *st_json_num(double x) {
+    if (isnan(x) || isinf(x)) return "null";
+    return st_ftoa(x);
+}
+
 // int("42"): NULL on success (value in *out), otherwise the error message
 char *st_parse_int(const char *s, int64_t *out) {
     char *end;

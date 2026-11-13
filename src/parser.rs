@@ -10,11 +10,13 @@ pub enum Type {
     #[default]
     Void,
     Struct(String),          // a reference to a heap object (like a Java/JS object)
+    Enum(String),            // a tagged union; the parser writes every named type as Struct, codegen sorts them out
     List(Box<Type>),         // [T]
     Map(Box<Type>, Box<Type>), // {K: V}
     Set(Box<Type>),          // {T}
     Fn(Vec<Type>, Box<Type>), // fn(A, B) -> R
     Result(Box<Type>),       // T!  = a T or an error message
+    Opt(Box<Type>),          // T?  = a T or `none`
 }
 
 impl fmt::Display for Type {
@@ -27,7 +29,8 @@ impl fmt::Display for Type {
             Type::Bool => write!(f, "bool"),
             Type::Str => write!(f, "str"),
             Type::Void => write!(f, "void"),
-            Type::Struct(n) => write!(f, "{n}"),
+            Type::Struct(n) | Type::Enum(n) => write!(f, "{n}"),
+            Type::Opt(t) => write!(f, "{t}?"),
             Type::List(t) => write!(f, "[{t}]"),
             Type::Result(t) => write!(f, "{t}!"),
             Type::Fn(ps, r) => {
@@ -47,13 +50,34 @@ pub struct Expr {
 }
 
 #[derive(Clone)]
-pub enum Pattern {
-    Any,
+pub struct Pat {
+    pub kind: PatKind,
+    pub pos: Pos,
+}
+
+#[derive(Clone)]
+pub enum PatKind {
+    Any,                                   // _
+    Name(String),                          // a new binding, a unit variant (`Red`) or `none`
     Int(i64),
     Bool(bool),
     Str(String),
-    Ok(String),  // ok(name) / ok(_)
-    Err(String), // err(name) / err(_)
+    Variant(Vec<String>, Option<Vec<Pat>>), // Circle(r) / Shape.Circle(r) / .Red / ok(x) / some(x)
+    Fields(Vec<String>, Vec<(String, Pat)>), // Rect { w, h: 0 } / Point { x, y }
+    Or(Vec<Pat>),                          // 1 | 2 | 3
+}
+
+/// The head of an `if` or `while`: a plain condition, or `let PATTERN = value`.
+#[derive(Clone)]
+pub enum Cond {
+    Expr(Expr),
+    Let(Pat, Expr),
+}
+
+pub struct Arm {
+    pub pat: Pat,
+    pub guard: Option<Expr>,
+    pub body: Body,
 }
 
 #[derive(Clone)]
@@ -89,17 +113,21 @@ pub enum ExprKind {
     Try(Box<Expr>),                       // expr?
     CatchValue(Box<Expr>, Box<Expr>),     // expr catch fallback
     CatchBlock(Box<Expr>, String, Vec<Stmt>), // expr catch e { ... }
-    Match(Box<Expr>, Vec<(Pattern, Pos, Body)>),
+    Match(Box<Expr>, std::rc::Rc<Vec<Arm>>),
+    If(Box<Cond>, Vec<Stmt>, Vec<Stmt>), // `if` used as a value
+    Member(String),                      // `.Circle`: a variant of the enum the context expects
 }
 
 #[derive(Clone)]
 pub enum Stmt {
     Let { name: String, mutable: bool, ty: Option<Type>, value: Expr, pos: Pos },
+    // `let Circle(r) = shape else { return }` / `let user = find(id) else { ... }`
+    LetElse { pat: Pat, mutable: bool, value: Expr, els: Option<Vec<Stmt>>, pos: Pos },
     Assign(Expr, Expr),
     Expr(Expr),
     Return(Option<Expr>, Pos),
-    If(Expr, Vec<Stmt>, Vec<Stmt>),
-    While(Expr, Vec<Stmt>),
+    If(Cond, Vec<Stmt>, Vec<Stmt>),
+    While(Cond, Vec<Stmt>),
     // for x in xs / for i, x in xs / for k, v in map / for i in a..b
     For { var: String, var2: Option<String>, iter: Expr, end: Option<Expr>, body: Vec<Stmt> },
     Break(Pos),
@@ -114,9 +142,36 @@ pub struct Func {
     pub pos: Pos,
 }
 
+#[derive(Clone)]
+pub struct Field {
+    pub name: String,
+    pub ty: Type,
+    pub default: Option<Expr>,
+}
+
 pub struct StructDef {
     pub name: String,
-    pub fields: Vec<(String, Type)>,
+    pub fields: Vec<Field>,
+    pub pos: Pos,
+}
+
+pub struct Variant {
+    pub name: String,
+    pub fields: Vec<Field>, // tuple variants get the names "0", "1", ... unless named
+    pub braces: bool,       // `Rect { w: int }` rather than `Circle(int)`
+    pub pos: Pos,
+}
+
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<Variant>,
+    pub pos: Pos,
+}
+
+pub struct Const {
+    pub name: String,
+    pub ty: Option<Type>,
+    pub value: Expr,
     pub pos: Pos,
 }
 
@@ -137,6 +192,8 @@ pub struct Extern {
 pub struct Module {
     pub imports: Vec<(String, Pos)>,
     pub structs: Vec<StructDef>,
+    pub enums: Vec<EnumDef>,
+    pub consts: Vec<Const>,
     pub impls: Vec<Impl>,
     pub funcs: Vec<Func>,
     pub externs: Vec<Extern>,
@@ -158,7 +215,28 @@ pub fn parse(toks: Vec<Token>) -> P<Module> {
                 m.imports.push((p.ident()?, pos));
             }
             Tok::Fn => m.funcs.push(p.func(false)?),
-            Tok::Struct => m.structs.push(p.structdef()?),
+            Tok::Struct => {
+                let (s, methods) = p.structdef()?;
+                if !methods.is_empty() {
+                    m.impls.push(Impl { name: s.name.clone(), methods, pos: s.pos });
+                }
+                m.structs.push(s);
+            }
+            Tok::Enum => {
+                let (e, methods) = p.enumdef()?;
+                if !methods.is_empty() {
+                    m.impls.push(Impl { name: e.name.clone(), methods, pos: e.pos });
+                }
+                m.enums.push(e);
+            }
+            Tok::Const => {
+                let pos = p.pos();
+                p.next();
+                let name = p.ident()?;
+                let ty = if p.eat(&Tok::Colon) { Some(p.ty()?) } else { None };
+                p.expect(Tok::Assign)?;
+                m.consts.push(Const { name, ty, value: p.expr()?, pos });
+            }
             Tok::Impl => {
                 let pos = p.pos();
                 p.next();
@@ -189,7 +267,7 @@ pub fn parse(toks: Vec<Token>) -> P<Module> {
                 m.braces = p.braces;
                 return Ok(m);
             }
-            t => return p.fail(format!("expected `fn`, `struct`, `impl` or `import`, found {t}")),
+            t => return p.fail(format!("expected `fn`, `struct`, `enum`, `impl`, `const` or `import`, found {t}")),
         }
     }
 }
@@ -340,7 +418,16 @@ impl Parser {
                 _ => Type::Struct(name),
             }
         };
-        Ok(if self.eat(&Tok::Bang) { Type::Result(Box::new(t)) } else { t })
+        let mut t = t;
+        loop {
+            if self.eat(&Tok::Bang) {
+                t = Type::Result(Box::new(t));
+            } else if self.eat(&Tok::Question) {
+                t = Type::Opt(Box::new(t));
+            } else {
+                return Ok(t);
+            }
+        }
     }
 
     /// `name: Type`, or a bare `self` when `allow_self`.
@@ -368,16 +455,72 @@ impl Parser {
         Ok(Func { name, params, ret, body: self.block()?, pos })
     }
 
-    fn structdef(&mut self) -> P<StructDef> {
+    /// `name: Type` or `name: Type = default`.
+    fn field(&mut self) -> P<Field> {
+        let name = self.ident()?;
+        self.expect(Tok::Colon)?;
+        let ty = self.ty()?;
+        let default = if self.eat(&Tok::Assign) { Some(self.expr()?) } else { None };
+        Ok(Field { name, ty, default })
+    }
+
+    /// The `{ ... }` of a struct or enum: items separated by commas or line breaks, plus `fn` methods.
+    fn body<T>(&mut self, mut item: impl FnMut(&mut Self) -> P<T>) -> P<(Vec<T>, Vec<Func>)> {
+        self.open()?;
+        let saved = std::mem::replace(&mut self.no_struct, false);
+        let (mut items, mut methods) = (vec![], vec![]);
+        loop {
+            self.nl();
+            if self.closes() { break }
+            if *self.peek() == Tok::Fn {
+                methods.push(self.func(true)?);
+                continue;
+            }
+            items.push(item(self)?);
+            let broke = self.nl();
+            if !self.eat(&Tok::Comma) && !broke {
+                if self.closes() { break }
+                return self.fail(format!("expected `,` or `}}`, found {}", self.peek()));
+            }
+        }
+        self.no_struct = saved;
+        Ok((items, methods))
+    }
+
+    fn structdef(&mut self) -> P<(StructDef, Vec<Func>)> {
         let pos = self.pos();
         self.next();
         let name = self.ident()?;
-        self.open()?;
-        let fields = self.list(Tok::RBrace, |p| {
-            let (n, t) = p.param(false)?;
-            Ok((n, t.unwrap()))
+        let (fields, methods) = self.body(|p| p.field())?;
+        Ok((StructDef { name, fields, pos }, methods))
+    }
+
+    fn enumdef(&mut self) -> P<(EnumDef, Vec<Func>)> {
+        let pos = self.pos();
+        self.next();
+        let name = self.ident()?;
+        let (variants, methods) = self.body(|p| {
+            let pos = p.pos();
+            let name = p.ident()?;
+            if p.eat(&Tok::LParen) {
+                let mut k = 0;
+                let fields = p.list(Tok::RParen, |p| {
+                    k += 1;
+                    if matches!(p.peek(), Tok::Ident(_)) && *p.peek_at(1) == Tok::Colon {
+                        return p.field();
+                    }
+                    Ok(Field { name: (k - 1).to_string(), ty: p.ty()?, default: None })
+                })?;
+                Ok(Variant { name, fields, braces: false, pos })
+            } else if p.at_open() {
+                p.open()?;
+                let fields = p.list(Tok::RBrace, |p| p.field())?;
+                Ok(Variant { name, fields, braces: true, pos })
+            } else {
+                Ok(Variant { name, fields: vec![], braces: false, pos })
+            }
         })?;
-        Ok(StructDef { name, fields, pos })
+        Ok((EnumDef { name, variants, pos }, methods))
     }
 
     fn block(&mut self) -> P<Vec<Stmt>> {
@@ -409,10 +552,24 @@ impl Parser {
         Ok(match self.peek().clone() {
             Tok::Let | Tok::Var => {
                 let mutable = self.next() == Tok::Var;
-                let name = self.ident()?;
-                let ty = if self.eat(&Tok::Colon) { Some(self.ty()?) } else { None };
+                let simple = matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Colon | Tok::Assign);
+                if simple {
+                    let name = self.ident()?;
+                    let ty = if self.eat(&Tok::Colon) { Some(self.ty()?) } else { None };
+                    self.expect(Tok::Assign)?;
+                    let value = self.expr()?;
+                    if ty.is_none() && *self.peek() == Tok::Else {
+                        self.next();
+                        let pat = Pat { kind: PatKind::Name(name), pos };
+                        return Ok(Stmt::LetElse { pat, mutable, value, els: Some(self.block()?), pos });
+                    }
+                    return Ok(Stmt::Let { name, mutable, ty, value, pos });
+                }
+                let pat = self.pattern()?;
                 self.expect(Tok::Assign)?;
-                Stmt::Let { name, mutable, ty, value: self.expr()?, pos }
+                let value = self.expr()?;
+                let els = if self.eat(&Tok::Else) { Some(self.block()?) } else { None };
+                Stmt::LetElse { pat, mutable, value, els, pos }
             }
             Tok::Return => {
                 self.next();
@@ -422,7 +579,7 @@ impl Parser {
             Tok::If => self.if_stmt()?,
             Tok::While => {
                 self.next();
-                let c = self.head()?;
+                let c = self.cond()?;
                 Stmt::While(c, self.block()?)
             }
             Tok::For => {
@@ -460,7 +617,7 @@ impl Parser {
 
     fn if_stmt(&mut self) -> P<Stmt> {
         self.next();
-        let c = self.head()?;
+        let c = self.cond()?;
         let then = self.block()?;
         let els = if !self.eat(&Tok::Else) {
             vec![]
@@ -470,6 +627,90 @@ impl Parser {
             self.block()?
         };
         Ok(Stmt::If(c, then, els))
+    }
+
+    /// `if` in a value position: `let x = if a { 1 } else { 2 }` (a block's value is its last line).
+    fn if_expr(&mut self) -> P<Expr> {
+        let pos = self.pos();
+        self.next();
+        let c = self.cond()?;
+        let then = self.block()?;
+        let els = if !self.eat(&Tok::Else) {
+            vec![]
+        } else if *self.peek() == Tok::If {
+            vec![Stmt::Expr(self.if_expr()?)]
+        } else {
+            self.block()?
+        };
+        Ok(Expr { kind: ExprKind::If(Box::new(c), then, els), pos })
+    }
+
+    /// The head of `if` / `while`: an expression, or `let PATTERN = value`.
+    fn cond(&mut self) -> P<Cond> {
+        if self.eat(&Tok::Let) {
+            let pat = self.pattern()?;
+            self.expect(Tok::Assign)?;
+            return Ok(Cond::Let(pat, self.head()?));
+        }
+        Ok(Cond::Expr(self.head()?))
+    }
+
+    /// `A | B | C`
+    fn pattern(&mut self) -> P<Pat> {
+        let first = self.pat1()?;
+        if *self.peek() != Tok::Pipe {
+            return Ok(first);
+        }
+        let pos = first.pos;
+        let mut alts = vec![first];
+        while self.eat(&Tok::Pipe) {
+            alts.push(self.pat1()?);
+        }
+        Ok(Pat { kind: PatKind::Or(alts), pos })
+    }
+
+    fn pat1(&mut self) -> P<Pat> {
+        let pos = self.pos();
+        let kind = match self.next() {
+            Tok::Int(n) => PatKind::Int(n),
+            Tok::Minus => match self.next() {
+                Tok::Int(n) => PatKind::Int(-n),
+                t => return Err((pos, format!("expected a number after `-`, found {t}"))),
+            },
+            Tok::Str(s) => PatKind::Str(s),
+            Tok::Ident(s) if s == "_" => PatKind::Any,
+            Tok::Ident(s) if s == "true" || s == "false" => PatKind::Bool(s == "true"),
+            t @ (Tok::Ident(_) | Tok::Dot) => {
+                let mut path = vec![];
+                let dotted = t == Tok::Dot;
+                if let Tok::Ident(s) = t { path.push(s) } else { path.push(self.ident()?) }
+                while *self.peek() == Tok::Dot && matches!(self.peek_at(1), Tok::Ident(_)) {
+                    self.next();
+                    path.push(self.ident()?);
+                }
+                if self.eat(&Tok::LParen) {
+                    PatKind::Variant(path, Some(self.list(Tok::RParen, |p| p.pattern())?))
+                } else if self.at_open() {
+                    self.open()?;
+                    let fields = self.list(Tok::RBrace, |p| {
+                        let fpos = p.pos();
+                        let f = p.ident()?;
+                        if p.eat(&Tok::Colon) {
+                            Ok((f, p.pattern()?))
+                        } else {
+                            Ok((f.clone(), Pat { kind: PatKind::Name(f), pos: fpos })) // `Rect { w, h }`
+                        }
+                    })?;
+                    PatKind::Fields(path, fields)
+                } else if path.len() == 1 && !dotted {
+                    PatKind::Name(path.pop().unwrap())
+                } else {
+                    PatKind::Variant(path, None)
+                }
+            }
+            t => return Err((pos, format!("expected a pattern (a number, string, true/false, a name, a variant like Circle(r), ok(x), none or _), found {t}"))),
+        };
+        Ok(Pat { kind, pos })
     }
 
     fn expr(&mut self) -> P<Expr> {
@@ -494,14 +735,16 @@ impl Parser {
                 Tok::AndAnd => 2,
                 Tok::Eq | Tok::Ne => 3,
                 Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge | Tok::In => 4,
-                Tok::Plus | Tok::Minus => 5,
-                Tok::Times | Tok::Slash | Tok::Percent => 6,
+                Tok::QuestionQuestion => 5,
+                Tok::Plus | Tok::Minus => 6,
+                Tok::Times | Tok::Slash | Tok::Percent => 7,
                 _ => 0,
             };
             if prec < min { return Ok(lhs) }
             let pos = self.pos();
             let op = self.next();
-            let rhs = self.binary(prec + 1)?;
+            // `a ?? b ?? c` groups to the right
+            let rhs = self.binary(if op == Tok::QuestionQuestion { prec } else { prec + 1 })?;
             lhs = Expr { kind: ExprKind::Binary(op, Box::new(lhs), Box::new(rhs)), pos };
         }
     }
@@ -545,14 +788,16 @@ impl Parser {
                     Expr { kind: ExprKind::Try(Box::new(e)), pos }
                 }
                 Tok::LBrace | Tok::Star if !self.no_struct => {
-                    let name = match &e.kind {
-                        ExprKind::Var(n) => n.clone(),
-                        ExprKind::Field(m, n) if matches!(&m.kind, ExprKind::Var(_)) => {
-                            let ExprKind::Var(m) = &m.kind else { unreachable!() };
-                            format!("{m}.{n}")
+                    // `Point {`, `geo.Point {`, `Shape.Rect {`, `.Rect {`
+                    fn path(e: &Expr) -> Option<String> {
+                        match &e.kind {
+                            ExprKind::Var(n) => Some(n.clone()),
+                            ExprKind::Member(n) => Some(format!(".{n}")),
+                            ExprKind::Field(m, n) => Some(format!("{}.{n}", path(m)?)),
+                            _ => None,
                         }
-                        _ => return Ok(e),
-                    };
+                    }
+                    let Some(name) = path(&e) else { return Ok(e) };
                     self.open()?;
                     let fields = self.list(Tok::RBrace, |p| {
                         let fpos = p.pos();
@@ -612,7 +857,11 @@ impl Parser {
         {
             return self.lambda();
         }
+        if *self.peek() == Tok::If {
+            return self.if_expr();
+        }
         let kind = match self.next() {
+            Tok::Dot => ExprKind::Member(self.ident()?),
             Tok::Int(n) => ExprKind::Int(n),
             Tok::Float(n) => ExprKind::Float(n),
             Tok::Str(s) => ExprKind::Str(s),
@@ -651,34 +900,18 @@ impl Parser {
                 let subject = self.head()?;
                 self.open()?;
                 let arms = self.list(Tok::RBrace, |p| p.arm())?;
-                ExprKind::Match(Box::new(subject), arms)
+                ExprKind::Match(Box::new(subject), std::rc::Rc::new(arms))
             }
             t => return Err((pos, format!("expected a value, found {t}"))),
         };
         Ok(Expr { kind, pos })
     }
 
-    fn arm(&mut self) -> P<(Pattern, Pos, Body)> {
-        let pos = self.pos();
-        let pat = match self.next() {
-            Tok::Int(n) => Pattern::Int(n),
-            Tok::Minus => match self.next() {
-                Tok::Int(n) => Pattern::Int(-n),
-                t => return Err((pos, format!("expected a number after `-`, found {t}"))),
-            },
-            Tok::Str(s) => Pattern::Str(s),
-            Tok::Ident(s) if s == "_" => Pattern::Any,
-            Tok::Ident(s) if s == "true" || s == "false" => Pattern::Bool(s == "true"),
-            Tok::Ident(s) if s == "ok" || s == "err" => {
-                self.expect(Tok::LParen)?;
-                let name = self.ident()?;
-                self.expect(Tok::RParen)?;
-                if s == "ok" { Pattern::Ok(name) } else { Pattern::Err(name) }
-            }
-            t => return Err((pos, format!("expected a pattern (number, string, true/false, ok(x), err(e) or _), found {t}"))),
-        };
+    fn arm(&mut self) -> P<Arm> {
+        let pat = self.pattern()?;
+        let guard = if self.eat(&Tok::If) { Some(self.expr()?) } else { None };
         self.expect(Tok::FatArrow)?;
         let body = if self.at_open() { Body::Block(self.block()?) } else { Body::Expr(Box::new(self.expr()?)) };
-        Ok((pat, pos, body))
+        Ok(Arm { pat, guard, body })
     }
 }

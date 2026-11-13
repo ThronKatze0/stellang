@@ -5,10 +5,13 @@
 //! Locals captured by a lambda live in a heap box so the lambda and the function share them.
 
 use crate::lexer::{Pos, Tok};
-use crate::parser::{Body, Expr, ExprKind, Func, Lambda, Module, Pattern, Stmt, Type};
+use crate::parser::{Arm, Body, Cond, Expr, ExprKind, Func, Lambda, Module, Pat, PatKind, Stmt, Type};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::mem;
+
+mod helpers;
+mod patterns;
 
 type R<T> = Result<T, (Pos, String)>;
 
@@ -20,7 +23,7 @@ pub struct Unit {
 
 const RESERVED: &[&str] = &[
     "print", "println", "str", "int", "float", "env", "panic", "ok", "err", "bool", "void", "true", "false", "min", "max",
-    "abs",
+    "abs", "some", "none", "to_json", "self",
 ];
 
 const RUNTIME: &str = r#"%st.vec = type { i64, i64, ptr }
@@ -53,6 +56,8 @@ declare ptr @st_join(ptr, ptr)
 declare ptr @st_ftoa(double)
 declare ptr @st_parse_float(ptr, ptr)
 declare ptr @st_quote(ptr)
+declare ptr @st_json_quote(ptr)
+declare ptr @st_json_num(double)
 declare ptr @st_char_at(ptr, i64, ptr)
 declare ptr @st_repeat(ptr, i64)
 declare ptr @st_chars(ptr)
@@ -121,8 +126,9 @@ fn ll(t: &Type) -> String {
         Type::Float => "double".into(),
         Type::Bool => "i1".into(),
         Type::Void => "void".into(),
-        Type::Str | Type::List(_) | Type::Map(..) | Type::Set(_) | Type::Struct(_) | Type::Fn(..) => "ptr".into(),
+        Type::Str | Type::List(_) | Type::Map(..) | Type::Set(_) | Type::Struct(_) | Type::Enum(_) | Type::Fn(..) => "ptr".into(),
         Type::Result(t) => format!("{{ i1, {}, ptr }}", if **t == Type::Void { "i1".into() } else { ll(t) }),
+        Type::Opt(t) => format!("{{ i1, {} }}", ll(t)),
     }
 }
 
@@ -151,6 +157,19 @@ fn peel(want: Option<&Type>) -> Option<&Type> {
     }
 }
 
+/// Like `peel`, and a `T?` context also welcomes a `T` (for `.Variant` and literals).
+fn peel_all(want: Option<&Type>) -> Option<&Type> {
+    match want {
+        Some(Type::Result(t) | Type::Opt(t)) => peel_all(Some(t)),
+        w => w,
+    }
+}
+
+/// A map value or set item has to fit an 8-byte slot.
+fn fits_slot(t: &Type) -> bool {
+    !matches!(t, Type::Void | Type::Result(_) | Type::Opt(_))
+}
+
 // ---- which names do lambdas use? (those locals get boxed) ----
 
 fn names_stmts(ss: &[Stmt], inl: bool, out: &mut HashSet<String>) {
@@ -162,13 +181,17 @@ fn names_stmts(ss: &[Stmt], inl: bool, out: &mut HashSet<String>) {
                 names_expr(b, inl, out);
             }
             Stmt::Expr(e) | Stmt::Return(Some(e), _) => names_expr(e, inl, out),
+            Stmt::LetElse { value, els, .. } => {
+                names_expr(value, inl, out);
+                if let Some(ss) = els { names_stmts(ss, inl, out) }
+            }
             Stmt::If(c, a, b) => {
-                names_expr(c, inl, out);
+                names_cond(c, inl, out);
                 names_stmts(a, inl, out);
                 names_stmts(b, inl, out);
             }
             Stmt::While(c, b) => {
-                names_expr(c, inl, out);
+                names_cond(c, inl, out);
                 names_stmts(b, inl, out);
             }
             Stmt::For { iter, end, body, .. } => {
@@ -178,6 +201,12 @@ fn names_stmts(ss: &[Stmt], inl: bool, out: &mut HashSet<String>) {
             }
             Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {}
         }
+    }
+}
+
+fn names_cond(c: &Cond, inl: bool, out: &mut HashSet<String>) {
+    match c {
+        Cond::Expr(e) | Cond::Let(_, e) => names_expr(e, inl, out),
     }
 }
 
@@ -193,7 +222,12 @@ fn names_expr(e: &Expr, inl: bool, out: &mut HashSet<String>) {
         ExprKind::Var(n) => {
             if inl { out.insert(n.clone()); }
         }
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) => {}
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Member(_) => {}
+        ExprKind::If(c, a, b) => {
+            names_cond(c, inl, out);
+            names_stmts(a, inl, out);
+            names_stmts(b, inl, out);
+        }
         ExprKind::Unary(_, x) | ExprKind::Field(x, _) | ExprKind::Try(x) => names_expr(x, inl, out),
         ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::CatchValue(a, b) => {
             names_expr(a, inl, out);
@@ -216,7 +250,10 @@ fn names_expr(e: &Expr, inl: bool, out: &mut HashSet<String>) {
         }
         ExprKind::Match(s, arms) => {
             names_expr(s, inl, out);
-            arms.iter().for_each(|(_, _, b)| names_body(b, inl, out));
+            for a in arms.iter() {
+                if let Some(g) = &a.guard { names_expr(g, inl, out) }
+                names_body(&a.body, inl, out);
+            }
         }
     }
 }
@@ -256,6 +293,21 @@ struct Join {
     slot: Option<(String, Type)>,
     mixed: bool, // some live branch has no value or a different type
     live: bool,
+    result_at: Option<Pos>, // a branch whose value is a result (must not be dropped silently)
+}
+
+#[derive(Clone)]
+struct VariantInfo {
+    name: String,
+    fields: Vec<(String, Type)>,
+    braces: bool,
+    named: bool, // the fields have real names (not "0", "1", ...)
+}
+
+/// What a `Name { ... }` literal builds.
+enum Lit {
+    Struct(String),
+    Variant(String, usize),
 }
 
 #[derive(Default)]
@@ -275,6 +327,11 @@ struct Gen {
     files: HashMap<String, String>,
     imports: HashMap<String, HashSet<String>>,
     structs: HashMap<String, Vec<(String, Type)>>,
+    enums: HashMap<String, Vec<VariantInfo>>,
+    defaults: HashMap<String, (String, Vec<(String, Expr)>)>, // struct or `Enum::Variant` -> (module, field defaults)
+    consts: HashMap<String, Type>,
+    const_order: Vec<String>,
+    statics: HashSet<String>, // `Type::name` functions without `self`
     funcs: HashMap<String, Sig>,
     module: String,
     decls: String,
@@ -308,37 +365,69 @@ impl Gen {
 
     fn resolve(&self, t: &Type, pos: Pos) -> R<Type> {
         Ok(match t {
-            Type::Struct(n) => {
+            Type::Struct(n) | Type::Enum(n) => {
                 let k = match n.split_once('.') {
                     Some((m, s)) if self.imports[&self.module].contains(m) => format!("{m}.{s}"),
                     Some((m, _)) => return err(pos, format!("unknown module `{m}` (add `import {m}`)")),
                     None => self.key(n),
                 };
-                if !self.structs.contains_key(&k) {
+                if self.structs.contains_key(&k) {
+                    Type::Struct(k)
+                } else if self.enums.contains_key(&k) {
+                    Type::Enum(k)
+                } else {
                     return err(pos, format!("unknown type `{n}`"));
                 }
-                Type::Struct(k)
             }
             Type::List(e) => Type::List(Box::new(self.resolve(e, pos)?)),
+            Type::Set(e) => Type::Set(Box::new(self.resolve(e, pos)?)),
+            Type::Map(k, v) => {
+                let v = self.resolve(v, pos)?;
+                if !fits_slot(&v) {
+                    return err(pos, format!("a map can't hold {v} (put it in a struct)"));
+                }
+                Type::Map(Box::new(self.resolve(k, pos)?), Box::new(v))
+            }
+            Type::Opt(e) => {
+                let e = self.resolve(e, pos)?;
+                if matches!(e, Type::Void | Type::Opt(_) | Type::Result(_)) {
+                    return err(pos, format!("{e}? isn't a type"));
+                }
+                Type::Opt(Box::new(e))
+            }
             Type::Result(e) => Type::Result(Box::new(self.resolve(e, pos)?)),
             Type::Fn(ps, r) => Type::Fn(ps.iter().map(|p| self.resolve(p, pos)).collect::<R<_>>()?, Box::new(self.resolve(r, pos)?)),
             t => t.clone(),
         })
     }
 
-    fn sig(&self, f: &Func, self_struct: Option<&str>, sym: String) -> R<Sig> {
+    fn sig(&self, f: &Func, self_ty: Option<&Type>, sym: String) -> R<Sig> {
         let mut params = vec![];
         for (i, (n, t)) in f.params.iter().enumerate() {
-            params.push(match (t, self_struct) {
-                (None, Some(s)) if i == 0 => Type::Struct(s.into()),
+            params.push(match (t, self_ty) {
+                (None, Some(s)) if i == 0 => s.clone(),
                 (None, _) => return err(f.pos, format!("parameter `{n}` needs a type, like `{n}: int`")),
                 (Some(t), _) => self.resolve(t, f.pos)?,
             });
         }
-        if self_struct.is_some() && f.params.first().is_none_or(|p| p.0 != "self") {
-            return err(f.pos, format!("method `{}` must take `self` as its first parameter", f.name));
-        }
         Ok(Sig { params, ret: self.resolve(&f.ret, f.pos)?, sym, is_extern: false })
+    }
+
+    fn type_of_key(&self, k: &str) -> Type {
+        if self.enums.contains_key(k) { Type::Enum(k.into()) } else { Type::Struct(k.into()) }
+    }
+
+    /// `Shape` or `geo.Shape` written as an expression: the type's key.
+    fn type_path(&self, e: &Expr) -> Option<String> {
+        let k = match &e.kind {
+            ExprKind::Var(n) if self.find(n).is_none() => self.key(n),
+            ExprKind::Field(m, n) => match &m.kind {
+                ExprKind::Var(m) if self.is_module(m) => format!("{m}.{n}"),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        (self.structs.contains_key(&k) || self.enums.contains_key(&k)).then_some(k)
     }
 
     fn add_fn(&mut self, key: String, sig: Sig, pos: Pos, name: &str) -> R<()> {
@@ -352,25 +441,41 @@ impl Gen {
     fn run(&mut self, units: &[Unit]) -> R<String> {
         for u in units {
             self.module = u.name.clone();
-            for s in &u.module.structs {
-                let k = self.key(&s.name);
-                if RESERVED.contains(&s.name.as_str()) || self.structs.insert(k, vec![]).is_some() {
-                    return err(s.pos, format!("`{}` is already defined", s.name));
+            let names = u.module.structs.iter().map(|s| (&s.name, s.pos)).chain(u.module.enums.iter().map(|e| (&e.name, e.pos)));
+            for (name, pos) in names {
+                let k = self.key(name);
+                if RESERVED.contains(&name.as_str()) || self.structs.contains_key(&k) || self.enums.contains_key(&k) {
+                    return err(pos, format!("`{name}` is already defined"));
+                }
+                if u.module.structs.iter().any(|s| s.name == *name) {
+                    self.structs.insert(k, vec![]);
+                } else {
+                    self.enums.insert(k, vec![]);
                 }
             }
         }
         for u in units {
             self.module = u.name.clone();
             for s in &u.module.structs {
-                let mut fields: Vec<(String, Type)> = vec![];
-                for (n, t) in &s.fields {
-                    if fields.iter().any(|(o, _)| o == n) {
-                        return err(s.pos, format!("duplicate field `{n}`"));
-                    }
-                    fields.push((n.clone(), self.resolve(t, s.pos)?));
-                }
                 let k = self.key(&s.name);
+                let fields = self.fields(&k, &s.fields, s.pos)?;
                 self.structs.insert(k, fields);
+            }
+            for e in &u.module.enums {
+                let k = self.key(&e.name);
+                let mut vs: Vec<VariantInfo> = vec![];
+                for v in &e.variants {
+                    if vs.iter().any(|o| o.name == v.name) {
+                        return err(v.pos, format!("duplicate variant `{}`", v.name));
+                    }
+                    if ["ok", "err", "some", "none"].contains(&v.name.as_str()) {
+                        return err(v.pos, format!("`{}` is a builtin pattern; pick another variant name", v.name));
+                    }
+                    let fields = self.fields(&format!("{k}::{}", v.name), &v.fields, v.pos)?;
+                    let named = v.braces || v.fields.iter().any(|f| f.name.parse::<usize>().is_err());
+                    vs.push(VariantInfo { name: v.name.clone(), fields, braces: v.braces, named });
+                }
+                self.enums.insert(k, vs);
             }
             for f in &u.module.funcs {
                 let k = self.key(&f.name);
@@ -389,14 +494,41 @@ impl Gen {
             }
             for im in &u.module.impls {
                 let sk = self.key(&im.name);
-                if !self.structs.contains_key(&sk) {
-                    return err(im.pos, format!("`impl` for unknown struct `{}`", im.name));
+                if !self.structs.contains_key(&sk) && !self.enums.contains_key(&sk) {
+                    return err(im.pos, format!("`impl` for unknown type `{}`", im.name));
                 }
+                let self_ty = self.type_of_key(&sk);
                 for m in &im.methods {
                     let k = format!("{sk}::{}", m.name);
-                    let sig = self.sig(m, Some(&sk), format!("@\"st.{k}\""))?;
+                    let is_static = m.params.first().is_none_or(|p| p.0 != "self" || p.1.is_some());
+                    if !is_static && self.enums.get(&sk).is_some_and(|vs| vs.iter().any(|v| v.name == m.name)) {
+                        return err(m.pos, format!("`{}` is already a variant of `{}`", m.name, im.name));
+                    }
+                    let sig = self.sig(m, (!is_static).then_some(&self_ty), format!("@\"st.{k}\""))?;
+                    if is_static {
+                        self.statics.insert(k.clone());
+                    }
                     self.add_fn(k, sig, m.pos, &m.name)?;
                 }
+            }
+        }
+        // constants: dependencies (later units) first, each in order of declaration
+        for u in units.iter().rev() {
+            self.module = u.name.clone();
+            for c in &u.module.consts {
+                let k = self.key(&c.name);
+                if RESERVED.contains(&c.name.as_str()) || self.consts.contains_key(&k) || self.funcs.contains_key(&k) {
+                    return err(c.pos, format!("`{}` is already defined", c.name));
+                }
+                let want = c.ty.as_ref().map(|t| self.resolve(t, c.pos)).transpose()?;
+                let body = Body::Expr(Box::new(c.value.clone()));
+                let t = self.function(&format!("@\"const.{k}\""), &[], want, &body, None, &[], c.pos, &format!("`{}`", c.name))?;
+                if t == Type::Void {
+                    return err(c.pos, "a constant needs a value");
+                }
+                writeln!(self.globals, "@\"g.{k}\" = internal global {} zeroinitializer", ll(&t)).unwrap();
+                self.consts.insert(k.clone(), t);
+                self.const_order.push(k);
             }
         }
         for u in units {
@@ -438,6 +570,18 @@ impl Gen {
             let fs: Vec<String> = self.structs[k].iter().map(|(_, t)| ll(t)).collect();
             writeln!(out, "%\"S.{k}\" = type {{ {} }}", fs.join(", ")).unwrap();
         }
+        let mut keys: Vec<&String> = self.enums.keys().collect();
+        keys.sort();
+        for k in keys {
+            for (i, v) in self.enums[k].iter().enumerate() {
+                let mut fs = vec!["i64".to_string()];
+                fs.extend(v.fields.iter().map(|(_, t)| ll(t)));
+                writeln!(out, "%\"V.{k}.{}\" = type {{ {} }}", v.name, fs.join(", ")).unwrap();
+                if v.fields.is_empty() {
+                    writeln!(out, "@\"U.{k}.{}\" = private unnamed_addr constant %\"V.{k}.{}\" {{ i64 {i} }}", v.name, v.name).unwrap();
+                }
+            }
+        }
         out += &self.code;
         for k in mem::take(&mut self.wrappers) {
             let s = &self.funcs[&k];
@@ -448,7 +592,12 @@ impl Gen {
             writeln!(out, "@\"clo.{k}\" = private constant ptr @\"st.{k}$val\"").unwrap();
             writeln!(out, "define internal {} @\"st.{k}$val\"({params}) {{\n{body}\n}}\n", ll(&s.ret)).unwrap();
         }
-        writeln!(out, "define i32 @main() {{\n  call void @st_init()\n{entry}\n}}").unwrap();
+        let mut init = String::new();
+        for (i, k) in self.const_order.iter().enumerate() {
+            let t = ll(&self.consts[k]);
+            write!(init, "  %c{i} = call {t} @\"const.{k}\"(ptr null)\n  store {t} %c{i}, ptr @\"g.{k}\"\n").unwrap();
+        }
+        writeln!(out, "define i32 @main() {{\n  call void @st_init()\n{init}{entry}\n}}").unwrap();
         out += &self.globals;
         // stack-clash protection: big frames touch every page, so they hit the guard page instead of jumping it
         out += "attributes #0 = { \"probe-stack\"=\"inline-asm\" }\n";
@@ -620,7 +769,13 @@ impl Gen {
     }
 
     fn field_ptr(&mut self, b: &Val, f: &str, pos: Pos) -> R<(String, Type)> {
-        let Type::Struct(s) = &b.ty else { return err(pos, format!("{} has no field `{f}`", b.ty)) };
+        let Type::Struct(s) = &b.ty else {
+            return match &b.ty {
+                Type::Opt(_) => err(pos, format!("this is optional ({}); unwrap it first: `if let x = ...`, `?? fallback` or `let x = ... else {{ ... }}`", b.ty)),
+                Type::Enum(_) => err(pos, format!("{} is an enum; look inside with `match` or `if let`", b.ty)),
+                _ => err(pos, format!("{} has no field `{f}`", b.ty)),
+            };
+        };
         let Some(i) = self.structs[s].iter().position(|(n, _)| n == f) else {
             return err(pos, format!("`{s}` has no field or method `{f}`"));
         };
@@ -644,8 +799,30 @@ impl Gen {
         Ok((p, et, i.v))
     }
 
-    /// `v` as a `want`; an int is welcome where a float is wanted.
+    /// Field types of a struct or variant; remembers their default values.
+    fn fields(&mut self, key: &str, fs: &[crate::parser::Field], pos: Pos) -> R<Vec<(String, Type)>> {
+        let (mut out, mut defs): (Vec<(String, Type)>, Vec<(String, Expr)>) = (vec![], vec![]);
+        for f in fs {
+            if out.iter().any(|(o, _)| *o == f.name) {
+                return err(pos, format!("duplicate field `{}`", f.name));
+            }
+            out.push((f.name.clone(), self.resolve(&f.ty, pos)?));
+            if let Some(d) = &f.default {
+                defs.push((f.name.clone(), d.clone()));
+            }
+        }
+        self.defaults.insert(key.into(), (self.module.clone(), defs));
+        Ok(out)
+    }
+
+    /// `v` as a `want`; an int is welcome where a float is wanted, a `T` where a `T?` is.
     fn coerce(&mut self, v: Val, want: &Type, pos: Pos) -> R<Val> {
+        if let Type::Opt(t) = want {
+            if v.ty != *want && v.ty != Type::Void {
+                let v = self.coerce(v, t, pos)?;
+                return Ok(self.some_of(&v));
+            }
+        }
         if *want == Type::Float && v.ty == Type::Int {
             let t = self.tmp();
             self.ins(format!("{t} = sitofp i64 {} to double", v.v));
@@ -778,8 +955,19 @@ impl Gen {
         self.ins(format!("store i64 {n1}, ptr {h}"));
     }
 
-    /// `a == b` for int, float, bool and str.
+    /// `a == b`: by value for everything but maps, sets and functions (structs, enums and lists compare their contents).
     fn eq(&mut self, a: Val, b: Val, pos: Pos) -> R<String> {
+        let (a, b) = match (&a.ty, &b.ty) {
+            (Type::Opt(_), t) if *t != a.ty => {
+                let w = a.ty.clone();
+                (a, self.coerce(b, &w, pos)?)
+            }
+            (t, Type::Opt(_)) if *t != b.ty => {
+                let w = b.ty.clone();
+                (self.coerce(a, &w, pos)?, b)
+            }
+            _ => (a, b),
+        };
         let (a, b) = self.promote(a, b, pos)?;
         expect_ty(&a.ty, &b.ty, pos)?;
         let t = self.tmp();
@@ -787,7 +975,12 @@ impl Gen {
             Type::Int | Type::Bool => self.ins(format!("{t} = icmp eq {} {}, {}", ll(&a.ty), a.v, b.v)),
             Type::Float => self.ins(format!("{t} = fcmp oeq double {}, {}", a.v, b.v)),
             Type::Str => return Ok(self.rt(Type::Bool, "st_streq", &[format!("ptr {}", a.v), format!("ptr {}", b.v)]).v),
-            t => return err(pos, format!("`==` compares int, float, bool or str, not {t}")),
+            Type::Struct(_) | Type::Enum(_) | Type::List(_) | Type::Opt(_) => {
+                let f = self.eq_fn(&a.ty, pos)?;
+                let l = ll(&a.ty);
+                return Ok(self.emit_call(&Type::Bool, &f, &[format!("{l} {}", a.v), format!("{l} {}", b.v)]).v);
+            }
+            t => return err(pos, format!("`==` can't compare {t}")),
         }
         Ok(t)
     }
@@ -842,7 +1035,7 @@ impl Gen {
 
     /// `str(v)`. Strs nested in lists and maps are shown quoted: `["a", "b"]`.
     fn show(&mut self, v: &Val, nested: bool, pos: Pos) -> R<Val> {
-        let p = format!("ptr {}", v.v);
+        let p = format!("{} {}", ll(&v.ty), v.v);
         Ok(match &v.ty {
             Type::Str if !nested => v.clone(),
             Type::Str => self.rt(Type::Str, "st_quote", &[p]),
@@ -850,6 +1043,7 @@ impl Gen {
             Type::Float => self.rt(Type::Str, "st_ftoa", &[format!("double {}", v.v)]),
             Type::Bool => val(self.bool_str(&v.v), Type::Str),
             Type::Fn(..) => val(self.str_const("<fn>"), Type::Str),
+            Type::Opt(_) => self.show_opt(v, nested, pos, "none", false)?,
             Type::Void | Type::Result(_) => return err(pos, format!("can't turn {} into a str", v.ty)),
             t => {
                 let sym = self.show_fn(t, pos)?;
@@ -871,12 +1065,15 @@ impl Gen {
         let r = self.show_body(t, pos);
         let f = mem::replace(&mut self.f, saved);
         r?;
-        write!(self.code, "define internal ptr {sym}(ptr %x) {{\nentry:\n{}\n{}\n}}\n\n", f.allocas.join("\n"), f.body.join("\n")).unwrap();
+        write!(self.code, "define internal ptr {sym}({} %x) {{\nentry:\n{}\n{}\n}}\n\n", ll(t), f.allocas.join("\n"), f.body.join("\n")).unwrap();
         Ok(sym)
     }
 
     fn show_body(&mut self, t: &Type, pos: Pos) -> R<()> {
         let x = val("%x", t.clone());
+        if let Type::Enum(k) = t {
+            return self.show_enum(k, pos);
+        }
         let parts = self.new_list(&Type::Str);
         let add = |g: &mut Self, s: Val| {
             g.rt(Type::Void, "st_vec_push_str", &[format!("ptr {}", parts.v), format!("ptr {}", s.v)]);
@@ -1100,7 +1297,12 @@ impl Gen {
                 // the value is computed before the target's address (it may grow a list)
                 let (addr, t, v) = match &target.kind {
                     ExprKind::Var(n) => {
-                        let Some(var) = self.find(n) else { return err(target.pos, format!("unknown name `{n}`")) };
+                        let Some(var) = self.find(n) else {
+                            if self.consts.contains_key(&self.key(n)) {
+                                return err(target.pos, format!("`{n}` is a constant; it can't be changed"));
+                            }
+                            return err(target.pos, format!("unknown name `{n}`"));
+                        };
                         if !var.mutable {
                             return err(target.pos, format!("`{n}` is a `let`; declare it with `var` to change it"));
                         }
@@ -1154,37 +1356,49 @@ impl Gen {
                 self.ret_value(v, *pos)?;
             }
             Stmt::If(c, then, els) => {
-                let c = self.cond(c)?;
-                let (lt, le, lend) = (self.lbl("then"), self.lbl("else"), self.lbl("endif"));
-                self.term(format!("br i1 {c}, label %{lt}, label %{le}"));
-                let mut reach = false;
-                for (l, b) in [(&lt, then), (&le, els)] {
-                    self.label(l);
-                    self.block(b)?;
-                    if self.f.open {
-                        reach = true;
-                        self.term(format!("br label %{lend}"));
-                    }
-                }
-                self.label(&lend);
-                if !reach {
-                    self.term("unreachable".into());
-                }
+                self.gen_if(c, then, els, None, false)?;
             }
             Stmt::While(c, body) => {
-                let (lc, lb, le) = (self.lbl("while"), self.lbl("do"), self.lbl("done"));
+                let (lc, le) = (self.lbl("while"), self.lbl("done"));
                 self.label(&lc);
-                let forever = matches!(c.kind, ExprKind::Bool(true));
-                let c = self.cond(c)?;
-                self.term(format!("br i1 {c}, label %{lb}, label %{le}"));
-                self.label(&lb);
-                let broke = self.loop_body(body, &le, &lc)?;
+                let forever = matches!(c, Cond::Expr(Expr { kind: ExprKind::Bool(true), .. }));
+                self.f.scopes.push(HashMap::new());
+                let r = self.test_cond(c, &le).and_then(|_| self.loop_body(body, &le, &lc));
+                self.f.scopes.pop();
+                let broke = r?;
                 if self.f.open {
                     self.term(format!("br label %{lc}"));
                 }
                 self.label(&le);
                 if forever && !broke {
                     self.term("unreachable".into());
+                }
+            }
+            Stmt::LetElse { pat, mutable, value, els, pos } => {
+                let v = self.expr(value, None)?;
+                let pat = if els.is_some() { patterns::unwrap_pat(pat, &v.ty) } else { pat.clone() };
+                let (lfail, lok) = (self.lbl("nomatch"), self.lbl("matched"));
+                let mut binds = vec![];
+                self.pat_test(&pat, &v, &lfail, &mut binds)?;
+                self.term(format!("br label %{lok}"));
+                self.label(&lfail);
+                match els {
+                    Some(ss) => {
+                        self.block(ss)?;
+                        if self.f.open {
+                            return err(*pos, "the `else` block of `let ... else` must leave (return, break or continue)");
+                        }
+                    }
+                    None => {
+                        if !self.irrefutable(&pat, &v.ty) {
+                            return err(*pos, "this pattern might not match; add `else { ... }` for the other case");
+                        }
+                        self.term("unreachable".into());
+                    }
+                }
+                self.label(&lok);
+                for (n, b) in binds {
+                    self.declare(&n, &b, *mutable);
                 }
             }
             Stmt::For { var, var2, iter, end, body } => {
@@ -1281,11 +1495,14 @@ impl Gen {
         r.map(|_| broke)
     }
 
-    fn join(&mut self, j: &mut Join, v: Val, end: &str) {
+    fn join(&mut self, j: &mut Join, v: Val, end: &str, pos: Pos) {
         if !self.f.open {
             return;
         }
         j.live = true;
+        if matches!(v.ty, Type::Result(_)) {
+            j.result_at.get_or_insert(pos);
+        }
         match j.slot.clone() {
             _ if v.ty == Type::Void => j.mixed = true,
             None => {
@@ -1299,23 +1516,91 @@ impl Gen {
         self.term(format!("br label %{end}"));
     }
 
-    fn finish(&mut self, j: Join, end: &str, exhaustive: bool) -> Val {
+    fn finish(&mut self, j: Join, end: &str, exhaustive: bool) -> R<Val> {
         self.label(end);
         if !j.live {
             self.term("unreachable".into());
-            return void();
+            return Ok(void());
         }
-        match j.slot {
+        Ok(match j.slot {
             Some((a, t)) if exhaustive && !j.mixed => self.load(&a, t),
-            _ => void(),
-        }
+            _ => {
+                if let Some(p) = j.result_at {
+                    return err(p, "this can fail and the error is ignored: handle it with `?`, `catch` or `match`");
+                }
+                void()
+            }
+        })
     }
 
     fn arm_body(&mut self, b: &Body, want: Option<&Type>) -> R<Val> {
         match b {
             Body::Expr(e) => self.expr(e, want),
-            Body::Block(ss) => self.block(ss).map(|_| void()),
+            Body::Block(ss) => self.block_value(ss, want),
         }
+    }
+
+    /// Run a block; its value is the value of its last line (if that is an expression).
+    fn block_value(&mut self, ss: &[Stmt], want: Option<&Type>) -> R<Val> {
+        self.f.scopes.push(HashMap::new());
+        let r = self.block_value_inner(ss, want);
+        self.f.scopes.pop();
+        r
+    }
+
+    fn block_value_inner(&mut self, ss: &[Stmt], want: Option<&Type>) -> R<Val> {
+        for (i, s) in ss.iter().enumerate() {
+            if !self.f.open {
+                break;
+            }
+            if let (true, Stmt::Expr(e)) = (i + 1 == ss.len(), s) {
+                return self.expr(e, want);
+            }
+            self.stmt(s)?;
+        }
+        Ok(void())
+    }
+
+    /// Branch to `fail` unless the condition holds; `let` patterns bind into the current scope.
+    fn test_cond(&mut self, c: &Cond, fail: &str) -> R<()> {
+        match c {
+            Cond::Expr(e) => {
+                let c = self.cond(e)?;
+                self.need(&c, fail);
+            }
+            Cond::Let(p, e) => {
+                let v = self.expr(e, None)?;
+                let p = patterns::unwrap_pat(p, &v.ty);
+                let mut binds = vec![];
+                self.pat_test(&p, &v, fail, &mut binds)?;
+                for (n, b) in binds {
+                    self.declare(&n, &b, false);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Continue only if `ok` is true, otherwise jump to `fail`.
+    fn need(&mut self, ok: &str, fail: &str) {
+        let l = self.lbl("pass");
+        self.term(format!("br i1 {ok}, label %{l}, label %{fail}"));
+        self.label(&l);
+    }
+
+    /// `if` as a statement (`value` false) or as an expression.
+    fn gen_if(&mut self, c: &Cond, then: &[Stmt], els: &[Stmt], want: Option<&Type>, value: bool) -> R<Val> {
+        let (le, lend) = (self.lbl("else"), self.lbl("endif"));
+        let mut j = Join::default();
+        self.f.scopes.push(HashMap::new());
+        let r = self.test_cond(c, &le).and_then(|_| if value { self.block_value(then, want) } else { self.block(then).map(|_| void()) });
+        self.f.scopes.pop();
+        let pos = match c { Cond::Expr(e) | Cond::Let(_, e) => e.pos };
+        self.join(&mut j, r?, &lend, pos);
+        self.label(&le);
+        let v = if value { self.block_value(els, want)? } else { self.block(els).map(|_| void())? };
+        self.join(&mut j, v, &lend, pos);
+        self.finish(j, &lend, !els.is_empty())
     }
 
     // ---- expressions ----
@@ -1323,29 +1608,54 @@ impl Gen {
     fn expr(&mut self, e: &Expr, want: Option<&Type>) -> R<Val> {
         let pos = e.pos;
         Ok(match &e.kind {
-            ExprKind::Int(n) if peel(want) == Some(&Type::Float) => val(float_lit(*n as f64), Type::Float),
+            ExprKind::Int(n) if peel_all(want) == Some(&Type::Float) => val(float_lit(*n as f64), Type::Float),
             ExprKind::Int(n) => val(n.to_string(), Type::Int),
             ExprKind::Float(x) => val(float_lit(*x), Type::Float),
             ExprKind::Bool(b) => val(b.to_string(), Type::Bool),
             ExprKind::Str(s) => val(self.str_const(s), Type::Str),
             ExprKind::Var(n) => match self.find(n) {
                 Some(v) => self.load(&v.addr, v.ty),
+                None if n == "none" => match peel(want) {
+                    Some(t @ Type::Opt(_)) => val("zeroinitializer", t.clone()),
+                    _ => return err(pos, "can't tell what kind of `none` this is; write `let x: int? = none`"),
+                },
+                None if self.consts.contains_key(&self.key(n)) => self.const_value(&self.key(n)),
                 None if self.funcs.contains_key(&self.key(n)) => self.fn_value(self.key(n), pos)?,
                 None if self.is_module(n) => return err(pos, format!("`{n}` is a module; use `{n}.something`")),
+                None if self.structs.contains_key(&self.key(n)) || self.enums.contains_key(&self.key(n)) => {
+                    return err(pos, format!("`{n}` is a type; build a value like `{n} {{ ... }}` or `{n}.Variant`"))
+                }
                 None => return err(pos, format!("unknown name `{n}`")),
             },
+            ExprKind::Member(name) => {
+                let Some(Type::Enum(k)) = peel_all(want).cloned() else {
+                    return err(pos, format!("can't tell which enum `.{name}` belongs to; write `Type.{name}`"));
+                };
+                self.variant_value(&k, name, pos)?
+            }
+            ExprKind::If(c, then, els) => self.gen_if(c, then, els, want, true)?,
             ExprKind::Field(b, f) => {
+                if let Some(tk) = self.type_path(b) {
+                    let k = format!("{tk}::{f}");
+                    if self.statics.contains(&k) {
+                        return self.fn_value(k, pos);
+                    }
+                    return self.variant_value(&tk, f, pos);
+                }
                 if let ExprKind::Var(m) = &b.kind {
                     if self.is_module(m) {
                         let k = format!("{m}.{f}");
+                        if self.consts.contains_key(&k) {
+                            return Ok(self.const_value(&k));
+                        }
                         if !self.funcs.contains_key(&k) {
-                            return err(pos, format!("module `{m}` has no function `{f}`"));
+                            return err(pos, format!("module `{m}` has no function or constant `{f}`"));
                         }
                         return self.fn_value(k, pos);
                     }
                 }
                 let b = self.expr(b, None)?;
-                if !matches!(b.ty, Type::Struct(_)) {
+                if !matches!(b.ty, Type::Struct(_) | Type::Opt(_) | Type::Enum(_)) {
                     return err(pos, format!("`{f}` is a method here; call it: `.{f}()`"));
                 }
                 let (p, t) = self.field_ptr(&b, f, pos)?;
@@ -1386,6 +1696,7 @@ impl Gen {
                 self.ins(format!("{t} = {code}"));
                 val(t, want)
             }
+            ExprKind::Binary(Tok::QuestionQuestion, l, r) => self.coalesce(l, r, want, pos)?,
             ExprKind::Binary(op, l, r) => self.binary(op, l, r, pos)?,
             ExprKind::Call(callee, args) => self.call(callee, args, pos, want)?,
             ExprKind::List(xs) => {
@@ -1440,8 +1751,8 @@ impl Gen {
                     return err(pos, "can't tell what this empty map holds; write `let m: {str: int} = {}`");
                 };
                 check_key(&kt, pos)?;
-                if matches!(vt, Type::Void | Type::Result(_)) {
-                    return err(pos, format!("a map can't hold {vt}"));
+                if !fits_slot(&vt) {
+                    return err(pos, format!("a map can't hold {vt} (put it in a struct)"));
                 }
                 let m = self.map_new(&kt);
                 for (k, v) in &vs {
@@ -1468,39 +1779,38 @@ impl Gen {
                 }
                 val(m, Type::Set(Box::new(et)))
             }
-            ExprKind::StructLit(name, fields) => {
-                let t = self.resolve(&Type::Struct(name.clone()), pos)?;
-                let Type::Struct(k) = &t else { unreachable!() };
-                let decl = self.structs[k].clone();
-                for (f, x) in fields {
-                    if !decl.iter().any(|d| d.0 == *f) {
-                        return err(x.pos, format!("`{name}` has no field `{f}`"));
+            ExprKind::StructLit(name, fields) => match self.lit_target(name, want, pos)? {
+                Lit::Struct(k) => {
+                    let decl = self.structs[&k].clone();
+                    let vals = self.fill(name, &k, &decl, Some(fields), None, pos)?;
+                    let obj = self.build(&format!("%\"S.{k}\""), None, &vals);
+                    val(obj, Type::Struct(k))
+                }
+                Lit::Variant(k, i) => {
+                    let v = self.enums[&k][i].clone();
+                    if !v.braces {
+                        return err(pos, format!("`{}` takes its values in parentheses: `{}(...)`", v.name, v.name));
                     }
+                    self.make_variant(&k, i, Some(fields), None, pos)?
                 }
-                let mut vals = vec![];
-                for (f, ft) in &decl {
-                    let Some((_, x)) = fields.iter().find(|x| x.0 == *f) else {
-                        return err(pos, format!("missing field `{f}` in `{name}`"));
-                    };
-                    let v = self.typed(x, ft)?;
-                    vals.push((f.clone(), v));
-                }
-                let (g, sz) = (self.tmp(), self.tmp());
-                self.ins(format!("{g} = getelementptr %\"S.{k}\", ptr null, i64 1"));
-                self.ins(format!("{sz} = ptrtoint ptr {g} to i64"));
-                let obj = self.rt(Type::Str, "st_alloc", &[format!("i64 {sz}")]);
-                let obj = val(obj.v, t.clone());
-                for (f, v) in vals {
-                    let (p, _) = self.field_ptr(&obj, &f, pos)?;
-                    self.store(&p, &v);
-                }
-                obj
-            }
+            },
             ExprKind::Lambda(l) => self.lambda(l, peel(want), pos)?,
             ExprKind::Try(x) => {
                 let v = self.expr(x, None)?;
+                if let Type::Opt(t) = v.ty.clone() {
+                    if !matches!(self.f.ret, Type::Opt(_)) {
+                        return err(pos, "`?` on an optional passes `none` up, so the function must return an optional (like `-> int?`). Or use `?? fallback` / `let x = ... else { ... }`");
+                    }
+                    let has = self.extract(&v, 0, Type::Bool);
+                    let (lnone, lok) = (self.lbl("none"), self.lbl("some"));
+                    self.term(format!("br i1 {}, label %{lok}, label %{lnone}", has.v));
+                    self.label(&lnone);
+                    self.term(format!("ret {} zeroinitializer", ll(&self.f.ret)));
+                    self.label(&lok);
+                    return Ok(self.extract(&v, 1, *t));
+                }
                 let Type::Result(t) = v.ty.clone() else {
-                    return err(pos, format!("`?` needs a result (like int!), but this is {}", v.ty));
+                    return err(pos, format!("`?` needs a result (like int!) or an optional (int?), but this is {}", v.ty));
                 };
                 let Type::Result(ft) = self.f.ret.clone() else {
                     return err(pos, "`?` passes the error up, so the function must return a result (like `-> int!`)");
@@ -1517,41 +1827,43 @@ impl Gen {
             }
             ExprKind::CatchValue(x, fallback) => {
                 let v = self.expr(x, None)?;
-                let Type::Result(t) = v.ty.clone() else { return err(pos, format!("`catch` needs a result (like int!), not {}", v.ty)) };
-                if *t == Type::Void {
+                let (e, t) = self.failed(&v, pos)?;
+                if t == Type::Void {
                     return err(pos, "this has no value to fall back from; use `catch e { ... }`");
                 }
                 let slot = self.alloca(&t);
-                let e = self.extract(&v, 0, Type::Bool);
                 let (lerr, lok, lend) = (self.lbl("caught"), self.lbl("fine"), self.lbl("endcatch"));
                 self.term(format!("br i1 {}, label %{lerr}, label %{lok}", e.v));
                 self.label(&lok);
-                let ok = self.extract(&v, 1, (*t).clone());
+                let ok = self.extract(&v, 1, t.clone());
                 self.store(&slot, &ok);
                 self.term(format!("br label %{lend}"));
                 self.label(&lerr);
                 let fb = self.typed(fallback, &t)?;
                 self.store(&slot, &fb);
                 self.label(&lend);
-                self.load(&slot, *t)
+                self.load(&slot, t)
             }
             ExprKind::CatchBlock(x, name, block) => {
                 let v = self.expr(x, None)?;
-                let Type::Result(t) = v.ty.clone() else { return err(pos, format!("`catch` needs a result (like int!), not {}", v.ty)) };
-                let slot = (*t != Type::Void).then(|| self.alloca(&t));
-                let e = self.extract(&v, 0, Type::Bool);
+                let (e, t) = self.failed(&v, pos)?;
+                let is_opt = matches!(v.ty, Type::Opt(_));
+                if is_opt && name != "_" {
+                    return err(pos, "an optional has no error message; write `catch _ { ... }`");
+                }
+                let slot = (t != Type::Void).then(|| self.alloca(&t));
                 let (lerr, lok, lend) = (self.lbl("caught"), self.lbl("fine"), self.lbl("endcatch"));
                 self.term(format!("br i1 {}, label %{lerr}, label %{lok}", e.v));
                 self.label(&lok);
                 if let Some(s) = &slot {
-                    let ok = self.extract(&v, 1, (*t).clone());
+                    let ok = self.extract(&v, 1, t.clone());
                     self.store(s, &ok);
                 }
                 self.term(format!("br label %{lend}"));
                 self.label(&lerr);
                 self.f.scopes.push(HashMap::new());
-                let m = self.extract(&v, 2, Type::Str);
                 if name != "_" {
+                    let m = self.extract(&v, 2, Type::Str);
                     self.declare(name, &m, false);
                 }
                 let r = self.block(block);
@@ -1562,90 +1874,12 @@ impl Gen {
                 }
                 self.label(&lend);
                 match slot {
-                    Some(s) => self.load(&s, *t),
+                    Some(s) => self.load(&s, t),
                     None => void(),
                 }
             }
             ExprKind::Match(subject, arms) => self.match_expr(subject, arms, want)?,
         })
-    }
-
-    fn match_expr(&mut self, subject: &Expr, arms: &[(Pattern, Pos, Body)], want: Option<&Type>) -> R<Val> {
-        let s = self.expr(subject, None)?;
-        if !matches!(s.ty, Type::Int | Type::Bool | Type::Str | Type::Result(_)) {
-            return err(subject.pos, format!("`match` works on int, bool, str and results, not {}", s.ty));
-        }
-        let lend = self.lbl("endmatch");
-        let mut j = Join::default();
-        let (mut any, mut seen_ok, mut seen_err, mut seen_t, mut seen_f) = (false, false, false, false, false);
-        for (pat, ppos, body) in arms {
-            if any || (seen_ok && seen_err) || (seen_t && seen_f) {
-                return err(*ppos, "this arm can never run: the arms above already cover everything");
-            }
-            let mismatch = |want: &str| err(*ppos, format!("this pattern is a {want}, but the value is {}", s.ty));
-            let test = match pat {
-                Pattern::Any => {
-                    any = true;
-                    None
-                }
-                Pattern::Int(n) => {
-                    if s.ty != Type::Int { return mismatch("int") }
-                    Some(format!("icmp eq i64 {}, {n}", s.v))
-                }
-                Pattern::Bool(b) => {
-                    if s.ty != Type::Bool { return mismatch("bool") }
-                    if *b { seen_t = true } else { seen_f = true }
-                    Some(format!("icmp eq i1 {}, {b}", s.v))
-                }
-                Pattern::Str(x) => {
-                    if s.ty != Type::Str { return mismatch("str") }
-                    let g = self.str_const(x);
-                    let r = self.rt(Type::Bool, "st_streq", &[format!("ptr {}", s.v), format!("ptr {g}")]);
-                    Some(format!("or i1 {}, false", r.v))
-                }
-                Pattern::Ok(_) | Pattern::Err(_) => {
-                    if !matches!(s.ty, Type::Result(_)) { return mismatch("result") }
-                    let is_ok = matches!(pat, Pattern::Ok(_));
-                    if is_ok { seen_ok = true } else { seen_err = true }
-                    let e = self.extract(&s, 0, Type::Bool);
-                    Some(format!("icmp eq i1 {}, {}", e.v, !is_ok))
-                }
-            };
-            let next = match test {
-                Some(test) => {
-                    let (t, la, ln) = (self.tmp(), self.lbl("arm"), self.lbl("next"));
-                    self.ins(format!("{t} = {test}"));
-                    self.term(format!("br i1 {t}, label %{la}, label %{ln}"));
-                    self.label(&la);
-                    Some(ln)
-                }
-                None => None,
-            };
-            self.f.scopes.push(HashMap::new());
-            if let (Pattern::Ok(n) | Pattern::Err(n), Type::Result(t)) = (pat, &s.ty) {
-                if n != "_" {
-                    let b = if matches!(pat, Pattern::Ok(_)) {
-                        if **t == Type::Void { return err(*ppos, "this result has no value; write `ok(_)`") }
-                        self.extract(&s, 1, (**t).clone())
-                    } else {
-                        self.extract(&s, 2, Type::Str)
-                    };
-                    self.declare(n, &b, false);
-                }
-            }
-            let v = self.arm_body(body, want);
-            self.f.scopes.pop();
-            let v = v?;
-            self.join(&mut j, v, &lend);
-            if let Some(ln) = next {
-                self.label(&ln);
-            }
-        }
-        let exhaustive = any || (seen_ok && seen_err) || (seen_t && seen_f);
-        if !exhaustive {
-            self.join(&mut j, void(), &lend); // nothing matched
-        }
-        Ok(self.finish(j, &lend, exhaustive))
     }
 
     fn fn_value(&mut self, key: String, pos: Pos) -> R<Val> {
@@ -1701,6 +1935,57 @@ impl Gen {
             self.ins(format!("store ptr {}, ptr {g}", v.addr));
         }
         Ok(val(obj, Type::Fn(params.into_iter().map(|p| p.1).collect(), Box::new(rt))))
+    }
+
+    /// For a result or an optional: (an i1 that is true when it holds no value, the value's type).
+    fn failed(&mut self, v: &Val, pos: Pos) -> R<(Val, Type)> {
+        match v.ty.clone() {
+            Type::Result(t) => Ok((self.extract(v, 0, Type::Bool), *t)),
+            Type::Opt(t) => {
+                let has = self.extract(v, 0, Type::Bool);
+                let n = self.tmp();
+                self.ins(format!("{n} = xor i1 {}, true", has.v));
+                Ok((val(n, Type::Bool), *t))
+            }
+            t => err(pos, format!("`catch` and `??` need a result (like int!) or an optional (int?), not {t}")),
+        }
+    }
+
+    fn const_value(&mut self, k: &str) -> Val {
+        let t = self.consts[k].clone();
+        self.load(&format!("@\"g.{k}\""), t)
+    }
+
+    /// `a ?? b`: the value inside `a`, or `b` (only evaluated when needed).
+    fn coalesce(&mut self, l: &Expr, r: &Expr, want: Option<&Type>, pos: Pos) -> R<Val> {
+        let lw = match peel(want) {
+            Some(Type::Opt(t)) => Some(Type::Opt(t.clone())),
+            Some(t) if *t != Type::Void => Some(Type::Opt(Box::new(t.clone()))),
+            _ => None,
+        };
+        let a = self.expr(l, lw.as_ref())?;
+        let (missing, t) = self.failed(&a, pos)?;
+        if t == Type::Void {
+            return err(pos, "this has no value to fall back from");
+        }
+        let (lnone, lsome, lend) = (self.lbl("none"), self.lbl("some"), self.lbl("endor"));
+        self.term(format!("br i1 {}, label %{lnone}, label %{lsome}", missing.v));
+        self.label(&lnone);
+        let b = self.expr(r, Some(&t))?;
+        // `a ?? b` where `b` is optional too stays optional
+        let rt = if b.ty == Type::Opt(Box::new(t.clone())) { b.ty.clone() } else { t.clone() };
+        let slot = self.alloca(&rt);
+        if self.f.open {
+            let b = self.coerce(b, &rt, r.pos)?;
+            self.store(&slot, &b);
+            self.term(format!("br label %{lend}"));
+        }
+        self.label(&lsome);
+        let x = self.extract(&a, 1, t);
+        let x = self.coerce(x, &rt, pos)?;
+        self.store(&slot, &x);
+        self.label(&lend);
+        Ok(self.load(&slot, rt))
     }
 
     fn binary(&mut self, op: &Tok, l: &Expr, r: &Expr, pos: Pos) -> R<Val> {
@@ -1761,6 +2046,9 @@ impl Gen {
             self.ins(format!("{t} = icmp s{cc} i64 {}, 0", c.v));
             return Ok(val(t, Type::Bool));
         }
+        if let Type::Opt(_) = a.ty {
+            return err(l.pos, format!("this is optional ({}); unwrap it first: `x ?? 0`, `if let x = ...` or `?`", a.ty));
+        }
         if !matches!(a.ty, Type::Int | Type::Float) {
             return err(l.pos, format!("{op} works on numbers, not {}", a.ty));
         }
@@ -1815,7 +2103,38 @@ impl Gen {
                 let argl = self.args(&sig.params, args, pos, name)?;
                 Ok(self.emit_call(&sig.ret, &sig.sym, &argl))
             }
+            ExprKind::Member(name) => {
+                let target = peel_all(want).cloned();
+                match target {
+                    Some(Type::Enum(k)) if self.enums[&k].iter().any(|v| v.name == *name) => {
+                        let i = self.enums[&k].iter().position(|v| v.name == *name).unwrap();
+                        self.make_variant(&k, i, None, Some(args), pos)
+                    }
+                    Some(Type::Enum(k) | Type::Struct(k)) if self.statics.contains(&format!("{k}::{name}")) => {
+                        let sig = self.funcs[&format!("{k}::{name}")].clone();
+                        let argl = self.args(&sig.params, args, pos, name)?;
+                        Ok(self.emit_call(&sig.ret, &sig.sym, &argl))
+                    }
+                    Some(t @ (Type::Enum(_) | Type::Struct(_))) => err(pos, format!("{t} has no variant or static function `{name}`")),
+                    _ => err(pos, format!("can't tell which type `.{name}` belongs to; write `Type.{name}(...)`")),
+                }
+            }
             ExprKind::Field(base, name) => {
+                if let Some(tk) = self.type_path(base) {
+                    if let Some(i) = self.enums.get(&tk).and_then(|vs| vs.iter().position(|v| v.name == *name)) {
+                        return self.make_variant(&tk, i, None, Some(args), pos);
+                    }
+                    let k = format!("{tk}::{name}");
+                    let Some(sig) = self.funcs.get(&k).cloned() else {
+                        let what = if self.enums.contains_key(&tk) { "variant or function" } else { "function" };
+                        return err(pos, format!("`{tk}` has no {what} `{name}`"));
+                    };
+                    if !self.statics.contains(&k) {
+                        return err(pos, format!("`{name}` is a method; call it on a value: `x.{name}(...)`"));
+                    }
+                    let argl = self.args(&sig.params, args, pos, name)?;
+                    return Ok(self.emit_call(&sig.ret, &sig.sym, &argl));
+                }
                 if let ExprKind::Var(m) = &base.kind {
                     if self.is_module(m) {
                         let Some(sig) = self.funcs.get(&format!("{m}.{name}")).cloned() else {
@@ -1834,11 +2153,18 @@ impl Gen {
                     }
                 }
                 match b.ty.clone() {
-                    Type::Struct(sk) => {
-                        if let Some(sig) = self.funcs.get(&format!("{sk}::{name}")).cloned() {
+                    Type::Struct(sk) | Type::Enum(sk) => {
+                        let k = format!("{sk}::{name}");
+                        if let Some(sig) = self.funcs.get(&k).cloned() {
+                            if self.statics.contains(&k) {
+                                return err(pos, format!("`{name}` is a static function; call it as `{sk}.{name}(...)`"));
+                            }
                             let mut argl = vec![format!("ptr {}", b.v)];
                             argl.extend(self.args(&sig.params[1..], args, pos, name)?);
                             return Ok(self.emit_call(&sig.ret, &sig.sym, &argl));
+                        }
+                        if matches!(b.ty, Type::Enum(_)) {
+                            return err(pos, format!("{sk} has no method `{name}`"));
                         }
                         let (p, t) = self.field_ptr(&b, name, pos)?;
                         let c = self.load(&p, t);
@@ -1860,6 +2186,7 @@ impl Gen {
                     Type::List(et) => self.list_method(&b, &et, name, args, pos),
                     Type::Map(kt, vt) => self.map_method(&b, &kt, &vt, name, args, pos),
                     Type::Set(et) => self.set_method(&b, &et, name, args, pos),
+                    Type::Opt(t) => self.opt_method(&b, &t, name, args, pos),
                     Type::Float => {
                         self.args(&[], args, pos, name)?;
                         let f = match name.as_str() {
@@ -1969,6 +2296,57 @@ impl Gen {
                 let (esz, w) = (self.size_of(et), self.located("slice() out of range", pos));
                 let argl = [hp, a[0].clone(), a[1].clone(), format!("i64 {esz}"), format!("i64 {}", atomic(et)), w];
                 self.rt(h.ty.clone(), "st_vec_slice", &argl)
+            }
+            "first" | "last" | "get" => {
+                let (len, d) = self.vec_parts(&h.v);
+                let i = match name {
+                    "first" => {
+                        self.args(&[], args, pos, name)?;
+                        "0".to_string()
+                    }
+                    "last" => {
+                        self.args(&[], args, pos, name)?;
+                        let t = self.tmp();
+                        self.ins(format!("{t} = sub i64 {len}, 1"));
+                        t
+                    }
+                    _ => self.args(&[Type::Int], args, pos, name)?.remove(0).trim_start_matches("i64 ").to_string(),
+                };
+                let ot = Type::Opt(Box::new(et.clone()));
+                let slot = self.alloca(&ot);
+                self.ins(format!("store {} zeroinitializer, ptr {slot}", ll(&ot)));
+                let (inr, lin, lend) = (self.tmp(), self.lbl("inside"), self.lbl("got"));
+                self.ins(format!("{inr} = icmp ult i64 {i}, {len}"));
+                self.term(format!("br i1 {inr}, label %{lin}, label %{lend}"));
+                self.label(&lin);
+                let p = self.tmp();
+                self.ins(format!("{p} = getelementptr inbounds {}, ptr {d}, i64 {i}", ll(et)));
+                let x = self.load(&p, et.clone());
+                let x = self.some_of(&x);
+                self.store(&slot, &x);
+                self.label(&lend);
+                self.load(&slot, ot)
+            }
+            "find" => {
+                let f = self.fn_arg(args, one.to_vec(), Some(Type::Bool), pos, name)?;
+                let ot = Type::Opt(Box::new(et.clone()));
+                let slot = self.alloca(&ot);
+                self.ins(format!("store {} zeroinitializer, ptr {slot}", ll(&ot)));
+                let lend = self.lbl("found");
+                self.each(h, et, |g, x, _| {
+                    let hit = g.call_val(&f, std::slice::from_ref(&x));
+                    let ly = g.lbl("hit");
+                    let ln = g.lbl("miss");
+                    g.term(format!("br i1 {}, label %{ly}, label %{ln}", hit.v));
+                    g.label(&ly);
+                    let x = g.some_of(&x);
+                    g.store(&slot, &x);
+                    g.term(format!("br label %{lend}"));
+                    g.label(&ln);
+                    Ok(())
+                })?;
+                self.label(&lend);
+                self.load(&slot, ot)
             }
             "contains" | "index_of" => {
                 let [a] = args else { return err(pos, format!("`{name}` takes 1 argument, got {}", args.len())) };
@@ -2091,21 +2469,45 @@ impl Gen {
                 val(t, vt.clone())
             }
             ("get", [k]) => {
-                // m.get(key) -> V!, for `?`, `catch` and `match`
+                // m.get(key) -> V?, for `??`, `if let`, `?` and `match`
                 let k = self.typed(k, kt)?;
                 let (found, v) = self.map_get(&m.v, &k, vt);
-                let rt = Type::Result(Box::new(vt.clone()));
-                let msg = self.str_const("key not in map");
-                let (e, m, a, b, c) = (self.tmp(), self.tmp(), self.tmp(), self.tmp(), self.tmp());
-                self.ins(format!("{e} = xor i1 {found}, true"));
-                self.ins(format!("{m} = select i1 {found}, ptr null, ptr {msg}"));
-                self.ins(format!("{a} = insertvalue {} zeroinitializer, i1 {e}, 0", ll(&rt)));
+                let rt = Type::Opt(Box::new(vt.clone()));
+                let (a, b) = (self.tmp(), self.tmp());
+                self.ins(format!("{a} = insertvalue {} zeroinitializer, i1 {found}, 0", ll(&rt)));
                 self.ins(format!("{b} = insertvalue {} {a}, {} {}, 1", ll(&rt), ll(vt), v.v));
-                self.ins(format!("{c} = insertvalue {} {b}, ptr {m}, 2", ll(&rt)));
-                val(c, rt)
+                val(b, rt)
             }
             _ => return err(pos, format!("{} has no method `{name}` with {} argument(s) (try get, contains, remove, keys, values, len)", m.ty, args.len())),
         })
+    }
+
+    fn opt_method(&mut self, o: &Val, t: &Type, name: &str, args: &[Expr], pos: Pos) -> R<Val> {
+        let has = self.extract(o, 0, Type::Bool);
+        Ok(match (name, args) {
+            ("is_some", []) => has,
+            ("is_none", []) => {
+                let n = self.tmp();
+                self.ins(format!("{n} = xor i1 {}, true", has.v));
+                val(n, Type::Bool)
+            }
+            ("unwrap", []) => {
+                let n = self.tmp();
+                self.ins(format!("{n} = xor i1 {}, true", has.v));
+                self.check(&n, "unwrap() on none", pos);
+                self.extract(o, 1, t.clone())
+            }
+            _ => return err(pos, format!("{} has no method `{name}` (try is_some, is_none, unwrap; or unwrap it with `if let`, `??` or `?`)", o.ty)),
+        })
+    }
+
+    /// `T` -> `T?`
+    fn some_of(&mut self, v: &Val) -> Val {
+        let ot = Type::Opt(Box::new(v.ty.clone()));
+        let (a, b) = (self.tmp(), self.tmp());
+        self.ins(format!("{a} = insertvalue {} zeroinitializer, i1 true, 0", ll(&ot)));
+        self.ins(format!("{b} = insertvalue {} {a}, {} {}, 1", ll(&ot), ll(&v.ty), v.v));
+        val(b, ot)
     }
 
     fn set_method(&mut self, s: &Val, et: &Type, name: &str, args: &[Expr], pos: Pos) -> R<Val> {
@@ -2237,6 +2639,25 @@ impl Gen {
                 self.ins(format!("call void @st_panic_msg(ptr {w}, ptr {})", v.v));
                 self.term("unreachable".into());
                 void()
+            }
+            "some" => {
+                let inner = match peel(want) {
+                    Some(Type::Opt(t)) => Some((**t).clone()),
+                    _ => None,
+                };
+                let v = one(self, inner.as_ref())?;
+                let v = match &inner {
+                    Some(t) => self.coerce(v, t, args[0].pos)?,
+                    None => v,
+                };
+                if !fits_slot(&v.ty) {
+                    return err(args[0].pos, format!("{}? isn't a type", v.ty));
+                }
+                self.some_of(&v)
+            }
+            "to_json" => {
+                let v = one(self, None)?;
+                self.json(&v, args[0].pos)?
             }
             "ok" | "err" => {
                 let Some(Type::Result(t)) = want else {
