@@ -794,3 +794,182 @@ fn language_server() {
     assert!(hover_let.contains("let s: Shape"), "{hover_let}");
     assert!(tokens.contains(r#""data":["#) && tokens.len() > 100, "{tokens}");
 }
+
+#[test]
+fn default_parameters() {
+    let src = r#"
+const BASE = 10
+fn add(a: int, b: int = BASE, tags: {str: str} = {}, names: [str] = []) -> int {
+    return a + b + tags.len() + names.len()
+}
+struct S {
+    x: int,
+    fn get(self, plus: int = 1) -> int { return self.x + plus }
+}
+fn main() {
+    println(add(1))
+    println(add(1, 2))
+    println(add(1, 2, {"a": "b"}, ["x", "y"]))
+    println(S { x: 5 }.get())
+    println(S { x: 5 }.get(10))
+}"#;
+    ok("defaults", src, "11\n3\n6\n6\n15\n");
+    for (src, want) in [
+        ("fn f(a: int = 1, b: int) {}\nfn main() {}", "needs a default too"),
+        ("fn f(a: int, b: int = 2) {}\nfn main() { f() }", "takes 1 to 2 argument(s), got 0"),
+        ("fn f(a: int = 2) {}\nfn main() { f(1, 2) }", "takes 0 to 1 argument(s), got 2"),
+    ] {
+        let (code, _, err) = run("defaults_bad", src);
+        assert!(code == -1 && err.contains(want), "{src}\n{err}");
+    }
+}
+
+#[test]
+fn url_encode_sleep_now_ms() {
+    let src = r#"
+fn main() {
+    println(url_encode("Hide on bush"))
+    println(url_encode("a#b/c?d=e&f+g"))
+    println(url_encode("Grüße"))
+    println(url_encode("🦀"))
+    println(url_encode("AZaz09-_.~"))
+    println(url_encode(""))
+    let t = now_ms()
+    sleep(50)
+    println(now_ms() - t >= 50)
+}"#;
+    ok(
+        "url_encode",
+        src,
+        "Hide%20on%20bush\na%23b%2Fc%3Fd%3De%26f%2Bg\nGr%C3%BC%C3%9Fe\n%F0%9F%A6%80\nAZaz09-_.~\n\ntrue\n",
+    );
+    let (code, _, err) = run("sleep_bad", "fn main() { sleep(\"1\") }");
+    assert!(code == -1 && err.contains("expected int"), "{err}");
+    let (code, _, err) = run("now_ms_bad", "fn now_ms() -> int { return 1 }\nfn main() {}");
+    assert!(code == -1 && err.contains("already defined"), "{err}");
+}
+
+/// `http.fetch` against a local stellang server: statuses (404 and 429 are answers, not errors),
+/// headers, JSON, POST bodies, and errors for refused connections and timeouts. No internet needed.
+#[test]
+fn http_fetch() {
+    let dir = tmpdir("fetch");
+    let server_src = r#"
+import http
+
+fn main() -> void! {
+    let app = http.app()
+    app.log = false
+    app.get("/users/:id", (req, res) => {
+        if req.param("id") == "404" {
+            res.status(404).json("{\"status\":{\"message\":\"Data not found\"}}")
+            return
+        }
+        res.set("X-Rate", "7").json("{\"id\":\"${req.param("id")}\",\"token\":\"${req.header("x-riot-token") ?? ""}\"}")
+    })
+    app.get("/limited", (req, res) => res.status(429).set("Retry-After", "2").send("slow down"))
+    app.post("/echo", (req, res) => res.status(201).send("${req.method} ${req.header("x-test") ?? "-"} ${req.body}"))
+    app.delete("/items/:id", (req, res) => res.send("deleted ${req.param("id")}"))
+    app.listen(int(env("PORT"))?)?
+}"#;
+    let client_src = r#"
+import http
+import json
+
+fn main() -> void! {
+    let base = "http://127.0.0.1:${env("PORT")}"
+    let r = http.fetch("${base}/users/${url_encode("ada lovelace")}", {"X-Riot-Token": "secret"})?
+    println(r.status)
+    println(r.header("content-type") ?? "?")
+    println(r.header("X-RATE") ?? "?")
+    println(r.headers.get("x-rate") ?? "?")
+    let user = r.json()?
+    println(user.get("id")?.as_str() ?? "?")
+    println(user.get("token")?.as_str() ?? "?")
+
+    let missing = http.fetch("${base}/users/404")?
+    println(missing.status)
+    println(missing.json()?.get("status")?.get("message")?.as_str() ?? "?")
+
+    let limited = http.fetch("${base}/limited")?
+    println(limited.status)
+    println((int(limited.header("retry-after") ?? "1") catch 1) * 1000)
+
+    let posted = http.request("post", "${base}/echo", {"X-Test": "yes"}, "{\"a\":1}")?
+    println("${posted.status} ${posted.body}")
+    let deleted = http.request("DELETE", "${base}/items/3")?
+    println("${deleted.status} ${deleted.body}")
+
+    let refused = http.fetch("http://127.0.0.1:${env("CLOSED_PORT")}/") catch e {
+        println("refused: ${e}")
+        return
+    }
+    println("unexpected ${refused.status}")
+}"#;
+    let build = |name: &str, src: &str| {
+        let (file, exe) = (dir.join(format!("{name}.st")), dir.join(name));
+        fs::write(&file, src).unwrap();
+        let c = Command::new(BIN).arg(&file).arg("-o").arg(&exe).output().unwrap();
+        assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+        exe
+    };
+    let (server_exe, client_exe) = (build("server", server_src), build("client", client_src));
+    let port = (20000 + (std::process::id() + 13) % 20000) as u16;
+    let mut server = Command::new(&server_exe).env("PORT", port.to_string()).stdout(Stdio::null()).spawn().unwrap();
+    for _ in 0..100 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    // a port nobody listens on
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let out = Command::new(&client_exe).env("PORT", port.to_string()).env("CLOSED_PORT", closed_port.to_string()).output().unwrap();
+    server.kill().unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    let want = [
+        "200",
+        "application/json",
+        "7",
+        "7",
+        "ada lovelace",
+        "secret",
+        "404",
+        "Data not found",
+        "429",
+        "2000",
+        "201 POST yes {\"a\":1}",
+        "200 deleted 3",
+    ];
+    assert_eq!(lines.len(), want.len() + 1, "{stdout}");
+    assert_eq!(lines[..want.len()], want);
+    assert!(lines[want.len()].starts_with("refused: GET http://127.0.0.1:"), "{stdout}");
+}
+
+/// A server that accepts the connection but never answers: fetch gives up after `timeout_ms` with an error.
+#[test]
+fn http_fetch_timeout() {
+    let hang = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); // never accepted: the kernel queues the connection
+    let port = hang.local_addr().unwrap().port();
+    let src = format!(
+        r#"
+import http
+
+fn main() {{
+    let start = now_ms()
+    let r = http.fetch("http://127.0.0.1:{port}/slow", {{}}, 300) catch e {{
+        println("error after ${{now_ms() - start >= 250 && now_ms() - start < 5000}}")
+        println(e.contains("imeout") || e.contains("timed out"))
+        return
+    }}
+    println("got ${{r.status}}")
+}}"#
+    );
+    let (code, out, err) = run("fetch_timeout", &src);
+    drop(hang);
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "error after true\ntrue\n", ""));
+}
