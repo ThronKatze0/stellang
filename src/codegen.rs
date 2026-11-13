@@ -26,9 +26,28 @@ pub struct Unit {
     pub module: Module,
 }
 
+/// The function that computes parameter `i`'s default, for the function `sym` (`@"st.f"` -> `@"def.st.f.1"`).
+fn default_sym(sym: &str, i: usize) -> String {
+    format!("@\"def.{}.{i}\"", sym.trim_start_matches('@').trim_matches('"'))
+}
+
+/// The function that computes field `f`'s default, for a struct or `Enum::Variant`.
+fn field_default_sym(dkey: &str, f: &str) -> String {
+    format!("@\"fdef.{dkey}.{f}\"")
+}
+
 pub const RESERVED: &[&str] = &[
     "print", "println", "str", "int", "float", "env", "panic", "ok", "err", "bool", "void", "true", "false", "min", "max",
-    "abs", "some", "none", "to_json", "self",
+    "abs", "some", "none", "to_json", "self", "sleep", "now_ms", "url_encode",
+    "url_decode",
+];
+
+/// Signatures of the newer builtins, for hover.
+const BUILTIN_SIGS: &[(&str, &str)] = &[
+    ("sleep", "fn sleep(ms: int)"),
+    ("now_ms", "fn now_ms() -> int"),
+    ("url_encode", "fn url_encode(s: str) -> str"),
+    ("url_decode", "fn url_decode(s: str) -> str"),
 ];
 
 const RUNTIME: &str = r#"%st.vec = type { i64, i64, ptr }
@@ -50,6 +69,10 @@ declare ptr @st_hook()
 declare ptr @st_itoa(i64)
 declare ptr @st_parse_int(ptr, ptr)
 declare ptr @st_env(ptr)
+declare ptr @st_url_encode(ptr)
+declare ptr @st_url_decode(ptr)
+declare void @st_sleep(i64)
+declare i64 @st_now_ms()
 declare ptr @st_slice(ptr, i64, i64, ptr)
 declare i64 @st_find(ptr, ptr)
 declare ptr @st_split(ptr, ptr)
@@ -327,6 +350,8 @@ struct Sig {
     ret: Type,
     sym: String,
     is_extern: bool,
+    defaults: Vec<Option<Expr>>, // per parameter; each one is compiled into `default_sym(sym, i)`
+    module: String,              // where the defaults are evaluated
 }
 
 /// Collects the values of the branches of a `match` that reach its end.
@@ -371,7 +396,8 @@ struct Gen {
     imports: HashMap<String, HashSet<String>>,
     structs: HashMap<String, Vec<(String, Type)>>,
     enums: HashMap<String, Vec<VariantInfo>>,
-    defaults: HashMap<String, (String, Vec<(String, Expr)>)>, // struct or `Enum::Variant` -> (module, field defaults)
+    defaults: HashMap<String, (String, Vec<(String, Expr)>)>, // struct or `Enum::Variant` -> (module, field defaults), see `field_default_sym`
+    default_fns: HashSet<String>, // the default-value functions made so far
     consts: HashMap<String, Type>,
     const_order: Vec<String>,
     statics: HashSet<String>, // `Type::name` functions without `self`
@@ -512,7 +538,8 @@ impl Gen {
                 (Some(t), _) => self.resolve(t, f.pos)?,
             });
         }
-        Ok(Sig { params, names: f.params.iter().map(|p| p.0.clone()).collect(), ret: self.resolve(&f.ret, f.pos)?, sym, is_extern: false })
+        let defaults = f.defaults.clone();
+        Ok(Sig { params, names: f.params.iter().map(|p| p.0.clone()).collect(), ret: self.resolve(&f.ret, f.pos)?, sym, is_extern: false, defaults, module: self.module.clone() })
     }
 
     fn type_of_key(&self, k: &str) -> Type {
@@ -648,7 +675,7 @@ impl Gen {
                     let ps: Vec<String> = params.iter().map(ll).collect();
                     writeln!(self.decls, "declare {} @{}({})", ll(&ret), x.name, ps.join(", ")).unwrap();
                 }
-                let sig = Sig { params, names: vec![], ret, sym: format!("@{}", x.name), is_extern: true };
+                let sig = Sig { params, names: vec![], ret, sym: format!("@{}", x.name), is_extern: true, defaults: vec![], module: self.module.clone() };
                 self.add_fn(self.key(&x.name), sig, x.pos, &x.name)?;
             }
             for im in &u.module.impls {
@@ -718,6 +745,44 @@ impl Gen {
                 writeln!(self.globals, "@\"g.{k}\" = internal global {} zeroinitializer", ll(&t)).unwrap();
                 self.consts.insert(k.clone(), t);
                 self.const_order.push(k);
+            }
+        }
+        // default values: each one becomes a small function of its own (like a constant), so its type is
+        // checked here, once, and a call that leaves the value out just calls it. Generic instances get
+        // theirs when they're made, since only then are the types known.
+        let mut fns: Vec<String> = vec![];
+        for u in units {
+            self.module = u.name.clone();
+            fns.extend(u.module.funcs.iter().filter(|f| f.tparams.is_empty()).map(|f| self.key(&f.name)));
+        }
+        for (_, sk, methods) in &self.impl_methods {
+            fns.extend(methods.iter().filter(|m| m.tparams.is_empty()).map(|m| format!("{sk}::{}", m.name)));
+        }
+        for k in fns {
+            let sig = self.funcs[&k].clone();
+            for (i, d) in sig.defaults.iter().enumerate() {
+                if let Some(e) = d {
+                    self.default_fn(&default_sym(&sig.sym, i), e, &sig.module, &sig.params[i])?;
+                }
+            }
+        }
+        for u in units {
+            self.module = u.name.clone();
+            let mut holders: Vec<(String, Vec<(String, Type)>)> = vec![];
+            for st in u.module.structs.iter().filter(|st| st.tparams.is_empty()) {
+                let k = self.key(&st.name);
+                holders.push((k.clone(), self.structs[&k].clone()));
+            }
+            for e in u.module.enums.iter().filter(|e| e.tparams.is_empty()) {
+                let k = self.key(&e.name);
+                holders.extend(self.enums[&k].iter().map(|v| (format!("{k}::{}", v.name), v.fields.clone())));
+            }
+            for (dkey, fields) in holders {
+                let Some((m, defs)) = self.defaults.get(&dkey).cloned() else { continue };
+                for (f, e) in defs {
+                    let ft = fields.iter().find(|x| x.0 == f).unwrap().1.clone();
+                    self.default_fn(&field_default_sym(&dkey, &f), &e, &m, &ft)?;
+                }
             }
         }
         for u in units {
@@ -802,6 +867,27 @@ impl Gen {
             out += "attributes #0 = { \"probe-stack\"=\"inline-asm\" }\n";
         }
         Ok(out)
+    }
+
+    /// A default value as a function of its own, evaluated in `module` and checked against the type it fills in.
+    fn default_fn(&mut self, sym: &str, e: &Expr, module: &str, t: &Type) -> R<()> {
+        self.default_fns.insert(sym.into());
+        let saved = mem::replace(&mut self.module, module.into());
+        let body = Body::Expr(Box::new(e.clone()));
+        // on an error, `module` stays put so the message names the file the default is written in
+        self.function(sym, &[], Some(t.clone()), &body, None, &[], e.pos, "a default value")?;
+        self.module = saved;
+        Ok(())
+    }
+
+    /// The value of a default: a call to its function (made here, for a generic instance, if it isn't yet).
+    pub(super) fn call_default(&mut self, sym: &str, e: &Expr, module: &str, t: &Type) -> R<Val> {
+        if !self.default_fns.contains(sym) {
+            self.default_fn(sym, e, module, t)?;
+        }
+        let r = self.tmp();
+        self.ins(format!("{r} = call {} {sym}(ptr null)", ll(t)));
+        Ok(val(r, t.clone()))
     }
 
     fn gen_named(&mut self, key: &str, f: &Func) -> R<()> {
@@ -2441,9 +2527,29 @@ impl Gen {
         Ok(out)
     }
 
+    /// Arguments for a declared function (from parameter `skip` on); trailing ones it leaves out take their defaults.
+    fn sig_args(&mut self, sig: &Sig, skip: usize, args: &[Expr], pos: Pos, name: &str) -> R<Vec<String>> {
+        let params = &sig.params[skip..];
+        let need = (skip..sig.params.len()).take_while(|&i| sig.defaults.get(i).is_none_or(Option::is_none)).count();
+        if args.len() < need || args.len() > params.len() {
+            let n = if need == params.len() { need.to_string() } else { format!("{need} to {}", params.len()) };
+            return err(pos, format!("`{name}` takes {n} argument(s), got {}", args.len()));
+        }
+        let mut out = self.args(&params[..args.len()], args, pos, name)?;
+        for i in skip + args.len()..sig.params.len() {
+            let e = sig.defaults[i].clone().unwrap();
+            let v = self.call_default(&default_sym(&sig.sym, i), &e, &sig.module, &sig.params[i])?;
+            out.push(format!("{} {}", ll(&v.ty), v.v));
+        }
+        Ok(out)
+    }
+
     fn call(&mut self, callee: &Expr, args: &[Expr], pos: Pos, want: Option<&Type>) -> R<Val> {
         match &callee.kind {
             ExprKind::Var(name) if self.find(name).is_none() => {
+                if let Some((_, s)) = BUILTIN_SIGS.iter().find(|b| b.0 == name) {
+                    self.note(callee.pos, s.to_string());
+                }
                 if let Some(v) = self.builtin(name, args, pos, want)? {
                     return Ok(v);
                 }
@@ -2454,7 +2560,7 @@ impl Gen {
                     return err(pos, format!("unknown function `{name}`"));
                 };
                 self.note(callee.pos, sig_text(name, &sig));
-                let argl = self.args(&sig.params, args, pos, name)?;
+                let argl = self.sig_args(&sig, 0, args, pos, name)?;
                 Ok(self.emit_call(&sig.ret, &sig.sym, &argl))
             }
             ExprKind::Member(name) => {
@@ -2470,7 +2576,7 @@ impl Gen {
                     }
                     Some(Type::Enum(k) | Type::Struct(k)) if self.statics.contains(&format!("{k}::{name}")) => {
                         let sig = self.funcs[&format!("{k}::{name}")].clone();
-                        let argl = self.args(&sig.params, args, pos, name)?;
+                        let argl = self.sig_args(&sig, 0, args, pos, name)?;
                         Ok(self.emit_call(&sig.ret, &sig.sym, &argl))
                     }
                     Some(t @ (Type::Enum(_) | Type::Struct(_))) => err(pos, format!("{t} has no variant or static function `{name}`")),
@@ -2509,7 +2615,7 @@ impl Gen {
                         return err(pos, format!("`{name}` is a method; call it on a value: `x.{name}(...)`"));
                     }
                     self.note(callee.pos, sig_text(&format!("{tk}.{name}"), &sig));
-                    let argl = self.args(&sig.params, args, pos, name)?;
+                    let argl = self.sig_args(&sig, 0, args, pos, name)?;
                     return Ok(self.emit_call(&sig.ret, &sig.sym, &argl));
                 }
                 if let ExprKind::Var(m) = &base.kind {
@@ -2521,7 +2627,7 @@ impl Gen {
                             return err(pos, format!("module `{m}` has no function `{name}`"));
                         };
                         self.note(callee.pos, sig_text(&format!("{m}.{name}"), &sig));
-                        let argl = self.args(&sig.params, args, pos, name)?;
+                        let argl = self.sig_args(&sig, 0, args, pos, name)?;
                         return Ok(self.emit_call(&sig.ret, &sig.sym, &argl));
                     }
                 }
@@ -2549,7 +2655,7 @@ impl Gen {
                             }
                             self.note(callee.pos, sig_text(&format!("{owner}.{name}"), &sig));
                             let mut argl = vec![format!("{} {}", ll(&b.ty), b.v)];
-                            argl.extend(self.args(&sig.params[1..], args, pos, name)?);
+                            argl.extend(self.sig_args(&sig, 1, args, pos, name)?);
                             return Ok(self.emit_call(&sig.ret, &sig.sym, &argl));
                         }
                     }
@@ -2563,7 +2669,7 @@ impl Gen {
                             }
                             self.note(callee.pos, sig_text(&format!("{sk}.{name}"), &sig));
                             let mut argl = vec![format!("ptr {}", b.v)];
-                            argl.extend(self.args(&sig.params[1..], args, pos, name)?);
+                            argl.extend(self.sig_args(&sig, 1, args, pos, name)?);
                             return Ok(self.emit_call(&sig.ret, &sig.sym, &argl));
                         }
                         if matches!(b.ty, Type::Enum(_)) {
@@ -3033,6 +3139,27 @@ impl Gen {
                 let v = one(self, Some(&Type::Str))?;
                 expect_ty(&Type::Str, &v.ty, args[0].pos)?;
                 self.rt(Type::Str, "st_env", &[format!("ptr {}", v.v)])
+            }
+            "url_encode" => {
+                let v = one(self, Some(&Type::Str))?;
+                expect_ty(&Type::Str, &v.ty, args[0].pos)?;
+                self.rt(Type::Str, "st_url_encode", &[format!("ptr {}", v.v)])
+            }
+            "url_decode" => {
+                let v = one(self, Some(&Type::Str))?;
+                expect_ty(&Type::Str, &v.ty, args[0].pos)?;
+                self.rt(Type::Str, "st_url_decode", &[format!("ptr {}", v.v)])
+            }
+            "sleep" => {
+                let v = one(self, Some(&Type::Int))?;
+                expect_ty(&Type::Int, &v.ty, args[0].pos)?;
+                self.rt(Type::Void, "st_sleep", &[format!("i64 {}", v.v)])
+            }
+            "now_ms" => {
+                if !args.is_empty() {
+                    return err(pos, format!("`now_ms` takes no arguments, got {}", args.len()));
+                }
+                self.rt(Type::Int, "st_now_ms", &[])
             }
             "panic" => {
                 let v = one(self, Some(&Type::Str))?;

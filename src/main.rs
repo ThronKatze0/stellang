@@ -152,7 +152,7 @@ fn main() {
         exit(1)
     });
 
-    // clang runs the LLVM optimizer, compiles the C runtime, and links against Boehm GC
+    // clang runs the LLVM optimizer, compiles the C runtime, and links against Boehm GC and libcurl
     let stem = Path::new(&input).file_stem().unwrap().to_string_lossy().into_owned();
     let out = out.unwrap_or(if emit { format!("{stem}.ll") } else { stem });
     let rt = env::temp_dir().join(format!("stellang-rt-{}.c", std::process::id()));
@@ -162,7 +162,7 @@ fn main() {
         cmd.args(["-S", "-emit-llvm"]);
     } else {
         fs::write(&rt, RUNTIME).unwrap_or_else(|e| die(e));
-        cmd.args(["-x", "c"]).arg(&rt).arg("-lgc");
+        cmd.args(["-x", "c"]).arg(&rt).args(["-lgc", "-lcurl"]);
     }
     cmd.args(["-o", &out]);
     let mut child = cmd.stdin(Stdio::piped()).spawn().unwrap_or_else(|e| die(format!("cannot run clang: {e}")));
