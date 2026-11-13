@@ -568,7 +568,8 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
 - **Sound** (`sound.st`): a virtio-sound driver and a small synthesizer (square-wave tones with soft edges,
   several at once). `stellang boot` adds the card and plays it through the host's audio (PulseAudio/PipeWire or
   ALSA, Core Audio, DirectSound; `STELLANG_AUDIO=none` or `--no-sound`); `beep [hz] [ms]` and `sound` in the
-  shell, `beep`/`note` for programs. `stellaos_programs` records it to a WAV file and checks the notes.
+  shell, `beep`/`note` for programs, and a **Piano** app (mouse or keyboard). `stellaos_programs` records it to
+  a WAV file and checks the notes.
 - **Terminal**: the shell in a window (an ANSI terminal: colors, line editing, scrollback).
 - **Shell**: `ls cd mkdir cat write edit rm wc`, `every 500 uptime` / `jobs` / `kill`, `calc`, `mem`, `df`,
   `date`, `open <app>`, `windows`, `keyboard us|de`; programs: `code run cc ps kill`; users: `whoami users adduser

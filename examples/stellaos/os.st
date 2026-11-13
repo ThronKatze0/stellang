@@ -41,6 +41,7 @@ import rv
 import sound
 import users
 import login
+import piano
 
 const VERSION = "0.3"
 
@@ -722,6 +723,7 @@ struct Shell {
             wm.Launcher { name: "Bricks", icon: "B", color: 0xff9f43, open: () => breakout.open(d) },
             wm.Launcher { name: "Mines", icon: "✹", color: 0x576574, open: () => mines.open(d) },
             wm.Launcher { name: "Paint", icon: "✎", color: 0xe84393, open: () => paint.open(d) },
+            wm.Launcher { name: "Piano", icon: "♪", color: 0xa29bfe, open: () => piano.open(d, (hz: int, ms: int) => self.beep(hz, ms)) },
         ]
         d.on_shutdown = () => {
             self.sync()
