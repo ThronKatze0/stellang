@@ -540,7 +540,8 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
     use, like stellang's), functions as values, `map filter any all count` on lists,
     string interpolation, the string and list methods (`len slice find contains split lines chars upper lower
     trim replace repeat`; `push pop insert remove slice contains index_of sort reverse join sum`; floats'
-    `sqrt floor ceil round abs`, `int(x)` and `float(x)`). Not yet: generics, traits, imports; `==` compares structs and lists by identity. Every index is checked, division by zero is caught,
+    `sqrt floor ceil round abs`, `int(x)` and `float(x)`). `==` compares structs, lists, maps and options by content (the compiler writes
+    an equality function per type, in the language itself). Not yet: generics, traits, imports. Every index is checked, division by zero is caught,
     runtime errors name their line, and memory is garbage-collected (a mark-and-sweep collector, also written
     in the language).
   - **Built in**: `print println input read_line sleep now_ms random exit max min abs parse_int parse_float

@@ -1235,6 +1235,8 @@ struct Gen {
     crt: bool = false,
     captured: [str] = [],         // names closures in this function use (their `var`s get boxed)
     lambdas: int = 0,
+    eq_names: {str: str} = {},    // types compared with ==: the function that does it
+    eq_todo: [str] = [],
 
     fn fail(self, e: Tree, msg: str) {
         if self.err == "" {
@@ -1386,7 +1388,52 @@ struct Gen {
         if !self.structs.contains(ty) && !self.enums.contains(ty) { self.fail(e, "unknown type ${ty}") }
     }
 
-    // the number of a variant of enum `ty`, or -1
+    // == compares these by content
+    fn deep(self, ty: str) -> bool {
+        if ty.starts_with("[") || ty.starts_with("{") || self.structs.contains(ty) { return true }
+        if ty.ends_with("?") {
+            let inner = ty.slice(0, ty.len() - 1)
+            return inner == "str" || inner == "float" || self.deep(inner)
+        }
+        return false
+    }
+
+    // the type's equality function as a closure (in a0)
+    fn eq_closure(self, ty: str) {
+        let a = self.a
+        let label = self.eq_label(ty)
+        a.li(rv.A0, 8)
+        a.push(rv.A0)
+        self.rt("__alloc", 1)
+        a.addr_fn(rv.T0, label)
+        a.sd(rv.T0, rv.A0, 0)
+    }
+
+    fn eq_label(self, ty: str) -> str {
+        if !self.eq_names.contains(ty) {
+            self.eq_names[ty] = "__eq_${self.eq_names.len()}"
+            self.eq_todo.push(ty)
+        }
+        return "f_" + self.eq_names[ty]
+    }
+
+    // the source of the equality function for a type, compiled like the runtime
+    fn eq_source(self, ty: str) -> str {
+        let name = self.eq_names[ty]
+        let head = "fn ${name}(a: ${ty}, b: ${ty}) -> bool {\n"
+        if ty.starts_with("[") {
+            return head + "    if a.len() != b.len() { return false }\n    for i in 0..a.len() {\n        if a[i] != b[i] { return false }\n    }\n    return true\n}\n"
+        }
+        if ty.starts_with("{") {
+            return head + "    if a.len() != b.len() { return false }\n    for k, v in a {\n        if !b.contains(k) { return false }\n        if b[k] != v { return false }\n    }\n    return true\n}\n"
+        }
+        if ty.ends_with("?") {
+            return head + "    if a == none { return b == none }\n    if b == none { return false }\n    return a.unwrap() == b.unwrap()\n}\n"
+        }
+        let fs = self.structs[ty].fields.filter(f => !f.ty.starts_with("fn("))
+        if fs.is_empty() { return head + "    return true\n}\n" }
+        return head + "    return " + fs.map(f => "a.${f.name} == b.${f.name}").join(" && ") + "\n}\n"
+    }
     fn variant(self, ty: str, name: str) -> int {
         if !self.enums.contains(ty) { return -1 }
         return self.enums[ty].variants.index_of(name)
@@ -1494,6 +1541,23 @@ struct Gen {
             let f = self.funcs[name]
             let label = if f.owner != "" { "m_${f.owner}_${f.name}" } else { "f_${f.name}" }
             self.offsets[label] = self.a.here()
+            self.function(f)
+            if self.err != "" { return }
+        }
+        while !self.eq_todo.is_empty() {
+            let ty = self.eq_todo.pop()
+            let src = self.eq_source(ty)
+            let lx = Lexer { src }
+            lx.run()
+            let ps = Parser { toks: lx.toks, crt: true }
+            let part = Program {}
+            ps.program(part)
+            if lx.err != "" || ps.err != "" || part.fns.is_empty() {
+                self.fail(Tree { k: "", line: 1, col: 1 }, "internal: equality for ${ty}: ${lx.err}${ps.err}")
+                return
+            }
+            let f = part.fns[0]
+            self.offsets["f_" + f.name] = self.a.here()
             self.function(f)
             if self.err != "" { return }
         }
@@ -2733,6 +2797,14 @@ struct Gen {
                 let t = self.expr(e.kids[0], et)
                 self.check(e.kids[0], t, et, "`in`")
                 a.push(rv.A0)
+                if self.deep(et) {
+                    self.eq_closure(et)
+                    a.push(rv.A0)
+                    self.rt("__l_index_eq", 3)
+                    a.slt(rv.A0, rv.A0, rv.ZERO)
+                    a.xori(rv.A0, rv.A0, 1)
+                    return "bool"
+                }
                 self.rt(if et == "str" { "__l_contains_str" } else { "__l_contains_int" }, 2)
             } else {
                 a.addi(rv.SP, rv.SP, 8)
@@ -2799,6 +2871,15 @@ struct Gen {
                 self.fail(e, "`${op}` doesn't work on floats")
                 return "?"
             }
+            return "bool"
+        }
+        if (op == "==" || op == "!=") && lt == rt2 && self.deep(lt) && e.kids[0].k != "none" && e.kids[1].k != "none" {
+            // by content: a function made for this type
+            a.push(rv.T0)
+            a.push(rv.A0)
+            a.call(self.eq_label(lt))
+            a.addi(rv.SP, rv.SP, 16)
+            if op == "!=" { a.xori(rv.A0, rv.A0, 1) }
             return "bool"
         }
         if op == "==" || op == "!=" {
@@ -3075,6 +3156,18 @@ struct Gen {
             self.expr(e.kids[0], "")
             return some("float")
         }
+        if name == "__call2" {
+            // __call2(f, x, y)
+            for x in e.kids {
+                self.expr(x, "")
+                a.push(rv.A0)
+            }
+            a.ld(rv.T0, rv.SP, 16)
+            a.ld(rv.T0, rv.T0, 0)
+            a.jalr(rv.T0)
+            a.addi(rv.SP, rv.SP, 24)
+            return some("int")
+        }
         if name == "__call1" {
             // __call1(f, x): call a closure with one argument
             self.expr(e.kids[0], "")
@@ -3337,6 +3430,18 @@ struct Gen {
                 let t = self.expr(e.kids[1], et)
                 self.check(e.kids[1], t, et, name)
                 a.push(rv.A0)
+                if self.deep(et) {
+                    // by content: through the type's equality function
+                    self.eq_closure(et)
+                    a.push(rv.A0)
+                    self.rt("__l_index_eq", 3)
+                    if name == "contains" {
+                        a.slt(rv.A0, rv.A0, rv.ZERO)
+                        a.xori(rv.A0, rv.A0, 1)
+                        return "bool"
+                    }
+                    return "int"
+                }
                 let kind = if et == "str" { "str" } else { "int" }
                 self.rt("__l_${name}_${kind}", 2)
                 return if name == "contains" { "bool" } else { "int" }
