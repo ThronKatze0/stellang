@@ -266,8 +266,10 @@ println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"p
 ## Editor support
 
 `stellang lsp` is a language server built into the compiler: errors as you type, hover types and doc comments,
-inlay type hints, completion, signature help, go to definition (into `std` too), references, rename, symbols,
-folding, formatting and semantic highlighting.
+inlay type and parameter hints, completion that asks the type checker (members of any expression, the variants an
+enum slot needs, missing struct fields, match arms, postfix snippets like `x.match`, auto-import), quick fixes
+(add missing match arms, import a module, did-you-mean), signature help, go to definition (into `std` too),
+references, rename, symbols, folding, formatting and semantic highlighting.
 It runs the real lexer, parser and type checker, so it keeps up with the language by itself.
 The fallback grammars come out of the compiler's keyword table (`stellang grammar textmate|vim`), and a test
 fails if the copies in `editors/` go stale.
@@ -283,8 +285,9 @@ fails if the copies in `editors/` go stale.
 - **VS Code**: run `editors/vscode/install.sh` (builds the compiler, packages the extension with it inside, and installs
   it with `code`; pass `codium` or `cursor` for those). Or build a `.vsix` to share (`cd editors/vscode && npm install && npm run package`; it includes the
   compiler) and install it from Extensions → `…` → *Install from VSIX…*. Besides the server features
-  it adds Run (`Ctrl+F5`, ▶ in the title bar, `▶ Run | Build` above `main`), build/check tasks with a problem
-  matcher, snippets, a file icon and Markdown code-block highlighting. See [editors/vscode](editors/vscode/README.md).
+  it adds two star themes (Stellang Nebula and Daybreak), a sidebar with your programs, types and HTTP routes, a runner
+  that spots server addresses (Open in Browser, stop, restart), project templates, a Get Started walkthrough,
+  Show LLVM IR, build/check tasks with a problem matcher, a file icon and Markdown code-block highlighting. See [editors/vscode](editors/vscode/README.md).
 - **Anything else** with LSP support: run `stellang lsp` for `*.st` files.
 
 ## Safety

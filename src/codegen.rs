@@ -461,6 +461,13 @@ impl Gen {
         Ok(())
     }
 
+    /// For completion: the type a `.Variant` shorthand is expected to have.
+    fn probe_want(&mut self, pos: Pos, want: Option<&Type>) {
+        if let Some(t) = peel_all(want) {
+            self.note(pos, format!("@want {t}"));
+        }
+    }
+
     fn note(&mut self, pos: Pos, text: String) {
         let file = self.files[&self.module].clone();
         self.notes.push(Note { file, pos, text });
@@ -1693,6 +1700,7 @@ impl Gen {
                 None => return err(pos, format!("unknown name `{n}`")),
             },
             ExprKind::Member(name) => {
+                self.probe_want(pos, want);
                 let Some(Type::Enum(k)) = peel_all(want).cloned() else {
                     return err(pos, format!("can't tell which enum `.{name}` belongs to; write `Type.{name}`"));
                 };
@@ -1764,6 +1772,7 @@ impl Gen {
                     }
                 }
                 let b = self.expr(b, None)?;
+                self.note(pos, format!("@recv {}", b.ty));
                 if !matches!(b.ty, Type::Struct(_) | Type::Opt(_) | Type::Enum(_)) {
                     return err(pos, format!("`{f}` is a method here; call it: `.{f}()`"));
                 }
@@ -2235,6 +2244,7 @@ impl Gen {
                 Ok(self.emit_call(&sig.ret, &sig.sym, &argl))
             }
             ExprKind::Member(name) => {
+                self.probe_want(callee.pos, want);
                 let target = peel_all(want).cloned();
                 match target {
                     Some(Type::Enum(k)) if self.enums[&k].iter().any(|v| v.name == *name) => {
@@ -2278,6 +2288,7 @@ impl Gen {
                     }
                 }
                 let b = self.expr(base, None)?;
+                self.note(callee.pos, format!("@recv {}", b.ty));
                 if name == "is_empty" && args.is_empty() {
                     if let Some(n) = self.len_of(&b) {
                         let t = self.tmp();

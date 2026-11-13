@@ -784,6 +784,25 @@ fn language_server() {
     let hover_let = recv();
     send(format!(r#"{{"jsonrpc":"2.0","id":4,"method":"textDocument/semanticTokens/full","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#));
     let tokens = recv();
+    // completion works on code that doesn't parse yet: `.` after a value, and a `.Variant` shorthand
+    let change = |version: u32, text: &str| {
+        let t = text.replace('\n', "\\n").replace('"', "\\\"");
+        format!(r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"{uri}","version":{version}}},"contentChanges":[{{"text":"{t}"}}]}}}}"#)
+    };
+    send(change(2, &src.replace("    println(nope)\n", "    let t: Shape = .\n")));
+    recv(); // diagnostics
+    send(format!(r#"{{"jsonrpc":"2.0","id":6,"method":"textDocument/completion","params":{{"textDocument":{{"uri":"{uri}"}},"position":{{"line":10,"character":20}}}}}}"#));
+    let variants = recv();
+    send(change(3, &src.replace("    println(nope)\n", "    s.\n")));
+    recv();
+    send(format!(r#"{{"jsonrpc":"2.0","id":7,"method":"textDocument/completion","params":{{"textDocument":{{"uri":"{uri}"}},"position":{{"line":10,"character":6}}}}}}"#));
+    let members = recv();
+    // a quick fix for a misspelled name
+    send(change(4, &src.replace("println(nope)", "println(aera(s))")));
+    let tdiags = recv();
+    let diag = tdiags.split(r#""diagnostics":["#).nth(1).unwrap_or("").trim_end_matches("]}}").to_string();
+    send(format!(r#"{{"jsonrpc":"2.0","id":8,"method":"textDocument/codeAction","params":{{"textDocument":{{"uri":"{uri}"}},"range":{{"start":{{"line":10,"character":0}},"end":{{"line":10,"character":0}}}},"context":{{"diagnostics":[{diag}]}}}}}}"#));
+    let fixes = recv();
     send(r#"{"jsonrpc":"2.0","id":5,"method":"shutdown"}"#.into());
     recv();
     send(r#"{"jsonrpc":"2.0","method":"exit"}"#.into());
@@ -793,4 +812,7 @@ fn language_server() {
     assert!(hover.contains("fn area(s: Shape) -> float") && hover.contains("How big it is."), "{hover}");
     assert!(hover_let.contains("let s: Shape"), "{hover_let}");
     assert!(tokens.contains(r#""data":["#) && tokens.len() > 100, "{tokens}");
+    assert!(variants.contains(r#""label":"Circle""#) && variants.contains(r#""label":"Empty""#) && !variants.contains(r#""label":"area""#), "{variants}");
+    assert!(members.contains(r#""label":"match""#) && members.contains("match s {"), "{members}");
+    assert!(fixes.contains("Change to `area`"), "{fixes}");
 }

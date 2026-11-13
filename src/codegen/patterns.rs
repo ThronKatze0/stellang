@@ -189,6 +189,7 @@ impl Gen {
 
     pub(super) fn match_expr(&mut self, subject: &Expr, arms: &[Arm], want: Option<&Type>) -> R<Val> {
         let s = self.expr(subject, None)?;
+        self.note(subject.pos, format!("@match {}", s.ty));
         if matches!(s.ty, Type::Void) {
             return err(subject.pos, "this has no value to match on");
         }
