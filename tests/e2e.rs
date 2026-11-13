@@ -1518,7 +1518,7 @@ fn kernel_boots_stellaos() {
     let out = q.wait_with_output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
     assert_eq!(out.status.code(), Some(0), "{text}");
-    for want in ["StellaOS 0.2", "hi there\n", "1039  (0x40f)", "a.txt  (9 B)", "hello.st", "RAM      128.0 MiB", "unknown command: nope", "bye!"] {
+    for want in ["StellaOS 0.3", "hi there\n", "1039  (0x40f)", "a.txt  (9 B)", "hello.st", "RAM      128.0 MiB", "unknown command: nope", "bye!"] {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
 
@@ -1659,6 +1659,306 @@ fn stellaos_desktop() {
         "b",
     );
     assert!(text.contains("\nfrom the first boot\n"), "the file didn't survive the reboot:\n{text}");
+}
+
+/// StellaOS's network stack under attack. QEMU puts the kernel on a LAN with this test (a UDP
+/// socket carrying raw Ethernet frames); we are 10.0.2.66, its gateway, DNS server and web server,
+/// and also the attacker: a port scan, ARP poisoning, thousands of malformed frames, a ping flood,
+/// hostile DNS answers and TCP injection. Afterwards it must still work.
+#[test]
+fn stellaos_network() {
+    use std::io::{Read, Write};
+    use std::net::UdpSocket;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-riscv64");
+        return;
+    }
+    let dir = tmpdir("network");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let elf = dir.join("os.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(root.join("examples/stellaos/os.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+
+    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+    let ours = sock.local_addr().unwrap().port();
+    let qemu_port = UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port(); // a free port for QEMU's end
+    let mut q = Command::new("qemu-system-riscv64")
+        .args(["-machine", "virt", "-m", "256M", "-nographic", "-bios", "default"])
+        .args(["-global", "virtio-mmio.force-legacy=false", "-device", "virtio-rng-device", "-netdev"])
+        .arg(format!("dgram,id=d0,local.type=inet,local.host=127.0.0.1,local.port={qemu_port},remote.type=inet,remote.host=127.0.0.1,remote.port={ours}"))
+        .args(["-device", "virtio-net-device,netdev=d0", "-kernel"])
+        .arg(&elf)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = q.id();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(120));
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    });
+    let mut stdin = q.stdin.take().unwrap();
+    let mut stdout = q.stdout.take().unwrap();
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let sink = out.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            sink.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+    });
+    let text = || String::from_utf8_lossy(&out.lock().unwrap()).replace('\r', "");
+    let clear = || out.lock().unwrap().clear();
+
+    const GMAC: [u8; 6] = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+    const AMAC: [u8; 6] = [2, 0, 0, 0, 0, 0x66];
+    const GIP: [u8; 4] = [10, 0, 2, 15];
+    const AIP: [u8; 4] = [10, 0, 2, 66];
+    fn csum(b: &[u8]) -> u16 {
+        let mut s: u32 = 0;
+        for c in b.chunks(2) {
+            s += (c[0] as u32) << 8 | *c.get(1).unwrap_or(&0) as u32;
+        }
+        while s >> 16 != 0 {
+            s = (s & 0xffff) + (s >> 16);
+        }
+        !(s as u16)
+    }
+    fn eth(kind: u16, payload: &[u8], dst: [u8; 6], src: [u8; 6]) -> Vec<u8> {
+        [&dst[..], &src[..], &kind.to_be_bytes(), payload].concat()
+    }
+    fn ip(proto: u8, payload: &[u8], frag: u16, total: Option<u16>, ihl: u8) -> Vec<u8> {
+        let tot = total.unwrap_or(20 + payload.len() as u16);
+        let mut h = vec![0x40 | ihl, 0];
+        h.extend(tot.to_be_bytes());
+        h.extend([0x12, 0x34]);
+        h.extend(frag.to_be_bytes());
+        h.extend([64, proto, 0, 0]);
+        h.extend(AIP);
+        h.extend(GIP);
+        let c = csum(&h);
+        h[10..12].copy_from_slice(&c.to_be_bytes());
+        [h, payload.to_vec()].concat()
+    }
+    fn tcp(sport: u16, dport: u16, seq: u32, ack: u32, flags: u8, data: &[u8]) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend(sport.to_be_bytes());
+        h.extend(dport.to_be_bytes());
+        h.extend(seq.to_be_bytes());
+        h.extend(ack.to_be_bytes());
+        h.extend([0x50, flags, 0xff, 0xff, 0, 0, 0, 0]);
+        h.extend(data);
+        let pseudo = [&AIP[..], &GIP[..], &[0, 6], &(h.len() as u16).to_be_bytes()].concat();
+        let c = csum(&[pseudo, h.clone()].concat());
+        h[16..18].copy_from_slice(&c.to_be_bytes());
+        h
+    }
+    fn icmp(kind: u8, id: u16, seq: u16, data: &[u8]) -> Vec<u8> {
+        let mut b = vec![kind, 0, 0, 0];
+        b.extend(id.to_be_bytes());
+        b.extend(seq.to_be_bytes());
+        b.extend(data);
+        let c = csum(&b);
+        b[2..4].copy_from_slice(&c.to_be_bytes());
+        b
+    }
+    let to = format!("127.0.0.1:{qemu_port}");
+    let send = |f: &[u8]| {
+        sock.send_to(f, &to).unwrap();
+    };
+    let ip4 = |proto: u8, p: &[u8]| eth(0x800, &ip(proto, p, 0x4000, None, 5), GMAC, AMAC);
+
+    // our side of the LAN: answer ARP for 10.0.2.66, pings, DNS, HTTP (with attacks mixed in)
+    struct State {
+        honest_dns: bool,
+        frames: Vec<Vec<u8>>,
+        http_isn: u32,
+        http_done: bool,
+    }
+    let st = std::cell::RefCell::new(State { honest_dns: false, frames: vec![], http_isn: 0x1234_0000, http_done: false });
+    let serve = |f: &[u8]| {
+        if f.len() < 34 || f[6..12] != GMAC {
+            return;
+        }
+        st.borrow_mut().frames.push(f.to_vec());
+        if f[12..14] == [8, 6] && f[20..22] == [0, 1] && f[38..42] == AIP {
+            let arp = [&[0, 1, 8, 0, 6, 4, 0, 2][..], &AMAC, &AIP, &GMAC, &GIP].concat();
+            send(&eth(0x806, &arp, GMAC, AMAC));
+            return;
+        }
+        if f[12..14] != [8, 0] {
+            return;
+        }
+        let body = &f[34..];
+        match f[23] {
+            1 if body[0] == 8 => {
+                let id = u16::from_be_bytes([body[4], body[5]]);
+                let seq = u16::from_be_bytes([body[6], body[7]]);
+                send(&ip4(1, &icmp(0, id, seq, &body[8..])));
+            }
+            17 if body[2..4] == [0, 53] => {
+                let sport = [body[0], body[1]];
+                let qmsg = &body[8..];
+                let (id, question) = (&qmsg[..2], &qmsg[12..]);
+                let udp = |payload: Vec<u8>| {
+                    let mut u = vec![0, 53, sport[0], sport[1]];
+                    u.extend((8 + payload.len() as u16).to_be_bytes());
+                    u.extend([0, 0]);
+                    u.extend(payload);
+                    send(&ip4(17, &u));
+                };
+                let answer_a = [0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4];
+                if st.borrow().honest_dns {
+                    udp([id, &[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0], question, &answer_a, &AIP].concat());
+                } else {
+                    // a wrong id; a compression loop; an answer to another question
+                    udp([&[id[0] ^ 1, id[1]], &[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0][..], question, &answer_a, &[1, 2, 3, 4]].concat());
+                    udp([id, &[0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0], question, &[0xc0, 0x30, 0xc0, 0x2e, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]].concat());
+                    udp([id, &[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0], b"\x03bad\x07example\0\0\x01\0\x01", &answer_a, &[1, 2, 3, 4]].concat());
+                }
+            }
+            6 if body[2..4] == [0, 80] => {
+                let sport = u16::from_be_bytes([body[0], body[1]]);
+                let seq = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+                let flags = body[13];
+                let data = &body[(body[12] >> 4) as usize * 4..];
+                let s = st.borrow().http_isn;
+                let seg = |sq: u32, ak: u32, fl: u8, d: &[u8]| send(&ip4(6, &tcp(80, sport, sq, ak, fl, d)));
+                if flags & 2 != 0 {
+                    seg(s, seq + 1, 0x12, b"");
+                } else if !data.is_empty() && !st.borrow().http_done {
+                    st.borrow_mut().http_done = true;
+                    let next = seq + data.len() as u32;
+                    seg(s + 1 + 1000, next, 0x04, b""); // a reset inside the window: must be challenged, not obeyed
+                    seg(s + 1 + 5000, next, 0x18, b"EVIL DATA"); // out of order: dropped
+                    seg(s + 1, next, 0x02, b""); // a SYN on the open connection: challenged
+                    let page = b"<html>REAL PAGE</html>";
+                    let resp = [format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", page.len()).as_bytes(), page].concat();
+                    seg(s + 1, next, 0x19, &resp);
+                } else if flags & 1 != 0 {
+                    seg(s + 2 + 22 + 60, seq + 1, 0x10, b"");
+                }
+            }
+            _ => {}
+        }
+    };
+    let pump = |d: Duration| {
+        let end = Instant::now() + d;
+        let mut buf = [0u8; 2048];
+        while Instant::now() < end {
+            if let Ok(n) = sock.recv(&mut buf) {
+                serve(&buf[..n]);
+            }
+        }
+    };
+    let mut sh = |cmd: &str, wait: u64| {
+        stdin.write_all(format!("{cmd}\r").as_bytes()).unwrap();
+        stdin.flush().unwrap();
+        pump(Duration::from_millis(wait));
+    };
+    let guest_ip = |st: &std::cell::RefCell<State>| st.borrow().frames.iter().filter(|f| f[12..14] == [8, 0]).count();
+
+    pump(Duration::from_millis(2500));
+    sh("ifconfig set 10.0.2.15/24 10.0.2.66", 300);
+    sh("dns 10.0.2.66", 300);
+    // 1. stealth: pings, a SYN scan of 300 ports and UDP to closed ports get no answer at all
+    st.borrow_mut().frames.clear();
+    for i in 0..5 {
+        send(&ip4(1, &icmp(8, 77, i, b"hello")));
+    }
+    for port in 1..=300 {
+        send(&ip4(6, &tcp(40000, port, 0xabcd_0000 + port as u32, 0, 0x02, b"")));
+    }
+    for port in 1..200u16 {
+        send(&ip4(17, &[&[0x13, 0x88][..], &port.to_be_bytes(), &[0, 12, 0, 0], b"hihi"].concat()));
+    }
+    pump(Duration::from_millis(2000));
+    assert_eq!(guest_ip(&st), 0, "something answered the scan:\n{}", text());
+    // 2. an unasked ARP answer claiming 10.0.2.66 is elsewhere must not poison the cache
+    sh("ping -c 1 10.0.2.66", 1500);
+    let evil = [2, 0, 0, 0, 0, 0xee];
+    for _ in 0..5 {
+        send(&eth(0x806, &[&[0, 1, 8, 0, 6, 4, 0, 2][..], &evil, &AIP, &GMAC, &GIP].concat(), GMAC, evil));
+    }
+    pump(Duration::from_millis(300));
+    clear();
+    sh("arp", 500);
+    assert!(text().contains("02:00:00:00:00:66") && !text().contains("02:00:00:00:00:ee"), "ARP cache poisoned:\n{}", text());
+    // 3. 3000 malformed frames: lying lengths, fragments, garbage of every kind
+    let mut seed: u32 = 12345;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    for i in 0..3000 {
+        let len = (rnd() % 300) as usize;
+        let junk: Vec<u8> = (0..len).map(|_| rnd() as u8).collect();
+        let dst = if rnd() % 2 == 0 { GMAC } else { [0xff; 6] };
+        let f = match rnd() % 4 {
+            0 => eth(0x806, &junk, dst, AMAC),
+            1 => eth(rnd() as u16, &junk, dst, AMAC),
+            _ => {
+                let proto = [1u8, 6, 17, 2, 255][(rnd() % 5) as usize];
+                let total = [None, None, Some(0), Some(19), Some(60000), Some(21)][(rnd() % 6) as usize];
+                let ihl = [5u8, 5, 5, 0, 15, 6][(rnd() % 6) as usize];
+                let frag = [0x4000u16, 0x2000, 0x0010, 0][(rnd() % 4) as usize];
+                eth(0x800, &ip(proto, &junk, frag, total, ihl), dst, AMAC)
+            }
+        };
+        send(&f);
+        if i % 200 == 0 {
+            pump(Duration::from_millis(10));
+        }
+    }
+    pump(Duration::from_millis(1000));
+    clear();
+    sh("uname", 500);
+    assert!(text().contains("StellaOS"), "the kernel didn't survive malformed frames:\n{}", text());
+    // 4. a ping flood, with answering on: rate-limited
+    sh("firewall ping on", 300);
+    st.borrow_mut().frames.clear();
+    for i in 0..300 {
+        send(&ip4(1, &icmp(8, 99, i, b"flood")));
+    }
+    pump(Duration::from_millis(2500));
+    let replies = st.borrow().frames.iter().filter(|f| f[12..14] == [8, 0] && f[23] == 1 && f[34] == 0).count();
+    assert!(replies > 0 && replies <= 45, "{replies} ping replies");
+    sh("firewall ping off", 300);
+    // 5. hostile DNS answers are all refused; an honest one is taken
+    clear();
+    sh("host evil.example", 5500);
+    // (the looping answer is taken apart safely and yields nothing: "no IPv4 address", or no answer at all)
+    assert!(!text().contains("1.2.3.4") && (text().contains("no IPv4 address") || text().contains("no answer")), "{}", text());
+    st.borrow_mut().honest_dns = true;
+    clear();
+    sh("host good.example", 1500);
+    assert!(text().contains("good.example has address 10.0.2.66"), "{}", text());
+    // 6. TCP: a reset inside the window, stray data and a SYN while fetching don't break the connection
+    clear();
+    sh("fetch good.example/", 4000);
+    assert!(text().contains("REAL PAGE") && !text().contains("EVIL") && !text().contains("reset"), "{}", text());
+    // 7. still well, and the log says what happened
+    clear();
+    sh("ping -c 2 10.0.2.66", 3000);
+    assert!(text().contains("2 sent, 2 received"), "{}", text());
+    clear();
+    sh("firewall log", 500);
+    sh("shutdown", 1000);
+    let status = q.wait().unwrap();
+    let t = text();
+    assert_eq!(status.code(), Some(0), "{t}");
+    for want in ["refused an IP fragment", "challenged, not obeyed", "doesn't match our question"] {
+        assert!(t.contains(want), "missing {want:?} in the security log:\n{t}");
+    }
 }
 
 /// A field default that builds another struct with defaults (from another module) makes that

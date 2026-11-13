@@ -274,6 +274,14 @@ int64_t st_k_csum(int64_t addr, int64_t n, int64_t sum) {
     while (s >> 16) s = (s & 0xffff) + (s >> 16);
     return (int64_t)s;
 }
+// Scanning long text (web pages) without measuring it again on every call: the callers (html.st's
+// Src) know the length and check positions against it.
+int64_t st_k_byte(const char *s, int64_t i) { return (unsigned char)s[i]; }
+int64_t st_k_find_at(const char *s, const char *sub, int64_t from) {
+    const char *p = strstr(s + from, sub);
+    return p ? p - s : -1;
+}
+char *st_k_substr(const char *s, int64_t from, int64_t to) { return mkstr(s + from, (size_t)(to - from)); }
 // The clock in its finest steps (for timing jitter as a little entropy).
 int64_t st_k_cycles(void) { return (int64_t)rdtime(); }
 int64_t st_k_pages_out(void) { return (int64_t)pages_out; }

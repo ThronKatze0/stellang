@@ -27,7 +27,7 @@ FACES = [
 ]
 
 # Latin-1 plus a few symbols that UIs and games like
-EXTRA = "✦★☆•…–—‘’“”€←↑→↓↵✓✔✕✖●○■□▲▶▼◀♥♦♣♠⌫☰▤≡✹⚑✎◉⚙♪⌂✉☺"
+EXTRA = "✦★☆•…–—‘’“”€←↑→↓↵✓✔✕✖●○■□▲▶▼◀♥♦♣♠⌫☰▤≡✹⚑✎◉⚙♪⌂✉☺◎↻🔒"
 CODES = list(range(32, 127)) + list(range(160, 256)) + sorted(ord(c) for c in EXTRA)
 FALLBACK = DEJAVU.format("")
 

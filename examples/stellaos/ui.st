@@ -170,6 +170,7 @@ struct Ui {
     hover: str = "",
     active: str = "",
     render: bool = true,
+    restyle: bool = true,
     relayout: bool = true,
     repaint: bool = true,
     last_click: int = 0,
@@ -177,6 +178,12 @@ struct Ui {
     mx: int = -1,
     my: int = -1,
     blink: int = 0,
+    // pages shown inside the app (the browser): element trees put into `data-slot` elements, styled
+    // only by their own sheet, with links and forms handed to the app
+    slots: {str: El} = {},
+    page_sheet: [Rule] = [],
+    links: [fn(El)] = [],
+    forms: [fn(El, str)] = [],
 
     fn tick(self, t: wm.Tick) -> bool {
         if t.signals { self.render = true }
@@ -203,7 +210,9 @@ struct Ui {
             if html != self.html {
                 self.html = html
                 self.root = parse(html)
+                self.fill_slots(self.root)
                 self.sync_fields(self.root)
+                self.restyle = true
                 self.relayout = true
             }
         }
@@ -214,8 +223,12 @@ struct Ui {
         }
         if self.relayout {
             self.relayout = false
-            style_tree(self.root, Style {}, self)
-            self.root.st.scroll = true
+            if self.restyle {
+                // styles depend only on the tree: worked out again only when it changes
+                self.restyle = false
+                style_tree(self.root, Style {}, self, false)
+                self.root.st.scroll = true
+            }
             clear_pref(self.root)
             layout(self.root, 0, 0, self.width, self.height, self)
             self.root.h = self.height
@@ -226,6 +239,25 @@ struct Ui {
         s.clear(if self.root.st.bg >= 0 { self.root.st.bg } else { 0xffffff })
         let p = Painter { s, ui: self }
         p.el(self.root, 0, 0, [0, 0, s.width, s.height])
+    }
+
+    // Show `page` in the element with data-slot="name".
+    fn set_slot(self, name: str, page: El) {
+        self.slots[name] = page
+        self.html = ""            // re-read the app's HTML, which puts the page in
+        self.render = true
+    }
+
+    fn fill_slots(self, e: El) {
+        if let name = e.attrs.get("data-slot") {
+            if let page = self.slots.get(name) {
+                page.parent = some(e)
+                e.kids = [page]
+                repath(page, "${e.path}.0")
+                return
+            }
+        }
+        for k in e.kids { self.fill_slots(k) }
     }
 
     // fields keep what's typed, unless the app gives them a new value
@@ -364,7 +396,7 @@ struct Ui {
         self.repaint = true
         if changed {
             f.text = cs.join("")
-            self.relayout = true
+            if multi { self.relayout = true }   // a one-line field keeps its size: no new layout
             self.fire(e, "input", f.text)
         }
         return true
@@ -471,6 +503,19 @@ struct Ui {
         }
         if !self.fire(e, "click", "") {
             if e.tag == "button" && e.attr("type") != "button" { self.submit_from(e) }
+            // a link in a page
+            var cur: El? = some(e)
+            while true {
+                if let c = cur {
+                    if c.tag == "a" && c.has("href") {
+                        for f in self.links { f(c) }
+                        break
+                    }
+                    cur = c.parent
+                } else {
+                    break
+                }
+            }
         } else if e.tag == "button" && e.attr("type") == "submit" {
             self.submit_from(e)
         }
@@ -484,7 +529,9 @@ struct Ui {
                 if c.tag == "form" {
                     var parts: [str] = []
                     self.form_fields(c, parts)
-                    self.fire(c, "submit", parts.join("&"))
+                    if !self.fire(c, "submit", parts.join("&")) {
+                        for f in self.forms { f(c, parts.join("&")) }
+                    }
                     return
                 }
                 cur = c.parent
@@ -585,7 +632,15 @@ fn app(view: fn() -> Node) -> wm.App {
 // The same, with a stylesheet for its classes: "button.on { background: #6c5ce7 } .muted { color: gray }".
 // Selectors: tags, .classes, #ids, combined (button.on) and nested (nav .item); later rules win.
 fn styled(view: fn() -> Node, css: str) -> wm.App {
-    let u = Ui { ctx: st_k_ui_new(), view, sheet: parse_sheet(css) }
+    return window_app(make(view, css))
+}
+
+// The Ui itself (for apps that reach into it, like the browser putting pages into slots).
+fn make(view: fn() -> Node, css: str) -> Ui {
+    return Ui { ctx: st_k_ui_new(), view, sheet: parse_sheet(css) }
+}
+
+fn window_app(u: Ui) -> wm.App {
     return wm.App {
         tick: (t: wm.Tick) => u.tick(t),
         paint: (s: gfx.Surface) => u.paint(s),
@@ -773,12 +828,13 @@ fn hex2(n: int) -> str {
 
 // ---- style ----
 
-fn style_tree(e: El, parent: Style, u: Ui) {
+fn style_tree(e: El, parent: Style, u: Ui, page: bool) {
     let st = Style { color: parent.color, size: parent.size, bold: parent.bold, mono: parent.mono,
         text_align: parent.text_align, pre: parent.pre, nowrap: parent.nowrap, underline: parent.underline && e.tag == "" }
     defaults(e, st)
     if e.tag != "" {
-        for r in u.sheet {
+        let rules = if page { u.page_sheet } else { u.sheet }
+        for r in rules {
             if matches(e, r.chain, r.chain.len() - 1) { apply_css(st, r.css) }
         }
     }
@@ -789,7 +845,8 @@ fn style_tree(e: El, parent: Style, u: Ui) {
     }
     e.st = st
     e.pref = -1
-    for k in e.kids { style_tree(k, st, u) }
+    let inside = page || e.has("data-slot")
+    for k in e.kids { style_tree(k, st, u, inside) }
 }
 
 fn defaults(e: El, st: Style) {
@@ -817,7 +874,7 @@ fn defaults(e: El, st: Style) {
             st.margin = [0, 0, 6, 0]
         },
         "p" => { st.margin = [0, 0, 8, 0] },
-        "b" | "strong" | "th" => { st.bold = true },
+        "b" | "strong" => { st.bold = true },
         "small" => { st.size = 12 },
         "code" | "pre" | "kbd" => {
             st.mono = true
@@ -890,6 +947,7 @@ fn defaults(e: El, st: Style) {
             st.row = true
         },
         "td" | "th" => {
+            st.bold = st.bold || t == "th"
             st.grow = 1
             st.pad = [4, 6, 4, 6]
         },
@@ -1475,12 +1533,13 @@ fn gather(e: El, st: Style, out: [Word], u: Ui) {
                     out.push(Word { text: l, w: gfx.text_width(l, face), h: lh, face, color: k.st.color, el: owner, bg: inline_bg(owner, e) })
                 }
             } else {
-                let lead = k.text.starts_with(" ") || k.text.starts_with("\n")
+                let text = k.text.replace("\n", " ").replace("\t", " ").replace("\r", " ")
+                let lead = text.starts_with(" ")
                 if lead && !out.is_empty() { out[out.len() - 1].space = max(out[out.len() - 1].space, space) }
-                let words = k.text.replace("\n", " ").split(" ").filter(w => w != "")
+                let words = text.split(" ").filter(w => w != "")
                 for i, wd in words {
                     let last = i + 1 == words.len()
-                    let trail = !last || k.text.ends_with(" ")
+                    let trail = !last || text.ends_with(" ")
                     out.push(Word { text: wd, w: gfx.text_width(wd, face), h: lh, face, color: k.st.color, el: owner,
                         space: if trail { space } else { 0 }, underline: k.st.underline || owner.st.underline, bg: inline_bg(owner, e) })
                 }
@@ -1494,6 +1553,20 @@ fn gather(e: El, st: Style, out: [Word], u: Ui) {
 }
 
 // an inline element's own background (code, mark), not the block's
+// the background showing through a transparent element
+fn backdrop(e: El) -> int {
+    var cur = e.parent
+    while true {
+        if let c = cur {
+            if c.st.bg >= 0 { return c.st.bg }
+            cur = c.parent
+        } else {
+            break
+        }
+    }
+    return 0xffffff
+}
+
 fn inline_bg(owner: El, block: El) -> int {
     if owner.path == block.path { return -1 }
     return owner.st.bg
@@ -1531,7 +1604,8 @@ struct Painter {
         if any_border && st.radius > 0 && bw[0] == bw[1] && bw[1] == bw[2] && bw[2] == bw[3] {
             let k = bw[0]
             s.round(x, y, e.w, e.h, st.radius, bc)
-            if bg >= 0 { s.round(x + k, y + k, e.w - 2 * k, e.h - 2 * k, max(st.radius - k, 0), bg) }
+            // the inside: its background, or (transparent) what's behind it
+            s.round(x + k, y + k, e.w - 2 * k, e.h - 2 * k, max(st.radius - k, 0), if bg >= 0 { bg } else { backdrop(e) })
             if focused && e.is_field() {
                 s.round_shade(x - 2, y - 2, e.w + 4, e.h + 4, st.radius + 2, ACCENT, 50)
                 s.round(x + 1, y + 1, e.w - 2, e.h - 2, max(st.radius - 1, 0), bg)
@@ -1705,6 +1779,14 @@ fn hit_in(e: El, x: int, y: int, u: Ui) -> El? {
         if x >= w.x && x < w.x + w.w + w.space && y + sy >= w.y && y + sy < w.y + w.h { return some(w.el) }
     }
     return some(e)
+}
+
+fn repath(e: El, path: str) {
+    e.path = path
+    for i, k in e.kids {
+        k.parent = some(e)
+        repath(k, "${path}.${i}")
+    }
 }
 
 fn find_path(e: El, path: str) -> El? {

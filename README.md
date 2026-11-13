@@ -470,7 +470,7 @@ println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"p
 the host OS: `import kernel` (and `gfx`) instead of `http`, `net` and `fs`.
 
 [`examples/stellaos`](examples/stellaos) is an operating system written that way: a desktop with windows, apps and
-games, a shell, and files that are kept on a disk.
+games, a shell, files that are kept on a disk, and a network stack with a web browser.
 
 <p align="center"><img src=".github/stellaos.png" alt="the StellaOS desktop: Calculator, Snake and the Terminal" width="720"></p>
 
@@ -489,11 +489,34 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
   browser sends. Files, Notes, Calculator, System Monitor and Mines are written like that.
 - **Games** draw directly (`gfx`: fast rectangles, anti-aliased circles and rounded shapes, lines, sprites and
   scaled pixel art, text in Inter and DejaVu Sans Mono) and get every frame and key: Snake, Bricks, Paint.
+- **Browser** (`browser.st`, `html.st`): an address bar, back/forward, links and GET forms; real-world HTML
+  (unclosed tags, entities, page stylesheets) laid out by the same toolkit. It never runs code from a page
+  (scripts, `on*` handlers and `javascript:` links are stripped, and the status bar says what was removed), pages
+  can't reach the browser's controls or the machine's files, and pages are capped at 4 MiB, 8,000 elements and
+  40 levels deep. It speaks http only, so it shows **Not secure**: HTTPS (TLS) is the next big piece.
+<p align="center"><img src=".github/stellaos-browser.png" alt="the StellaOS browser showing a page, the Terminal behind it after ping, host and firewall" width="720"></p>
+
 - **Terminal**: the shell in a window (an ANSI terminal: colors, line editing, scrollback).
 - **Shell**: `ls cd mkdir cat write edit rm wc`, `every 500 uptime` / `jobs` / `kill`, `calc`, `mem`, `df`,
-  `date`, `open <app>`, `windows`, `keyboard us|de`.
+  `date`, `open <app>`, `windows`, `keyboard us|de`, and for the network `ifconfig`, `ping`, `host`, `fetch`
+  (an HTTP GET; `-o file` saves), `browse`, `arp`, `netstat`, `firewall`, `dns`.
+- **Network** (`nic.st`, `inet.st`, `tcp.st`, `www.st`): a virtio-net driver, then Ethernet, ARP, IPv4, ICMP,
+  UDP, DHCP, DNS, TCP and HTTP/1.1, all in stellang. `stellang boot` plugs in a network card on QEMU's user
+  network (`--no-net` for none); nothing outside can connect in. Built to be hard to attack:
+  - every byte from the wire is read through a bounds-checked view (`bytes.st`), so a packet that lies about
+    its lengths is dropped, not followed off the end of a buffer; checksums are checked, IP fragments refused
+  - nothing listens, and closed ports don't answer at all (a port scan sees nothing); pings go unanswered
+    unless `firewall ping on`, and then at most 20 a second
+  - ARP is learned only from answers to our own questions (no cache poisoning); DNS answers must match a random
+    query id, a random source port and the question; compressed names can't loop
+  - TCP: random initial sequence numbers and ports from a ChaCha20 generator seeded by the host (virtio-rng);
+    a reset or SYN that isn't exactly in sequence gets a challenge ACK, not obeyed (RFC 5961); data in order
+    only, 4 MiB per connection
+  - `firewall log` keeps what was refused. A test (`stellaos_network`) attacks the kernel on a LAN of its own:
+    a port scan, ARP poisoning, 3,000 malformed frames, a ping flood, hostile DNS answers and TCP injection.
 - **Drivers, in stellang**: the display (QEMU's ramfb, through fw_cfg DMA), virtio (the transport and its
-  queues), keyboard and mouse (virtio-input; US and German layouts), and the disk (virtio-blk). The file system
+  queues), keyboard and mouse (virtio-input; US and German layouts), the disk (virtio-blk), the network card
+  (virtio-net) and the host's random numbers (virtio-rng). The file system
   is saved to the disk a moment after each change and loaded at boot; `stellang boot` keeps the disk image in
   `~/.cache/stellang/` (`--disk file.img` to choose one, `--no-disk` for none).
 
@@ -528,8 +551,8 @@ fn main() {
   tree, the GC's pages, and the pixel loops of `gfx`. Interrupts never run stellang code: they queue and count,
   and the program picks them up from its loop, so the collector only ever runs in ordinary code. The C library
   is `src/runtime_klibc.c`; the fonts are pre-rendered glyphs (`tools/genfont.py`); nothing else is linked.
-- Next: virtio-net and a TCP/IP stack, then page tables and user mode (processes, system calls) so apps are
-  protected from each other, and more harts.
+- Next: TLS for HTTPS, then page tables and user mode (processes, system calls) so apps are protected from
+  each other, and more harts.
 
 ## Editor support
 

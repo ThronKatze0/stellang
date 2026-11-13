@@ -12,6 +12,8 @@ import kernel
 import ramfs
 import calc
 import wm
+import web
+import ui
 import input
 import term
 import files
@@ -27,6 +29,7 @@ import rng
 import inet
 import netcmd
 import tcp
+import browser
 
 const VERSION = "0.3"
 
@@ -199,6 +202,11 @@ struct Shell {
             "arp" => netcmd.arp(self.network()?),
             "firewall" => netcmd.firewall(self.network()?, argv)?,
             "dns" => netcmd.dns(self.network()?, argv)?,
+            "browse" => {
+                self.desktop()?
+                self.sockets()?
+                self.browse(argv.get(0) ?? "")
+            },
             "netstat" => netcmd.netstat(self.sockets()?),
             "fetch" | "curl" | "wget" => netcmd.fetch(self.sockets()?, self.fs, self.cwd, argv)?,
             "panic" => panic("you asked for it"),
@@ -259,6 +267,7 @@ struct Shell {
             wm.Launcher { name: "Files", icon: "▤", color: 0x0984e3, open: () => files.open(d, fs, edit) },
             wm.Launcher { name: "Notes", icon: "✎", color: 0xf0932b, open: () => notes.open(d, fs, "") },
             wm.Launcher { name: "Calculator", icon: "=", color: 0x6c5ce7, open: () => calculator.open(d) },
+            wm.Launcher { name: "Browser", icon: "◎", color: 0x0984e3, open: () => self.browse("") },
             wm.Launcher { name: "Monitor", icon: "◉", color: 0x00b894, open: () => monitor.open(d) },
             wm.Launcher { name: "Snake", icon: "S", color: 0x10ac84, open: () => snake.open(d) },
             wm.Launcher { name: "Bricks", icon: "B", color: 0xff9f43, open: () => breakout.open(d) },
@@ -272,6 +281,16 @@ struct Shell {
         }
         d.hurt_all()
         kernel.every(16, () => d.frame())
+    }
+
+    fn browse(self, url: str) {
+        if let d = self.gui {
+            if let t = self.tcp {
+                browser.open(d, t, url)
+            } else {
+                let w = d.open("Browser", "◎", 0x0984e3, 360, 120, ui.app(() => <p style="padding: 20px">"No network card (boot without --no-net)."</p>))
+            }
+        }
     }
 
     fn open_terminal(self, d: wm.Desktop) {
@@ -312,7 +331,7 @@ fn help() {
     println("jobs      every <ms> <command>  jobs  kill <job>  sleep <ms>")
     println("tools     echo <text>  calc <expr>  peek <address>  date  panic")
     println("network   ifconfig [set <ip>/<bits> [gw] | dhcp]  ping [-c n] <host>  host <name>  arp  firewall [ping on|off|log]")
-    println("          fetch [-i] <url> [-o file]  netstat  dns [server]")
+    println("          fetch [-i] <url> [-o file]  browse [url]  netstat  dns [server]")
     println("desktop   desktop  apps  open <app>  windows  keyboard us|de")
     println("keys      arrows edit and recall history, Ctrl-U clears the line, Ctrl-D exits")
 }
