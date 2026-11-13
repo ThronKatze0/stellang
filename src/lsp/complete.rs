@@ -403,8 +403,128 @@ enum Ctx {
     Shorthand { dot: Pos },
     StructField { path: Vec<String>, used: Vec<String> },
     MatchArm { subject: Pos },
+    Tag,                                    // `<|`: an element or component name
+    CloseTag(String),                       // `</|`
+    Attr { tag: String, used: Vec<String> }, // `<div |` / `<Card title="x" |`
     Plain,
 }
+
+/// Can a `<` after this token start a JSX tag (rather than compare)?
+fn tag_can_start(prev: Option<&Tok>) -> bool {
+    !matches!(prev, Some(Tok::Ident(_) | Tok::RParen | Tok::RBrack | Tok::Int(_) | Tok::Float(_)))
+}
+
+/// Is the cursor in JSX: after `<`, after `</`, or among a tag's attributes?
+fn jsx_context(toks: &[&Token]) -> Option<Ctx> {
+    let n = toks.len();
+    let tok = |i: usize| &toks[i].tok;
+    let last = n.checked_sub(1).map(tok)?;
+    if *last == Tok::Lt && tag_can_start(n.checked_sub(2).map(tok)) {
+        return Some(Ctx::Tag);
+    }
+    if *last == Tok::Slash && n >= 2 && *tok(n - 2) == Tok::Lt {
+        // the innermost tag still open
+        let mut open: Vec<String> = vec![];
+        let mut i = 0;
+        while i + 1 < n - 2 {
+            if *tok(i) == Tok::Lt && tag_can_start(i.checked_sub(1).map(tok)) {
+                let closing = *tok(i + 1) == Tok::Slash;
+                let at = i + 1 + closing as usize;
+                if let Some(Tok::Ident(name)) = toks.get(at).map(|t| &t.tok) {
+                    let mut name = name.clone();
+                    let mut j = at + 1;
+                    while j + 1 < n && matches!(tok(j), Tok::Dot | Tok::Minus) && toks[j - 1].end == toks[j].start {
+                        if let Tok::Ident(x) = tok(j + 1) {
+                            name.push(if *tok(j) == Tok::Dot { '.' } else { '-' });
+                            name += x;
+                        }
+                        j += 2;
+                    }
+                    // a tag that closes itself (`/>`) never opens
+                    let mut depth = 0;
+                    let mut k = j;
+                    let mut selfclose = false;
+                    while k < n {
+                        match tok(k) {
+                            Tok::LBrace => depth += 1,
+                            Tok::RBrace => depth -= 1,
+                            Tok::Slash if depth == 0 && toks.get(k + 1).is_some_and(|t| t.tok == Tok::Gt) => {
+                                selfclose = true;
+                                break;
+                            }
+                            Tok::Gt if depth == 0 => break,
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                    if closing {
+                        if let Some(p) = open.iter().rposition(|o| *o == name) {
+                            open.truncate(p);
+                        }
+                    } else if !selfclose {
+                        open.push(name);
+                    }
+                    i = k;
+                }
+            }
+            i += 1;
+        }
+        return Some(Ctx::CloseTag(open.pop().unwrap_or_default()));
+    }
+    // among the attributes of an unfinished tag head?
+    let mut depth = 0;
+    let mut used = vec![];
+    let mut i = n;
+    while i > 0 {
+        i -= 1;
+        match tok(i) {
+            Tok::RBrace => depth += 1,
+            Tok::LBrace if depth > 0 => depth -= 1,
+            Tok::LBrace => return None, // inside an attribute's {value}
+            _ if depth > 0 => {}
+            Tok::Gt => return None,
+            Tok::Ident(a) if *tok(i.saturating_sub(1)) != Tok::Lt => used.push(a.clone()),
+            Tok::Ident(_) | Tok::Dot | Tok::Minus | Tok::Newline | Tok::Assign | Tok::Str(_) | Tok::Interp(_) => {}
+            Tok::Lt if tag_can_start(i.checked_sub(1).map(tok)) => {
+                let Some(Tok::Ident(first)) = toks.get(i + 1).map(|t| &t.tok) else { return None };
+                let mut name = first.clone();
+                let mut j = i + 2;
+                while j + 1 < n && matches!(tok(j), Tok::Dot | Tok::Minus) && toks[j - 1].end == toks[j].start {
+                    if let Tok::Ident(x) = tok(j + 1) {
+                        name.push(if *tok(j) == Tok::Dot { '.' } else { '-' });
+                        name += x;
+                    }
+                    j += 2;
+                }
+                if j > n || (j == n && toks[n - 1].end == toks[n - 1].start) {
+                    return None;
+                }
+                used.retain(|u| !name.split(['.', '-']).any(|p| p == u));
+                return (j <= n).then_some(Ctx::Attr { tag: name, used });
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+const HTML_TAGS: &[&str] = &[
+    "div", "span", "p", "a", "button", "ul", "ol", "li", "h1", "h2", "h3", "h4", "section", "main", "header", "footer", "nav", "article",
+    "aside", "form", "label", "select", "option", "textarea", "table", "thead", "tbody", "tr", "th", "td", "strong", "em", "b", "i",
+    "code", "pre", "small", "img", "input", "br", "hr", "html", "head", "body", "title", "meta", "link", "script", "style",
+];
+const VOID_TAGS: &[&str] = &["input", "br", "hr", "img", "meta", "link"];
+const HTML_ATTRS: &[(&str, &str)] = &[
+    ("class", "CSS classes"), ("id", "element id"), ("style", "inline CSS"), ("key", "identity in a list (keeps the element when the list changes)"),
+    ("href", "link target"), ("src", "source URL"), ("alt", "text instead of the image"), ("type", "input / button type"),
+    ("value", "the field's value"), ("placeholder", "hint text"), ("name", "form field name"), ("title", "tooltip"),
+    ("disabled", "bool"), ("checked", "bool"), ("autofocus", "bool"), ("for", "the input a label is for"), ("rows", "textarea rows"),
+];
+const EVENTS: &[(&str, &str, &str)] = &[
+    ("onclick", "() => $0", "fn()"), ("oninput", "v => $0", "fn(str): the field's text"), ("onchange", "v => $0", "fn(str): the new value (\"true\"/\"false\" for a checkbox)"),
+    ("onsubmit", "form => $0", "fn(str): the fields as a=1&b=2"), ("onkeydown", "key => $0", "fn(str): the key"), ("onkeyup", "key => $0", "fn(str): the key"),
+    ("onfocus", "() => $0", "fn()"), ("onblur", "() => $0", "fn()"), ("ondblclick", "() => $0", "fn()"),
+];
 
 fn context(toks: &[Token], word_start: Pos) -> Ctx {
     let toks: Vec<&Token> = toks.iter().filter(|t| t.tok != Tok::Eof && (t.pos.line, t.pos.col) < (word_start.line, word_start.col)).collect();
@@ -413,6 +533,9 @@ fn context(toks: &[Token], word_start: Pos) -> Ctx {
     // `import x`
     if toks.iter().rev().take_while(on_line).count() == 1 && last == Some(&Tok::Import) {
         return Ctx::Import;
+    }
+    if let Some(c) = jsx_context(&toks) {
+        return c;
     }
     // the bracket the cursor is in
     let mut stack: Vec<usize> = vec![];
@@ -823,6 +946,65 @@ impl Server {
                 let mut it = item("_", K_KEYWORD, "anything else", 2);
                 it.snippet = Some("_ => $0".into());
                 items.push(it);
+            }
+            Ctx::Tag => {
+                for d in decls.iter().filter(|d| d.kind == "fn" && d.name.starts_with(|c: char| c.is_ascii_uppercase()) && params_of(&d.sig).1 == "Node" && (d.module.is_empty() || imported.contains(&d.module))) {
+                    let name = if d.module.is_empty() { d.name.clone() } else { format!("{}.{}", d.module, d.name) };
+                    let props = component_props(d, &model);
+                    let mut k = 0;
+                    let required: Vec<String> = props.iter().filter(|p| !p.2 && p.0 != "children").map(|p| {
+                        k += 1;
+                        if p.1 == "str" { format!("{}=\"${{{k}}}\"", p.0) } else { format!("{}={{${{{k}}}}}", p.0) }
+                    }).collect();
+                    let head = if required.is_empty() { name.clone() } else { format!("{name} {}", required.join(" ")) };
+                    let mut it = item(name.clone(), K_STRUCT, "component", if d.module.is_empty() { 0 } else { 1 });
+                    it.snippet = Some(if props.iter().any(|p| p.0 == "children") { format!("{head}>$0</{name}>") } else { format!("{head} />") });
+                    it.label_desc = Some("component".into());
+                    it.doc = format!("```stellang\n{}\n```\n{}", d.sig.trim_end_matches('{').trim(), d.doc);
+                    items.push(it);
+                }
+                for t in HTML_TAGS {
+                    let mut it = item(*t, K_KEYWORD, "HTML element", 2);
+                    it.snippet = Some(if VOID_TAGS.contains(t) { format!("{t} $0/>") } else { format!("{t}>$0</{t}>") });
+                    items.push(it);
+                }
+                let mut it = item("<>", K_SNIPPET, "fragment: several elements as one", 3);
+                it.snippet = Some(">$0</>".into());
+                it.filter = Some(prefix.clone());
+                items.push(it);
+            }
+            Ctx::CloseTag(name) => {
+                if !name.is_empty() {
+                    let mut it = item(name.clone(), K_KEYWORD, "close the tag", 0);
+                    it.snippet = Some(format!("{name}>"));
+                    items.push(it);
+                }
+            }
+            Ctx::Attr { tag, used } => {
+                let comp = tag.rsplit('.').next().is_some_and(|t| t.starts_with(|c: char| c.is_ascii_uppercase()));
+                if comp {
+                    let (module, name) = tag.rsplit_once('.').map_or((String::new(), tag.clone()), |(m, n)| (m.to_string(), n.to_string()));
+                    if let Some(d) = decls.iter().find(|d| d.kind == "fn" && d.name == name && d.module == module) {
+                        for (p, ty, optional) in component_props(d, &model).into_iter().filter(|p| !used.contains(&p.0) && p.0 != "children") {
+                            let mut it = item(p.clone(), K_FIELD, ty.clone(), if optional { 1 } else { 0 });
+                            it.snippet = Some(if ty == "str" { format!("{p}=\"$1\"") } else if ty.starts_with("fn(") { format!("{p}={{() => $1}}") } else { format!("{p}={{$1}}") });
+                            it.label_desc = Some(if optional { format!("{ty} (optional)") } else { ty });
+                            items.push(it);
+                        }
+                    }
+                } else {
+                    for (a, doc) in HTML_ATTRS.iter().filter(|a| !used.iter().any(|u| u == a.0)) {
+                        let mut it = item(*a, K_FIELD, *doc, 0);
+                        it.snippet = Some(if matches!(*a, "disabled" | "checked" | "autofocus") { format!("{a}={{$1}}") } else { format!("{a}=\"$1\"") });
+                        items.push(it);
+                    }
+                    for (e, snip, doc) in EVENTS.iter().filter(|e| !used.iter().any(|u| u == e.0)) {
+                        let mut it = item(*e, K_METHOD, *doc, 1);
+                        it.snippet = Some(format!("{e}={{{snip}}}"));
+                        it.label_desc = Some("event".into());
+                        items.push(it);
+                    }
+                }
             }
             Ctx::Plain => self.plain_items(path, &decls, &model, &notes, &imported, text, word_start, parens_follow, &mut items),
         }
@@ -1483,4 +1665,28 @@ fn bind_pattern(v: &str, fields: &[(String, String)], braces: bool, stops: Optio
     } else {
         format!(".{v}({})", names.join(", "))
     }
+}
+
+/// A component's props: (name, type, optional) from its parameters, or from the fields of its one
+/// props struct.
+fn component_props(d: &Decl, model: &Model) -> Vec<(String, String, bool)> {
+    let (params, _) = params_of(&d.sig);
+    let ps: Vec<(String, String)> = params
+        .iter()
+        .map(|p| {
+            let (n, t) = p.split_once(':').unwrap_or((p.as_str(), ""));
+            (n.trim().to_string(), t.trim().to_string())
+        })
+        .collect();
+    if let [(_, t)] = ps.as_slice() {
+        let (m, n) = t.rsplit_once('.').map_or((d.module.clone(), t.clone()), |(m, n)| (m.to_string(), n.to_string()));
+        let fields = model.struct_fields(&m, &n);
+        if !fields.is_empty() {
+            return fields;
+        }
+    }
+    ps.into_iter().map(|(n, t)| {
+        let opt = t.ends_with('?');
+        (n, t, opt)
+    }).collect()
 }

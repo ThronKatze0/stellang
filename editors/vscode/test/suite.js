@@ -261,8 +261,9 @@ exports.run = async () => {
       const x = await api.trees.model.getChildren();
       return x.some((i) => i.label === "Todo") && x;
     });
-    const todo = items.find((i) => i.label === "Todo");
-    const kids = (await api.trees.model.getChildren(todo)).map((i) => i.label);
+    // (examples/fullstack has a Todo of its own)
+    const kids = [];
+    for (const todo of items.filter((i) => i.label === "Todo")) kids.push(...(await api.trees.model.getChildren(todo)).map((i) => i.label));
     assert.ok(kids.includes("title") && kids.includes("priority"), kids.join(","));
     assert.ok(items.some((i) => i.label === "Priority"));
   });
@@ -290,12 +291,50 @@ exports.run = async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "stellang-templates-"));
     for (const id of api.templates) {
       api.createProject(id, path.join(dir, id), `t-${id}`);
-      const main = path.join(dir, id, "main.st");
-      const done = new Promise((r) => vscode.tasks.onDidEndTaskProcess((e) => r(e.exitCode)));
-      await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(main));
-      await vscode.commands.executeCommand("stellang.check");
-      assert.strictEqual(await done, 0, `${id} doesn't type-check`);
+      for (const f of id === "fullstack" ? ["server.st", "client.st"] : ["main.st"]) {
+        const main = path.join(dir, id, f);
+        const done = new Promise((r) => vscode.tasks.onDidEndTaskProcess((e) => r(e.exitCode)));
+        await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(main));
+        await vscode.commands.executeCommand("stellang.check");
+        assert.strictEqual(await done, 0, `${id}/${f} doesn't type-check`);
+      }
     }
+  });
+  await check("JSX: completion offers components, then their props", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "stellang-jsx-"));
+    const file = path.join(dir, "ui.st");
+    fs.writeFileSync(file, 'import web\n\nfn Badge(count: int, label: str?) -> Node {\n    return <b title={label}>{count}</b>\n}\n\nfn App() -> Node {\n    return <main>\n    </main>\n}\n');
+    const d = await vscode.workspace.openTextDocument(file);
+    const ed = await vscode.window.showTextDocument(d);
+    await until("diagnostics settle", async () => (await vscode.commands.executeCommand("vscode.executeHoverProvider", d.uri, new vscode.Position(2, 4))).length);
+    await ed.edit((e) => e.insert(new vscode.Position(8, 0), "        <\n"));
+    const tags = await until("tag completion", async () => {
+      const r = await vscode.commands.executeCommand("vscode.executeCompletionItemProvider", d.uri, new vscode.Position(8, 9));
+      return r.items.some((i) => i.label === "Badge" || i.label.label === "Badge") && r;
+    });
+    const badge = tags.items.find((i) => (i.label.label || i.label) === "Badge");
+    assert.match(badge.insertText.value, /^Badge count=\{\$\{1\}\} \/>$/, badge.insertText.value);
+    assert.ok(tags.items.some((i) => (i.label.label || i.label) === "div"));
+    await ed.edit((e) => e.replace(new vscode.Range(8, 0, 9, 0), "        <Badge \n"));
+    const props = await until("prop completion", async () => {
+      const r = await vscode.commands.executeCommand("vscode.executeCompletionItemProvider", d.uri, new vscode.Position(8, 15));
+      return r.items.some((i) => (i.label.label || i.label) === "count") && r;
+    });
+    assert.ok(props.items.some((i) => (i.label.label || i.label) === "label"));
+    await vscode.commands.executeCommand("workbench.action.revertAndCloseActiveEditor");
+  });
+  await check("the runner builds a browser app and serves it", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "stellang-browser-"));
+    api.createProject("browser", path.join(dir, "app"), "app");
+    const file = path.join(dir, "app", "main.st");
+    api.runner.run(file);
+    const url = await until("the url", () => api.runner.runs.get(file)?.url, 90000);
+    const port = +new URL(url).port;
+    assert.match(await get(port, "/"), /<script src="\/main\.js"><\/script>/);
+    assert.match(await get(port, "/main.js"), /stellang web loader/);
+    await api.runner.stop(file);
+    vscode.window.terminals.forEach((t) => t.dispose());
+    await until("cleaned up", () => api.runner.runs.size === 0);
   });
   await check("Show LLVM IR opens the generated code", async () => {
     await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(path.join(root, "server.st")));

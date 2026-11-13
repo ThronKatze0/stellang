@@ -18,7 +18,7 @@ use complete::Model;
 
 const TOKEN_TYPES: &[&str] = &[
     "keyword", "string", "number", "operator", "function", "method", "type", "enum", "enumMember", "struct",
-    "variable", "parameter", "property", "comment", "namespace",
+    "variable", "parameter", "property", "comment", "namespace", "class", "typeParameter", "interface",
 ];
 const TOKEN_MODIFIERS: &[&str] = &["declaration", "defaultLibrary", "readonly", "mutable", "static"];
 
@@ -394,6 +394,12 @@ impl Server {
                         (false, false) => format!("({})", fields.join(", ")),
                     };
                     add(&v.name, Some(&e.name), v.pos, "variant", format!("{}.{}{shape}", e.name, v.name));
+                }
+            }
+            for t in &m.traits {
+                add(&t.name, None, t.pos, "trait", block_sig(&lines, t.pos));
+                for (f, _) in &t.methods {
+                    add(&f.name, Some(&t.name), f.pos, "method", line_sig(&lines, f.pos).replacen(&format!("fn {}", f.name), &format!("fn {}.{}", t.name, f.name), 1));
                 }
             }
             for im in &m.impls {
@@ -792,7 +798,7 @@ impl Server {
                     continue;
                 }
                 let t = self.text_of(&d.file).unwrap_or_default();
-                let kind: u32 = match d.kind { "fn" => 12, "method" => 6, "struct" => 23, "enum" => 10, "variant" => 22, "const" => 14, _ => 13 };
+                let kind: u32 = match d.kind { "fn" => 12, "method" => 6, "struct" => 23, "enum" => 10, "variant" => 22, "const" => 14, "trait" => 11, _ => 13 };
                 out.push(obj([
                     ("name", d.name.as_str().into()),
                     ("kind", kind.into()),
@@ -817,6 +823,7 @@ impl Server {
                 "variant" => 22,
                 "const" => 14,
                 "field" => 8,
+                "trait" => 11,
                 _ => 13,
             }
         };
@@ -866,6 +873,17 @@ impl Server {
         let decls = self.decls(&a.units);
         let names = |kinds: &[&str]| -> HashSet<String> { decls.iter().filter(|d| kinds.contains(&d.kind)).map(|d| d.name.clone()).collect() };
         let (types, enums, variants, funcs, consts) = (names(&["struct"]), names(&["enum"]), names(&["variant"]), names(&["fn"]), names(&["const"]));
+        let traits = names(&["trait"]);
+        // type parameters in scope: the names in `<...>` after fn/struct/enum names
+        let tparams: HashSet<String> = a.units.iter().flat_map(|u| {
+            let m = &u.module;
+            m.funcs.iter().flat_map(|f| f.tparams.iter())
+                .chain(m.structs.iter().flat_map(|s| s.tparams.iter()))
+                .chain(m.enums.iter().flat_map(|e| e.tparams.iter()))
+                .chain(m.impls.iter().flat_map(|i| i.methods.iter().flat_map(|f| f.tparams.iter())))
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+        }).collect();
         let std_modules: HashSet<&str> = STD.iter().map(|s| s.0).collect();
         // which braces open a struct/enum declaration (their `name:` lines declare fields)
         let plain = flatten(&toks);
@@ -892,9 +910,21 @@ impl Server {
             }
         };
         let flat = flatten_with_strings(&toks, &cs);
+        let jsx = jsx_marks(&flat);
         for (k, t) in flat.iter().enumerate() {
             let prev = k.checked_sub(1).map(|i| &flat[i].tok);
             let next = flat.get(k + 1).map(|t| &t.tok);
+            match jsx.get(&k) {
+                // tags and attribute names: the grammar colors them
+                Some(Jsx::Punct | Jsx::Tag | Jsx::Attr) => continue,
+                Some(Jsx::Component) => {
+                    if matches!(t.tok, Tok::Ident(_)) {
+                        emit(t.pos, t.start, t.end, "class", 0);
+                    }
+                    continue;
+                }
+                None => {}
+            }
             let (ty, mods) = match &t.tok {
                 Tok::Str(_) | Tok::Interp(_) => ("string", 0),
                 Tok::Int(_) | Tok::Float(_) => ("number", 0),
@@ -919,6 +949,8 @@ impl Server {
                         _ if prim.contains(n.as_str()) && !call => ("type", tm(&["defaultLibrary"])),
                         _ if label && (decl_body_field(&plain, t.pos) || enclosing(&plain, t.pos) != Some(Tok::LParen)) => ("property", decl_body_field(&plain, t.pos) as u32),
                         _ if consts.contains(n) => ("variable", tm(&["readonly", "static"]) | decl),
+                        _ if traits.contains(n) => ("interface", decl),
+                        _ if tparams.contains(n) && n.starts_with(|c: char| c.is_ascii_uppercase()) && !types.contains(n) && !enums.contains(n) => ("typeParameter", 0),
                         _ if enums.contains(n) => ("enum", decl),
                         _ if types.contains(n) => ("struct", decl),
                         _ if variants.contains(n) => ("enumMember", 0),
@@ -1213,6 +1245,85 @@ fn split_top(s: &str) -> Vec<String> {
     }
     if !cur.trim().is_empty() {
         out.push(cur);
+    }
+    out
+}
+
+/// What a token is inside JSX (tags are colored by the grammar; components like types).
+#[derive(Clone, Copy, PartialEq)]
+enum Jsx {
+    Punct,
+    Tag,
+    Component,
+    Attr,
+}
+
+/// Find JSX tags in a token list: `<` (where a value starts) followed by a name, up to its `>`/`/>`,
+/// and closing tags `</name>`.
+fn jsx_marks(toks: &[Token]) -> HashMap<usize, Jsx> {
+    let mut out = HashMap::new();
+    let mut k = 0;
+    while k < toks.len() {
+        if toks[k].tok != Tok::Lt {
+            k += 1;
+            continue;
+        }
+        let prev = k.checked_sub(1).map(|i| &toks[i].tok);
+        if matches!(prev, Some(Tok::Ident(_) | Tok::RParen | Tok::RBrack | Tok::Int(_) | Tok::Float(_))) {
+            k += 1;
+            continue;
+        }
+        let closing = toks.get(k + 1).map(|t| &t.tok) == Some(&Tok::Slash);
+        let mut i = k + 1 + closing as usize;
+        if !matches!(toks.get(i).map(|t| &t.tok), Some(Tok::Ident(_) | Tok::Gt)) {
+            k += 1;
+            continue;
+        }
+        out.insert(k, Jsx::Punct);
+        if closing {
+            out.insert(k + 1, Jsx::Punct);
+        }
+        // the name: idents glued with `.` / `-`
+        let name_start = i;
+        while let Some(t) = toks.get(i) {
+            match t.tok {
+                Tok::Ident(_) => i += 1,
+                Tok::Dot | Tok::Minus if i > name_start && toks[i - 1].end == t.start => i += 1,
+                _ => break,
+            }
+        }
+        let last = toks[name_start..i].iter().rev().find_map(|t| if let Tok::Ident(n) = &t.tok { Some(n.clone()) } else { None });
+        let component = last.is_some_and(|n| n.starts_with(|c: char| c.is_ascii_uppercase()));
+        for j in name_start..i {
+            let module = matches!(&toks[j].tok, Tok::Ident(_)) && toks.get(j + 1).is_some_and(|t| t.tok == Tok::Dot) && component;
+            out.insert(j, if module { Jsx::Punct } else if component { Jsx::Component } else { Jsx::Tag });
+        }
+        // attributes, up to `>` or `/>` outside braces
+        let mut depth = 0;
+        while let Some(t) = toks.get(i) {
+            match &t.tok {
+                Tok::LBrace => depth += 1,
+                Tok::RBrace => depth -= 1,
+                Tok::Gt if depth == 0 => {
+                    out.insert(i, Jsx::Punct);
+                    break;
+                }
+                Tok::Slash if depth == 0 => {
+                    out.insert(i, Jsx::Punct);
+                }
+                Tok::Ident(_) if depth == 0 => {
+                    out.insert(i, Jsx::Attr);
+                }
+                Tok::Minus if depth == 0 => {
+                    out.insert(i, Jsx::Attr);
+                }
+                Tok::Newline | Tok::Str(_) | Tok::Interp(_) | Tok::Assign => {}
+                _ if depth == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        k = i.max(k + 1);
     }
     out
 }

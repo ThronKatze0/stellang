@@ -854,6 +854,133 @@ fn main() {
     bad("trait Show { fn show(self) -> str }\nstruct P {}\nimpl Show for P { }\nfn main() {}", "missing `fn show`");
 }
 
+#[test]
+fn jsx_server_rendering() {
+    let src = r##"
+struct Todo { id: int, title: str, done: bool = false }
+
+struct CardProps { title: str, footer: str = "the end", children: Node }
+
+fn Card(p: CardProps) -> Node {
+    return <section class="card">
+        <h2>{p.title}</h2>
+        {p.children}
+        <footer>{p.footer}</footer>
+    </section>
+}
+
+fn Badge(n: int, label: str?) -> Node {
+    return <span class="badge" title={label}>{n}</span>
+}
+
+fn TodoList(todos: [Todo]) -> Node {
+    return <ul>
+        for t in todos {
+            <li key={t.id} class={if t.done { "done" } else { "open" }}>
+                <input type="checkbox" checked={t.done} onclick={() => println("x")} />
+                " ${t.title}"
+            </li>
+        }
+        if todos.is_empty() { <li>"nothing to do"</li> }
+    </ul>
+}
+
+fn main() {
+    let todos = [Todo { id: 1, title: "write <jsx>" }, Todo { id: 2, title: "ship it", done: true }]
+    let page = <>
+        <Card title="Todos & more">
+            <TodoList todos={todos} />
+            <Badge n={todos.len()} />
+            <Badge n={7} label="seven" />
+        </Card>
+        {todos.map(t => <i>{t.title}</i>)}
+    </>
+    println(page)
+}
+"##;
+    let want = "<section class=\"card\"><h2>Todos &amp; more</h2><ul><li data-key=\"1\" class=\"open\"><input type=\"checkbox\"> write &lt;jsx&gt;</li><li data-key=\"2\" class=\"done\"><input type=\"checkbox\" checked> ship it</li></ul><span class=\"badge\">2</span><span class=\"badge\" title=\"seven\">7</span><footer>the end</footer></section><i>write &lt;jsx&gt;</i><i>ship it</i>\n";
+    ok("jsx", src, want);
+    let bad = |src: &str, msg: &str| {
+        let (code, _, err) = run("jsx-bad", src);
+        assert_eq!(code, -1);
+        assert!(err.contains(msg), "{err}");
+    };
+    bad("fn main() { let x = <div><p>\"a\"</div> }", "`</div>` doesn't close `<p>`");
+    bad("fn main() { let x = <input>\"a\"</input> }", "<input> can't have children");
+    bad("fn Card(title: str) -> Node { return <b>{title}</b> }\nfn main() { let x = <Card titel=\"a\" /> }", "<Card> has no prop `titel`");
+    bad("fn Card(title: str) -> Node { return <b>{title}</b> }\nfn main() { let x = <Card /> }", "<Card> needs `title`");
+    bad("fn main() { let x = <button onclick={() => 1}>\"a\"</button>\n let y = <b onclick={(a: int) => println(a)} /> }", "an event handler is a fn() or a fn(str)");
+}
+
+#[test]
+fn from_json_decodes_types() {
+    let src = r##"
+import json
+
+enum Shape { Circle(float), Rect { w: float, h: float }, Pair(int, str), Empty }
+enum Color { Red, Green }
+struct Todo { id: int, title: str, done: bool = false, tags: [str] = [], note: str? }
+struct Data { todos: [Todo], counts: {str: int}, byid: {int: str}, shapes: [Shape], color: Color, ids: {int} }
+
+fn main() -> void! {
+    let d = Data {
+        todos: [Todo { id: 1, title: "a", tags: ["x"] }, Todo { id: 2, title: "b \"q\"", done: true, note: "n" }],
+        counts: {"a": 1}, byid: {7: "seven"}, shapes: [Shape.Circle(2.5), Shape.Rect { w: 1.0, h: 2.0 }, Shape.Pair(3, "p"), Shape.Empty],
+        color: .Green, ids: {1, 2}
+    }
+    let text = to_json(d)
+    println(text)
+    let back: Data = from_json(text)?
+    println(to_json(back) == text)
+    let t: Todo = from_json("{\"id\": 5, \"title\": \"partial\"}")?
+    println(t)
+    let xs: [int] = from_json("[1, 2, 3]")?
+    println(xs)
+    let bad: Todo = from_json("{\"id\": 5}") catch (Todo { id: 0, title: "fallback" })
+    println(bad.title)
+    let ys: [int] = from_json("[1, \"x\"]") catch m {
+        println(m)
+        [0]
+    }
+    println(ys)
+    let r: [int]! = from_json("{oops")
+    if let err(m) = r { println(m) }
+}
+"##;
+    let (code, out, err) = run("fromjson", src);
+    assert_eq!(code, 0, "{err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[1], "true");
+    assert_eq!(lines[2], "Todo { id: 5, title: \"partial\", done: false, tags: [], note: none }");
+    assert_eq!(lines[3..].join("\n"), "[1, 2, 3]\nfallback\nfrom_json: expected a number\n[0]\nbad JSON at 1: expected `\"`, found `o`");
+}
+
+/// `--web` builds a WebAssembly module and its loader (when this machine has the WASI libc).
+#[test]
+fn web_build() {
+    let dir = tmpdir("web");
+    let file = dir.join("app.st");
+    fs::write(&file, "import web\n\nfn App() -> Node {\n    let n = signal(0)\n    return <button onclick={() => n.set(n.get() + 1)}>\"clicked ${n.get()}\"</button>\n}\n\nfn main() {\n    web.mount(\"#app\", () => <App />)\n}\n").unwrap();
+    let out = Command::new(BIN).arg("--web").arg(&file).arg("-o").arg(dir.join("dist/app")).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() && err.contains("WASI") {
+        eprintln!("skipping: no WASI libc here");
+        return;
+    }
+    assert!(out.status.success(), "{err}");
+    let wasm = fs::read(dir.join("dist/app.wasm")).unwrap();
+    assert_eq!(&wasm[..4], b"\0asm");
+    assert!(fs::read_to_string(dir.join("dist/app.js")).unwrap().contains("st_dispatch"));
+    assert!(fs::read_to_string(dir.join("dist/app.html")).unwrap().contains("<script src=\"app.js\">"));
+    // the same app natively: mount renders once to stdout (handlers aren't rendered on the server)
+    let (code, html, _) = run("web-native", &fs::read_to_string(&file).unwrap());
+    assert_eq!((code, html.as_str()), (0, "<button>clicked 0</button>\n"));
+    // server-only modules are refused
+    fs::write(&file, "import http\nfn main() {}\n").unwrap();
+    let out = Command::new(BIN).arg("--web").arg(&file).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("`import http` only works on the server"));
+}
+
 /// The editor grammars are generated from the compiler's keyword table; the copies in `editors/`
 /// must match (regenerate with `stellang grammar textmate|vim`).
 #[test]

@@ -5,6 +5,7 @@ const cp = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const http = require("http");
 
 const URL_RE = /\bhttps?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::\]):(\d+)\S*/;
 const RESET = "\x1b[0m";
@@ -52,6 +53,24 @@ class Run {
     }
     const outDir = path.join(os.tmpdir(), "stellang-run");
     fs.mkdirSync(outDir, { recursive: true });
+    const dir = path.dirname(this.file);
+    // a full-stack app (server.st + client.st): `stellang dev` builds both and restarts on change
+    if (Run.isFullStack(dir) && ["server.st", "client.st", "shared.st"].includes(path.basename(this.file))) {
+      this.url = undefined;
+      this.write(`${GOLD}⭐ stellang dev${RESET} ${DIM}${dir}${RESET}\n`);
+      return this.exec(c.path, ["dev", dir], { group: true });
+    }
+    // a browser app (`import web` + `web.mount`): build it for WebAssembly and serve it here
+    const src = (() => {
+      try {
+        return fs.readFileSync(this.file, "utf8");
+      } catch {
+        return "";
+      }
+    })();
+    if (/^\s*import\s+web\b/m.test(src) && /\bweb\.mount\s*\(/.test(src) && !/^\s*import\s+(?:http|net)\b/m.test(src)) {
+      return this.startWeb(c.path, outDir);
+    }
     const exe = path.join(outDir, path.basename(this.file, ".st") + (process.platform === "win32" ? ".exe" : ""));
     const opt = config().get("optimization");
     this.url = undefined;
@@ -78,10 +97,70 @@ class Run {
     });
   }
 
-  exec(exe) {
+  static isFullStack(dir) {
+    return fs.existsSync(path.join(dir, "server.st")) && fs.existsSync(path.join(dir, "client.st"));
+  }
+
+  /** Build a browser app with `stellang --web` and serve it (plus the files next to it) on a local port. */
+  startWeb(compiler, outDir) {
+    const name = path.basename(this.file, ".st");
+    const out = path.join(outDir, "web-" + name, name);
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    this.set("building");
+    this.write(`${GOLD}⭐ building for the browser${RESET} ${DIM}${this.file}${RESET}\n`);
+    const t0 = Date.now();
+    const build = cp.spawn(compiler, ["--web", this.file, "-o", out], { cwd: path.dirname(this.file), env: { ...process.env, STELLANG_NO_HTML: "1" } });
+    this.child = build;
+    build.stdout.on("data", (d) => this.write(d.toString()));
+    build.stderr.on("data", (d) => this.write(`${RED}${d}${RESET}`));
+    build.on("close", (code) => {
+      if (this.child !== build) return;
+      this.child = undefined;
+      if (code !== 0) {
+        this.write(`\n${RED}✗ build failed${RESET}\n`);
+        return this.set("failed");
+      }
+      const wasm = fs.statSync(out + ".wasm").size;
+      this.write(`${GREEN}✓ built${RESET} ${DIM}in ${Date.now() - t0} ms (${(wasm / 1024).toFixed(0)} KB of WebAssembly)${RESET}\n\n`);
+      const own = path.dirname(this.file);
+      const types = { ".html": "text/html", ".js": "text/javascript", ".wasm": "application/wasm", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png", ".json": "application/json" };
+      const page = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${name}</title>` +
+        (fs.existsSync(path.join(own, "style.css")) ? `<link rel="stylesheet" href="/style.css">` : "") +
+        `</head><body><div id="app"></div><script src="/${name}.js"></script></body></html>`;
+      const server = http.createServer((req, res) => {
+        const p = decodeURIComponent((req.url || "/").split("?")[0]);
+        if (p === "/" && !fs.existsSync(path.join(own, "index.html"))) {
+          res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+          return res.end(page);
+        }
+        const rel = p === "/" ? "index.html" : p.slice(1);
+        for (const base of [path.dirname(out), own]) {
+          const f = path.join(base, rel);
+          if (f.startsWith(base) && fs.existsSync(f) && fs.statSync(f).isFile()) {
+            res.writeHead(200, { "content-type": types[path.extname(f)] || "application/octet-stream", "cache-control": "no-store" });
+            return fs.createReadStream(f).pipe(res);
+          }
+        }
+        res.writeHead(404);
+        res.end("not found");
+      });
+      server.listen(0, "127.0.0.1", () => {
+        this.server = server;
+        this.started = Date.now();
+        this.url = `http://localhost:${server.address().port}`;
+        this.set("running");
+        this.write(`${GOLD}●${RESET} serving ${this.url} ${DIM}(print output goes to the browser console)${RESET}\n`);
+        this.runner.changed();
+        this.runner.announce(this);
+      });
+    });
+  }
+
+  exec(exe, args, { group = false } = {}) {
     const env = { ...process.env, ...(this.runner.config().get("run.env") || {}) };
-    const args = this.runner.config().get("run.args") || [];
-    const child = cp.spawn(exe, args, { cwd: path.dirname(this.file), env });
+    args = args || this.runner.config().get("run.args") || [];
+    const child = cp.spawn(exe, args, { cwd: path.dirname(this.file), env, detached: group });
+    child.group = group;
     this.child = child;
     this.started = Date.now();
     this.set("running");
@@ -137,10 +216,25 @@ class Run {
   kill(closing) {
     const c = this.child;
     this.child = undefined;
+    if (this.server) {
+      this.server.close();
+      this.server = undefined;
+      if (!closing) {
+        this.write(`\n${DIM}● stopped${RESET}\n`);
+        this.url = undefined;
+        this.set("exited");
+      }
+    }
     if (c && c.exitCode === null) {
       try {
-        c.kill("SIGTERM");
-        setTimeout(() => c.exitCode === null && c.kill("SIGKILL"), 1500);
+        // `stellang dev` runs the server as its own child: stop the whole process group
+        const sig = (s) => (c.group && process.platform !== "win32" ? process.kill(-c.pid, s) : c.kill(s));
+        sig("SIGTERM");
+        setTimeout(() => {
+          try {
+            if (c.exitCode === null) sig("SIGKILL");
+          } catch {}
+        }, 1500);
       } catch {
         // gone already
       }

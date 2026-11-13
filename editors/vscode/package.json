@@ -517,6 +517,15 @@
           ],
           "type.defaultLibrary": [
             "support.type.primitive.stellang"
+          ],
+          "class": [
+            "support.class.component.stellang"
+          ],
+          "interface": [
+            "entity.name.type.trait.stellang"
+          ],
+          "typeParameter": [
+            "entity.name.type.parameter.stellang"
           ]
         }
       }

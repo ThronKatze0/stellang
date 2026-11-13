@@ -404,6 +404,76 @@
       "settings": {
         "foreground": "#0079a3"
       }
+    },
+    {
+      "name": "JSX tags",
+      "scope": [
+        "entity.name.tag.stellang"
+      ],
+      "settings": {
+        "foreground": "#c4327f"
+      }
+    },
+    {
+      "name": "JSX components",
+      "scope": [
+        "support.class.component.stellang"
+      ],
+      "settings": {
+        "foreground": "#0e7490",
+        "fontStyle": "bold"
+      }
+    },
+    {
+      "name": "JSX attributes",
+      "scope": [
+        "entity.other.attribute-name.stellang"
+      ],
+      "settings": {
+        "foreground": "#b45309",
+        "fontStyle": "italic"
+      }
+    },
+    {
+      "name": "JSX events",
+      "scope": [
+        "entity.other.attribute-name.event.stellang"
+      ],
+      "settings": {
+        "foreground": "#d6336c",
+        "fontStyle": "italic"
+      }
+    },
+    {
+      "name": "JSX punctuation",
+      "scope": [
+        "punctuation.definition.tag.begin.stellang",
+        "punctuation.definition.tag.end.stellang",
+        "punctuation.section.embedded.begin.stellang",
+        "punctuation.section.embedded.end.stellang"
+      ],
+      "settings": {
+        "foreground": "#6b7280"
+      }
+    },
+    {
+      "name": "Traits",
+      "scope": [
+        "entity.name.type.trait.stellang"
+      ],
+      "settings": {
+        "foreground": "#6d28d9",
+        "fontStyle": "italic"
+      }
+    },
+    {
+      "name": "Type parameters",
+      "scope": [
+        "meta.type.parameters.stellang"
+      ],
+      "settings": {
+        "foreground": "#0891b2"
+      }
     }
   ],
   "semanticTokenColors": {
@@ -459,6 +529,18 @@
       "foreground": "#8a8fb3",
       "italic": true
     },
-    "operator": "#0a7aa0"
+    "operator": "#0a7aa0",
+    "class": {
+      "foreground": "#0e7490",
+      "bold": true
+    },
+    "typeParameter": {
+      "foreground": "#0891b2",
+      "italic": true
+    },
+    "interface": {
+      "foreground": "#6d28d9",
+      "italic": true
+    }
   }
 }
