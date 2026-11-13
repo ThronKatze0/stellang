@@ -1,6 +1,6 @@
 [package]
 name = "stellang"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A small compiled language with structs, enums, options and results, an Express-style web framework, and a built-in language server"
 license = "MIT"

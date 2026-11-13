@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+
+- The language grew generics, traits and JSX, and compiles to WebAssembly: the grammar and the
+  language server know all of it (type parameters, traits, tags, components, attributes, events).
+- JSX completion: components with their required props, HTML elements, props and attributes, events,
+  closing tags.
+- Full-stack apps run under `stellang dev`; browser apps are built with `--web` and served locally.
+- New templates: Full-stack app, Browser app.
+- Theme colors for tags, components, attributes, events, traits and type parameters.
+
 ## 0.3.0
 
 - Completion from the type checker, even in code that doesn't parse: members of any expression

@@ -1,8 +1,8 @@
 {
   "name": "stellang",
   "displayName": "stellang",
-  "description": "stellang for VS Code: smart completion from the type checker, quick fixes, star-themed colors, a sidebar for programs, types and HTTP routes, one-click run with server detection, project templates.",
-  "version": "0.3.0",
+  "description": "stellang for VS Code: completion from the type checker (JSX too), quick fixes, star-themed colors, a sidebar for programs, types and HTTP routes, one-click run for servers, browser apps and full-stack apps, project templates.",
+  "version": "0.4.0",
   "publisher": "stellang",
   "license": "MIT",
   "pricing": "Free",

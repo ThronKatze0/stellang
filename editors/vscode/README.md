@@ -26,6 +26,14 @@ real type checker, so it knows exactly what's in front of the `.`, even in code 
 - `http.` or `json.` imports the module for you if it isn't imported yet.
 - On an optional, `x.field` offers to reach through with `?.`.
 
+### JSX
+
+- After `<`: your components (with their required props filled in as tab stops) and HTML elements.
+- Inside a tag: a component's props (or the fields of its props struct) and their types; for HTML
+  elements the usual attributes and the events (`onclick={() => …}`, `oninput={v => …}`, …).
+- After `</`: the tag that's still open.
+- Tags, components, attributes and event attributes each get their own color.
+
 ### Quick fixes
 
 - **Add the missing match arms** when a `match` doesn't handle every case.
@@ -55,13 +63,17 @@ real type checker, so it knows exactly what's in front of the `.`, even in code 
   stops the program, and any key runs it again after it exits.
 - When a program prints a `http://localhost:…` address, the extension offers to open it in the
   browser or inside VS Code. The status bar shows the port; click it to restart or stop.
+- **Full-stack apps** (a folder with `server.st` and `client.st`) run under `stellang dev`: the client is
+  built for WebAssembly, the server runs, and both are rebuilt on every save.
+- **Browser apps** (`import web` + `web.mount`) are built with `stellang --web` and served on a local port.
 - **Show LLVM IR** opens the code the compiler generates.
 - **Build** and **Check** are tasks. Compiler errors and runtime panics show up in the Problems
   panel through the `$stellang` problem matcher.
 
 ### And
 
-- **New Project…** with templates (hello, web server, JSON API + WebSockets, data modeling, CLI) and
+- **New Project…** with templates (hello, web server, JSON API + WebSockets, data modeling, CLI,
+  full-stack app, browser app) and
   a **Get Started** walkthrough.
 - Hover types and docs, inlay type and parameter-name hints, signature help (builtin methods too),
   go to definition (into the standard library), references, rename, highlights, outline, workspace symbols,
