@@ -528,6 +528,12 @@ int putchar(int c) {
     return c;
 }
 
+int64_t st_k_wait_byte(void);
+int getchar(void) { // raw console bytes (the builtin `read_line` uses it; there is no end of input)
+    int c = (int)st_k_wait_byte();
+    return c == '\r' ? '\n' : c;
+}
+
 int fflush(FILE *fp) {
     (void)fp;
     return 0;

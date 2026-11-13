@@ -1137,6 +1137,55 @@ fn main() {
     assert!(code == -1 && err.contains("already defined"), "{err}");
 }
 
+/// `args()`, `read_line()` and `exit(code)`: command-line programs.
+#[test]
+fn args_read_line_exit() {
+    let dir = tmpdir("cli");
+    let (file, exe) = (dir.join("main.st"), dir.join("main"));
+    fs::write(
+        &file,
+        r#"
+fn main() {
+    let a = args()
+    println("${a.len()} ${a}")
+    print("name? ")
+    var n = 0
+    while let line = read_line() {
+        n += 1
+        println("[${line}]")
+    }
+    println("lines ${n}")
+    if a.contains("--fail") {
+        exit(3)
+    }
+    println("done")
+}"#,
+    )
+    .unwrap();
+    let c = Command::new(BIN).arg(&file).arg("-o").arg(&exe).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let go = |argv: &[&str], input: &str| {
+        let mut p = Command::new(&exe).args(argv).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        p.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let o = p.wait_with_output().unwrap();
+        (o.status.code().unwrap(), String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    // CRLF is stripped, and a last line without a line break still counts
+    assert_eq!(go(&["x", "y z"], "ada\r\nbob\nlast"), (0, "2 [\"x\", \"y z\"]\nname? [ada]\n[bob]\n[last]\nlines 3\ndone\n".into()));
+    // exit flushes what was printed and ends with its code
+    assert_eq!(go(&["--fail"], ""), (3, "1 [\"--fail\"]\nname? lines 0\n".into()));
+    assert_eq!(go(&[], "\n"), (0, "0 []\nname? []\nlines 1\ndone\n".into()));
+
+    let (code, out, _) = run("exit_int", "fn main() -> int {\n    println(\"bye\")\n    exit(7)\n    return 1\n}");
+    assert_eq!((code, out.as_str()), (7, "bye\n"));
+    let (code, _, err) = run("exit_bad", "fn main() { exit(\"1\") }");
+    assert!(code == -1 && err.contains("expected int"), "{err}");
+    let (code, _, err) = run("args_bad", "fn main() { println(args(1)) }");
+    assert!(code == -1 && err.contains("takes no arguments"), "{err}");
+    let (code, _, err) = run("read_line_type", "fn main() { let s: str = read_line() }");
+    assert!(code == -1, "{err}");
+}
+
 /// `http.fetch` against a local stellang server: statuses (404 and 429 are answers, not errors),
 /// headers, JSON, POST bodies, and errors for refused connections and timeouts. No internet needed.
 #[test]

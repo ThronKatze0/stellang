@@ -39,7 +39,7 @@ fn field_default_sym(dkey: &str, f: &str) -> String {
 pub const RESERVED: &[&str] = &[
     "print", "println", "str", "int", "float", "env", "panic", "ok", "err", "bool", "void", "true", "false", "min", "max",
     "abs", "some", "none", "to_json", "self", "sleep", "now_ms", "url_encode",
-    "url_decode",
+    "url_decode", "args", "read_line", "exit",
 ];
 
 /// Signatures of the newer builtins, for hover.
@@ -48,6 +48,9 @@ const BUILTIN_SIGS: &[(&str, &str)] = &[
     ("now_ms", "fn now_ms() -> int"),
     ("url_encode", "fn url_encode(s: str) -> str"),
     ("url_decode", "fn url_decode(s: str) -> str"),
+    ("args", "fn args() -> [str]"),
+    ("read_line", "fn read_line() -> str?"),
+    ("exit", "fn exit(code: int)"),
 ];
 
 const RUNTIME: &str = r#"%st.vec = type { i64, i64, ptr }
@@ -73,6 +76,10 @@ declare ptr @st_url_encode(ptr)
 declare ptr @st_url_decode(ptr)
 declare void @st_sleep(i64)
 declare i64 @st_now_ms()
+declare void @st_set_args(i32, ptr)
+declare ptr @st_args()
+declare ptr @st_read_line()
+declare void @st_exit(i64) noreturn
 declare ptr @st_slice(ptr, i64, i64, ptr)
 declare i64 @st_find(ptr, ptr)
 declare ptr @st_split(ptr, ptr)
@@ -869,8 +876,11 @@ impl Gen {
             let t = ll(&self.consts[k]);
             write!(init, "  %c{i} = call {t} @\"const.{k}\"(ptr null)\n  store {t} %c{i}, ptr @\"g.{k}\"\n").unwrap();
         }
-        let entry_sym = if self.web { "st_start" } else { "main" };
-        writeln!(out, "define i32 @{entry_sym}() {{\n  call void @st_init()\n{init}{entry}\n}}").unwrap();
+        if self.web {
+            writeln!(out, "define i32 @st_start() {{\n  call void @st_init()\n{init}{entry}\n}}").unwrap();
+        } else {
+            writeln!(out, "define i32 @main(i32 %argc, ptr %argv) {{\n  call void @st_set_args(i32 %argc, ptr %argv)\n  call void @st_init()\n{init}{entry}\n}}").unwrap();
+        }
         out += &self.globals;
         if self.web || self.kernel {
             out += "attributes #0 = { nounwind }\n";
@@ -3199,6 +3209,32 @@ impl Gen {
                     return err(pos, format!("`now_ms` takes no arguments, got {}", args.len()));
                 }
                 self.rt(Type::Int, "st_now_ms", &[])
+            }
+            "args" => {
+                if !args.is_empty() {
+                    return err(pos, format!("`args` takes no arguments, got {}", args.len()));
+                }
+                self.rt(Type::List(Box::new(Type::Str)), "st_args", &[])
+            }
+            "read_line" => {
+                if !args.is_empty() {
+                    return err(pos, format!("`read_line` takes no arguments, got {}", args.len()));
+                }
+                // NULL at the end of input: none
+                let p = self.rt(Type::Str, "st_read_line", &[]).v;
+                let ot = Type::Opt(Box::new(Type::Str));
+                let (h, a, b) = (self.tmp(), self.tmp(), self.tmp());
+                self.ins(format!("{h} = icmp ne ptr {p}, null"));
+                self.ins(format!("{a} = insertvalue {} zeroinitializer, i1 {h}, 0", ll(&ot)));
+                self.ins(format!("{b} = insertvalue {} {a}, ptr {p}, 1", ll(&ot)));
+                val(b, ot)
+            }
+            "exit" => {
+                let v = one(self, Some(&Type::Int))?;
+                expect_ty(&Type::Int, &v.ty, args[0].pos)?;
+                self.ins(format!("call void @st_exit(i64 {})", v.v));
+                self.term("unreachable".into());
+                void()
             }
             "panic" => {
                 let v = one(self, Some(&Type::Str))?;

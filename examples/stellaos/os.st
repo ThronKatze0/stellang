@@ -57,7 +57,7 @@ struct Shell {
         let words = line.trim().split(" ").filter(w => w != "")
         if words.is_empty() { return }
         let cmd = words[0]
-        let args = words.slice(1, words.len())
+        let argv = words.slice(1, words.len())
         let rest = line.trim().slice(cmd.len(), line.trim().len()).trim()
         match cmd {
             "help" => help(),
@@ -73,7 +73,7 @@ struct Shell {
             },
             "pwd" => println(self.cwd),
             "ls" => {
-                let dir = self.path(args.get(0) ?? ".")
+                let dir = self.path(argv.get(0) ?? ".")
                 if !self.fs.is_dir(dir) { return err("no such directory: ${dir}") }
                 for name in self.fs.list(dir) {
                     if name.ends_with("/") {
@@ -85,22 +85,22 @@ struct Shell {
                 }
             },
             "cd" => {
-                let dir = self.path(args.get(0) ?? "/")
+                let dir = self.path(argv.get(0) ?? "/")
                 if !self.fs.is_dir(dir) { return err("no such directory: ${dir}") }
                 self.cwd = dir
             },
-            "mkdir" => self.fs.mkdir(self.path(need(args, 0, "mkdir <dir>")?))?,
-            "cat" => print(self.fs.read(self.path(need(args, 0, "cat <file>")?))?),
+            "mkdir" => self.fs.mkdir(self.path(need(argv, 0, "mkdir <dir>")?))?,
+            "cat" => print(self.fs.read(self.path(need(argv, 0, "cat <file>")?))?),
             "write" | "append" => {
-                let file = self.path(need(args, 0, "${cmd} <file> <text>")?)
-                let text = rest.slice(args[0].len(), rest.len()).trim() + "\n"
+                let file = self.path(need(argv, 0, "${cmd} <file> <text>")?)
+                let text = rest.slice(argv[0].len(), rest.len()).trim() + "\n"
                 let old = if cmd == "append" { self.fs.read(file) catch "" } else { "" }
                 self.fs.write(file, old + text)?
             },
-            "edit" => self.edit(self.path(need(args, 0, "edit <file>")?))?,
-            "rm" => self.fs.remove(self.path(need(args, 0, "rm <path>")?))?,
+            "edit" => self.edit(self.path(need(argv, 0, "edit <file>")?))?,
+            "rm" => self.fs.remove(self.path(need(argv, 0, "rm <path>")?))?,
             "wc" => {
-                let text = self.fs.read(self.path(need(args, 0, "wc <file>")?))?
+                let text = self.fs.read(self.path(need(argv, 0, "wc <file>")?))?
                 let words = text.split(" ").map(w => w.trim()).filter(w => w != "").len()
                 println("${text.lines().len()} lines, ${words} words, ${text.len()} bytes")
             },
@@ -108,23 +108,23 @@ struct Shell {
                 let n = calc.eval(rest)?
                 println("${n}  (${calc.hex(n)})")
             },
-            "every" => self.every(args, rest)?,
+            "every" => self.every(argv, rest)?,
             "jobs" => {
                 if self.jobs.is_empty() { println("no jobs") }
                 for j in self.jobs { println("[${j.id}] ${j.what}") }
             },
             "kill" => {
-                let id = int(need(args, 0, "kill <job>")?)?
+                let id = int(need(argv, 0, "kill <job>")?)?
                 let found = self.jobs.find(j => j.id == id)
                 if let j = found { kernel.cancel(j.timer) } else { return err("no job ${id}") }
                 self.jobs = self.jobs.filter(x => x.id != id)
             },
-            "sleep" => sleep(int(need(args, 0, "sleep <ms>")?)?),
+            "sleep" => sleep(int(need(argv, 0, "sleep <ms>")?)?),
             "history" => {
                 for i, h in self.ed.history { println("${i + 1}  ${h}") }
             },
             "peek" => {
-                let addr = calc.eval(need(args, 0, "peek <address>")?)?
+                let addr = calc.eval(need(argv, 0, "peek <address>")?)?
                 let v = kernel.peek32(addr)
                 println("${calc.hex(addr)}: ${calc.hex(v)}")
             },
@@ -160,7 +160,7 @@ struct Shell {
                 }
             },
             "open" => {
-                let name = need(args, 0, "open <app>  (see `apps`)")?
+                let name = need(argv, 0, "open <app>  (see `apps`)")?
                 let d = self.desktop()?
                 if let l = d.launchers.find(l => l.name.lower() == name.lower()) {
                     l.open()
@@ -178,7 +178,7 @@ struct Shell {
             },
             "keyboard" => {
                 let d = self.desktop()?
-                let layout = need(args, 0, "keyboard us|de")?
+                let layout = need(argv, 0, "keyboard us|de")?
                 if layout != "us" && layout != "de" { return err("layouts: us, de") }
                 d.inp.layout = layout
                 println("keyboard layout: ${layout}")
@@ -193,9 +193,9 @@ struct Shell {
     }
 
     // `every <ms> <command>`: run a command in the background, on a timer
-    fn every(self, args: [str], rest: str) -> void! {
-        let ms = int(need(args, 0, "every <ms> <command>")?)?
-        let cmd = rest.slice(args[0].len(), rest.len()).trim()
+    fn every(self, argv: [str], rest: str) -> void! {
+        let ms = int(need(argv, 0, "every <ms> <command>")?)?
+        let cmd = rest.slice(argv[0].len(), rest.len()).trim()
         if cmd == "" { return err("usage: every <ms> <command>") }
         if ms < 10 { return err("every: at least 10 ms") }
         let id = self.next_job
@@ -276,8 +276,8 @@ struct Shell {
     }
 }
 
-fn need(args: [str], i: int, usage: str) -> str! {
-    if let a = args.get(i) { return a }
+fn need(argv: [str], i: int, usage: str) -> str! {
+    if let a = argv.get(i) { return a }
     return err("usage: ${usage}")
 }
 

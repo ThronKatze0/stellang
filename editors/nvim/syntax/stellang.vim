@@ -14,7 +14,7 @@ syn match stellangControl "🐺"
 syn match stellangControl "🦭"
 syn keyword stellangType int float bool str void
 syn keyword stellangConstant true false none
-syn match stellangBuiltin "\<\(print\|println\|env\|panic\|ok\|err\|min\|max\|abs\|some\|to_json\|sleep\|now_ms\|url_encode\|url_decode\)\ze\s*("
+syn match stellangBuiltin "\<\(print\|println\|env\|panic\|ok\|err\|min\|max\|abs\|some\|to_json\|sleep\|now_ms\|url_encode\|url_decode\|args\|read_line\|exit\)\ze\s*("
 syn keyword stellangSelf self
 syn match stellangNumber "\<0[xX][0-9a-fA-F_]\+\>"
 syn match stellangNumber "\<0[bB][01_]\+\>"

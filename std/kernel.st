@@ -15,7 +15,7 @@
 //
 // print/println go to the serial console. The heap is garbage-collected like everywhere else.
 // Timers (`after`, `every`) run from the main loop: whenever the program waits (`key`,
-// `read_line`, the builtin `sleep`, `idle`). Interrupts are handled in the C runtime (src/runtime_kernel.c) and
+// `prompt`, the builtin `sleep`, `idle`). Interrupts are handled in the C runtime (src/runtime_kernel.c) and
 // never run stellang code, so a driver written here polls `irq_count` from the loop instead.
 // Returning from main powers the machine off (QEMU exits with main's code; a panic exits with 101).
 
@@ -235,8 +235,8 @@ struct LineEditor {
 }
 
 // A line from the console, without history.
-fn read_line(prompt: str) -> str {
-    return LineEditor {}.read(prompt)
+fn prompt(text: str) -> str {
+    return LineEditor {}.read(text)
 }
 
 // ---- the machine ----
