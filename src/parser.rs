@@ -136,9 +136,13 @@ pub enum Stmt {
     Continue(Pos),
 }
 
+/// A parameter: its name and type (only `self` may omit the type).
+pub type Param = (String, Option<Type>);
+
 pub struct Func {
     pub name: String,
-    pub params: Vec<(String, Option<Type>)>, // only `self` may omit its type
+    pub params: Vec<Param>,
+    pub defaults: Vec<Option<Expr>>,         // one per parameter: `timeout: int = 8000`
     pub ret: Type,
     pub body: Vec<Stmt>,
     pub pos: Pos,
@@ -261,7 +265,10 @@ pub fn parse(toks: Vec<Token>) -> P<Module> {
                 p.expect(Tok::Fn)?;
                 let name = p.ident()?;
                 p.expect(Tok::LParen)?;
-                let params = p.list(Tok::RParen, |p| Ok(p.param(false)?.1.unwrap()))?;
+                let params = p.list(Tok::RParen, |p| match p.param(false)? {
+                    ((_, ty), None) => Ok(ty.unwrap()),
+                    (_, Some(d)) => Err((d.pos, "an extern function's parameters can't have defaults".into())),
+                })?;
                 let ret = if p.eat(&Tok::Arrow) { p.ty()? } else { Type::Void };
                 m.externs.push(Extern { name, params, ret, pos });
             }
@@ -432,14 +439,16 @@ impl Parser {
         }
     }
 
-    /// `name: Type`, or a bare `self` when `allow_self`.
-    fn param(&mut self, allow_self: bool) -> P<(String, Option<Type>)> {
+    /// `name: Type`, `name: Type = default`, or a bare `self` when `allow_self`.
+    fn param(&mut self, allow_self: bool) -> P<(Param, Option<Expr>)> {
         let n = self.ident()?;
         if allow_self && n == "self" && *self.peek() != Tok::Colon {
-            return Ok((n, None));
+            return Ok(((n, None), None));
         }
         self.expect(Tok::Colon)?;
-        Ok((n, Some(self.ty()?)))
+        let ty = self.ty()?;
+        let default = if self.eat(&Tok::Assign) { Some(self.expr()?) } else { None };
+        Ok(((n, Some(ty)), default))
     }
 
     fn func(&mut self, method: bool) -> P<Func> {
@@ -448,13 +457,18 @@ impl Parser {
         let name = self.ident()?;
         self.expect(Tok::LParen)?;
         let mut first = method;
-        let params = self.list(Tok::RParen, |p| {
+        let all = self.list(Tok::RParen, |p| {
             let r = p.param(first);
             first = false;
             r
         })?;
+        let (params, defaults): (Vec<_>, Vec<_>) = all.into_iter().unzip();
+        let first = defaults.iter().position(Option::is_some).unwrap_or(defaults.len());
+        if let Some(j) = defaults[first..].iter().position(Option::is_none) {
+            return Err((pos, format!("parameter `{}` needs a default too (it comes after one that has one)", params[first + j].0)));
+        }
         let ret = if self.eat(&Tok::Arrow) { self.ty()? } else { Type::Void };
-        Ok(Func { name, params, ret, body: self.block()?, pos })
+        Ok(Func { name, params, defaults, ret, body: self.block()?, pos })
     }
 
     /// `name: Type` or `name: Type = default`.

@@ -14,6 +14,16 @@
 //     app.listen(8080)?
 //
 // One thread, one event loop (like Node): many connections at once, keep-alive, WebSockets, timers.
+//
+// And a client for HTTP and HTTPS (libcurl underneath):
+//
+//     let r = http.fetch("https://example.com/api/users/1", {"Authorization": "Bearer ${token}"})?
+//     if r.status == 404 { ... }                    // any status is a response; only network trouble is an error
+//     let user = r.json()?
+//     let made = http.request("POST", url, {"Content-Type": "application/json"}, to_json(user))?
+//
+// shortcut: fetch blocks until the answer is there (at most `timeout_ms`), the server's event loop included;
+// move to libcurl's multi interface inside the poll loop once handlers need fetches side by side.
 
 import net
 import json
@@ -33,13 +43,9 @@ extern fn st_now_ms() -> int
 extern fn st_url_decode(s: str) -> str
 extern fn st_file_size(path: str) -> int
 extern fn st_send_file(fd: int, head: str, path: str) -> int
+extern fn st_fetch(method: str, url: str, headers: [str], body: str, timeout_ms: int) -> [str]
 
 const IDLE_MS = 30000
-
-// Milliseconds on a monotonic clock (for measuring time).
-fn now_ms() -> int {
-    return st_now_ms()
-}
 
 struct Request {
     method: str,
@@ -458,6 +464,82 @@ struct App {
 
 fn app() -> App {
     return App {}
+}
+
+// ---- client ----
+
+// What a server answered to `fetch` or `request`.
+struct FetchResponse {
+    status: int,          // 200, 404, 429, ...
+    headers: {str: str},  // lowercase names; repeated headers joined with ", "
+    body: str,
+    header_list: [str] = [], // every header as it came: name, value, name, value, ... (names lowercase)
+
+    // A response header (case-insensitive).
+    fn header(self, name: str) -> str? {
+        return self.headers.get(name.lower())
+    }
+
+    // Every value of a header that can come more than once, like `set-cookie` (JavaScript's `getSetCookie()`).
+    fn header_all(self, name: str) -> [str] {
+        let want = name.lower()
+        let out: [str] = []
+        var i = 0
+        while i + 1 < self.header_list.len() {
+            if self.header_list[i] == want {
+                out.push(self.header_list[i + 1])
+            }
+            i += 2
+        }
+        return out
+    }
+
+    // The body parsed as JSON.
+    fn json(self) -> json.Json! {
+        return json.parse(self.body)
+    }
+}
+
+// GET `url` (http:// or https://). Every HTTP status, 404 and 500 included, comes back as a response;
+// only DNS, connection, TLS and timeout problems are errors. Blocks for at most `timeout_ms`.
+fn fetch(url: str, headers: {str: str} = {}, timeout_ms: int = 8000) -> FetchResponse! {
+    return request("GET", url, headers, "", timeout_ms)
+}
+
+// Any method (GET, POST, PUT, PATCH, DELETE, HEAD, ...), with a request body.
+fn request(method: str, url: str, headers: {str: str} = {}, body: str = "", timeout_ms: int = 8000) -> FetchResponse! {
+    let flat: [str] = []
+    for name, value in headers {
+        flat.push(name)
+        flat.push(value)
+    }
+    let r = st_fetch(method.upper(), url, flat, body, timeout_ms)
+    if r[0] == "" {
+        return err(r[1])
+    }
+    let got: {str: str} = {}
+    let list: [str] = []
+    var i = 2
+    while i + 1 < r.len() {
+        list.push(r[i])
+        list.push(r[i + 1])
+        if let prev = got.get(r[i]) {
+            got[r[i]] = prev + ", " + r[i + 1]
+        } else {
+            got[r[i]] = r[i + 1]
+        }
+        i += 2
+    }
+    return FetchResponse { status: int(r[0])?, headers: got, body: r[1], header_list: list }
+}
+
+// {"start": "0", "q": "a b"} -> "start=0&q=a%20b", in the map's order; names and values url_encode-d.
+fn query(params: {str: str}) -> str {
+    let parts: [str] = []
+    for name, value in params {
+        parts.push(url_encode(name) + "=" + url_encode(value))
+    }
+    return parts.join("&")
 }
 
 // A handler returned an error: answer 500.

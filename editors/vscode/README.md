@@ -43,8 +43,8 @@ The extension looks for the compiler in this order:
 4. the copy bundled inside the extension (platform builds).
 
 If it finds none, it offers to run `cargo install --git https://github.com/ThronKatze0/stellang`.
-To *build and run* programs you also need clang and the Boehm GC library
-(`sudo apt install clang libgc-dev`, or `brew install llvm bdw-gc`). The editor features don't need them.
+To *build and run* programs you also need clang, the Boehm GC library and libcurl
+(`sudo apt install clang libgc-dev libcurl4-openssl-dev`, or `brew install llvm bdw-gc`; macOS ships libcurl). The editor features don't need them.
 
 ## Settings
 
