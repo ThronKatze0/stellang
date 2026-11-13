@@ -90,6 +90,9 @@ pub(super) const BUILTIN_FNS: &[(&str, &str, &str, &str)] = &[
     ("ok", "value", "T!", "A successful result."),
     ("err", "message: str", "T!", "A failed result with a message."),
     ("to_json", "value", "str", "Any struct, enum, list, map or scalar as JSON."),
+    ("args", "", "[str]", "The command-line arguments, without the program name."),
+    ("read_line", "", "str?", "One line from standard input without its line break; `none` at the end of input."),
+    ("exit", "code: int", "void", "End the program now with an exit code."),
 ];
 
 /// Keyword snippets: (label, snippet, detail).

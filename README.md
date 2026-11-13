@@ -385,9 +385,14 @@ println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"p
 ```
 
 - Functions: `print println str int float min max abs env panic some to_json from_json sleep now_ms url_encode
-  url_decode`.
+  url_decode args read_line exit`.
   `from_json(text)` decodes into the type the code expects (`let t: Todo = from_json(body)?`): structs (missing
   fields take their defaults), enums, lists, maps, sets and optionals, the reverse of `to_json`.
+  - `args() -> [str]` gives the command-line arguments without the program name (`./tool a "b c"` ->
+    `["a", "b c"]`; empty in the browser).
+  - `read_line() -> str?` reads a line from standard input without its line break (`\r\n` too) and gives `none` at
+    the end of input, so `while let line = read_line() { ... }` reads it all. What `print` wrote shows up first.
+  - `exit(code)` ends the program right away with that exit code (output is flushed).
   - `sleep(ms)` blocks; `now_ms() -> int` reads a monotonic clock (for timing, TTL caches, uptime).
   - `url_encode(s) -> str` percent-encodes UTF-8 bytes for a URL path segment or query value; only
     `A-Z a-z 0-9 - _ . ~` stay as they are (a bit stricter than JavaScript's `encodeURIComponent`,
