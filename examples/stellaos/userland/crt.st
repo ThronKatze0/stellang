@@ -791,6 +791,22 @@ fn char(code: int) -> str {
     return __str(p)
 }
 
+// the words after the program's name: `run tool.st a b` gives ["a", "b"]
+fn args() -> [str] {
+    let out: [str] = []
+    let b = __alloc_raw(4096)
+    var i = 0
+    while true {
+        let n = __syscall(21, i, b, 4096)
+        if n < 0 { break }
+        let p = __str_new(n)
+        __copy(p + 8, b, n)
+        out.push(__str(p))
+        i += 1
+    }
+    return out
+}
+
 fn user() -> str {
     let b = __alloc_raw(64)
     let n = __syscall(19, b, 64)

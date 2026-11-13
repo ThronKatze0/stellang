@@ -269,7 +269,12 @@ struct Shell {
                 self.fs.chown(self.path(need(argv, 1, "chown <user> <path>")?), u)?
             },
             "cc" => self.compile_cmd(argv)?,
-            "run" => self.run_program(need(argv, 0, "run <file.st | program>")?)?,
+            "run" => {
+                need(argv, 0, "run <file.st | program> [args...] [&]")?
+                let background = argv.last() == some("&")
+                let words = argv.filter(w => w != "&")
+                self.run_program(words[0], words.slice(1, words.len()), background)?
+            },
             "ps" => self.ps(),
             "beep" => {
                 let hz = if argv.len() > 0 { int(argv[0])? } else { 880 }
@@ -373,7 +378,7 @@ struct Shell {
     }
 
     // run a program in the foreground: a .st source (compiled first) or a compiled program file
-    fn run_program(self, file: str) -> void! {
+    fn run_program(self, file: str, args: [str], background: bool) -> void! {
         let path = self.path(file)
         let text = self.fs.read(path)?
         var img = rv_image_none()
@@ -390,6 +395,15 @@ struct Shell {
         let sys = self.sys()
         sys.write = (p: proc.Proc, s: str) => print(s)
         let p = self.procs.spawn(self.fs.name(path), self.user, img.bytes, img.data_at, img.data_size, sys)?
+        p.args = args
+        if background {
+            // it runs on; its output still comes here, but it can't read lines
+            p.no_input = true
+            sys.write = (q: proc.Proc, s: str) => print("[${q.pid}] ${s}")
+            sys.exited = (q: proc.Proc) => println("[${q.pid}] ${q.name} ended${if q.why != "" { ": " + q.why } else { " (exit code ${q.code})" }}")
+            println("[${p.pid}] ${p.name} running in the background (`kill ${p.pid}` ends it)")
+            return
+        }
         // in the foreground: the program has the terminal until it ends (Ctrl-C ends it)
         while !p.done() {
             if p.state == "input" {

@@ -49,6 +49,7 @@ const SYS_WRITE_FILE = 17
 const SYS_PID = 18
 const SYS_USER = 19
 const SYS_TEXT_WIDTH = 20
+const SYS_ARG = 21
 
 extern fn st_k_user_run(frame: int, ms: int) -> int
 extern fn st_k_read_text(src: int, n: int) -> str
@@ -98,6 +99,8 @@ struct Proc {
     my: int = 0,
     buttons: int = 0,
     file: str = "",              // the last file read, between file_size and read_file
+    args: [str] = [],            // its command line (after the program's name)
+    no_input: bool = false,      // running in the background: read_line gets nothing
 
     fn reg(self, n: int) -> int { return kernel.peek64(self.slot.frame + 8 * n) }
     fn set_reg(self, n: int, v: int) { kernel.poke64(self.slot.frame + 8 * n, v) }
@@ -299,10 +302,14 @@ struct Procs {
                 p.kill("bad pointer passed to read_line")
                 return
             }
-            p.input_buf = a
-            p.input_max = b
-            p.state = "input"
-            return
+            if p.no_input {
+                r = -1
+            } else {
+                p.input_buf = a
+                p.input_max = b
+                p.state = "input"
+                return
+            }
         } else if n == SYS_NOW {
             r = kernel.uptime()
         } else if n == SYS_SLEEP {
@@ -373,6 +380,9 @@ struct Procs {
                     if e2 == "" { r = 0 } else { p.sys.write(p, "write_file ${path}: ${e2}\n") }
                 }
             }
+        } else if n == SYS_ARG {
+            // the a-th argument into (b, c); -1 past the last
+            r = if a >= 0 && a < p.args.len() { p.put(b, c, p.args[a]) } else { -1 }
         } else if n == SYS_PID {
             r = p.pid
         } else if n == SYS_USER {

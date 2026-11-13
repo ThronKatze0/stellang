@@ -523,8 +523,8 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
   file sidebar) with a **Run** button (F5): the program is compiled right there to RISC-V machine code (a 30 KB
   program in about 40 ms) and runs as a process. Its output and questions are in the console under the editor,
   its graphics in a window of its own; a compile error is marked at its line, a crash ends the program with a
-  message and nothing else. From the shell: `run hello.st`, `cc game.st -o game` then `run game`, `ps`,
-  `kill <pid>`. Example programs are in `/home/examples` (a game, bouncing balls, a sketch pad, music, files).
+  message and nothing else. From the shell: `run hello.st`, `run tool.st a b` (the words come back from
+  `args()`), `run long.st &` (in the background), `cc game.st -o game` then `run game`, `ps`, `kill <pid>`. Example programs are in `/home/examples` (a game, bouncing balls, a sketch pad, music, files).
   - **The language** is stellang, the parts a one-file program needs: `fn`, `struct` with fields, defaults and
     methods, `enum`s of plain variants (`Light.Red`, `.Red`; `match` on them must cover every one),
     `const`/`let`/`var`, `int`/`float`/`bool`/`str` and lists (`[int]`, `[[str]]`, `[Point]`), `if`/`else` and
@@ -535,7 +535,7 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
     runtime errors name their line, and memory is garbage-collected (a mark-and-sweep collector, also written
     in the language).
   - **Built in**: `print println input read_line sleep now_ms random exit max min abs parse_int parse_float
-    is_number char pid user gc_count memory_used`, math (`sin cos tan atan atan2 exp log pow sqrt PI E`),
+    is_number char args pid user gc_count memory_used`, math (`sin cos tan atan atan2 exp log pow sqrt PI E`),
     files (`read_file write_file file_exists`: as the program's user, relative to their home), graphics
     (`window clear rect circle line text big_text mono_text text_width show key mouse_x mouse_y mouse_down rgb`)
     and sound (`beep(hz, ms)`, `note("A4")`). The runtime behind them (strings, lists, printing, the system
