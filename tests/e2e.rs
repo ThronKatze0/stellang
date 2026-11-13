@@ -870,6 +870,9 @@ fn main() -> void! {
     app.get("/limited", (req, res) => res.status(429).set("Retry-After", "2").send("slow down"))
     app.post("/echo", (req, res) => res.status(201).send("${req.method} ${req.header("x-test") ?? "-"} ${req.body}"))
     app.delete("/items/:id", (req, res) => res.send("deleted ${req.param("id")}"))
+    app.get("/cookies", (req, res) => {
+        res.cookie("a", "1; Expires=Wed, 21 Oct 2026 07:28:00 GMT").cookie("b", "2").send("${req.query.get("start") ?? "-"} ${req.query.get("q") ?? "-"}")
+    })
     app.listen(int(env("PORT"))?)?
 }"#;
     let client_src = r#"
@@ -899,6 +902,12 @@ fn main() -> void! {
     println("${posted.status} ${posted.body}")
     let deleted = http.request("DELETE", "${base}/items/3")?
     println("${deleted.status} ${deleted.body}")
+
+    let c = http.fetch("${base}/cookies?${http.query({"start": "0", "q": "a b&c"})}")?
+    println(c.body)
+    println(c.header_all("Set-Cookie"))
+    println(c.header_all("x-none").len())
+    println(http.query({}) == "")
 
     let refused = http.fetch("http://127.0.0.1:${env("CLOSED_PORT")}/") catch e {
         println("refused: ${e}")
@@ -944,10 +953,14 @@ fn main() -> void! {
         "2000",
         "201 POST yes {\"a\":1}",
         "200 deleted 3",
+        "0 a b&c",
+        r#"["a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Path=/; HttpOnly", "b=2; Path=/; HttpOnly"]"#,
+        "0",
+        "true",
     ];
     assert_eq!(lines.len(), want.len() + 1, "{stdout}");
     assert_eq!(lines[..want.len()], want);
-    assert!(lines[want.len()].starts_with("refused: GET http://127.0.0.1:"), "{stdout}");
+    assert!(lines[want.len()].starts_with("refused: connect: GET http://127.0.0.1:"), "{stdout}");
 }
 
 /// A server that accepts the connection but never answers: fetch gives up after `timeout_ms` with an error.
@@ -963,7 +976,7 @@ fn main() {{
     let start = now_ms()
     let r = http.fetch("http://127.0.0.1:{port}/slow", {{}}, 300) catch e {{
         println("error after ${{now_ms() - start >= 250 && now_ms() - start < 5000}}")
-        println(e.contains("imeout") || e.contains("timed out"))
+        println(e.starts_with("timeout: GET http://127.0.0.1:"))
         return
     }}
     println("got ${{r.status}}")
@@ -972,4 +985,97 @@ fn main() {{
     let (code, out, err) = run("fetch_timeout", &src);
     drop(hang);
     assert_eq!((code, out.as_str(), err.as_str()), (0, "error after true\ntrue\n", ""));
+}
+
+/// A hand-written keep-alive server that numbers its connections: three fetches share one connection,
+/// and a body over 64 MB stops with a `too_large:` error. Unknown hosts give `dns:`.
+#[test]
+fn http_fetch_reuse_and_limits() {
+    use std::io::{BufRead, BufReader};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for (n, conn) in listener.incoming().enumerate() {
+            let Ok(conn) = conn else { return };
+            thread::spawn(move || {
+                let mut w = conn.try_clone().unwrap();
+                let mut r = BufReader::new(conn);
+                loop {
+                    let mut first = String::new();
+                    if r.read_line(&mut first).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    loop {
+                        let mut line = String::new();
+                        if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    if first.contains("/big") {
+                        let size = (64usize << 20) + 1;
+                        if write!(w, "HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n\r\n").is_err() {
+                            return;
+                        }
+                        let chunk = vec![b'a'; 1 << 20];
+                        let mut left = size;
+                        while left > 0 {
+                            let k = left.min(chunk.len());
+                            if w.write_all(&chunk[..k]).is_err() {
+                                return;
+                            }
+                            left -= k;
+                        }
+                    } else {
+                        let body = format!("conn {}", n + 1);
+                        if write!(w, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let src = format!(
+        r#"
+import http
+
+fn main() -> void! {{
+    let base = "http://127.0.0.1:{port}"
+    for i in 0..3 {{
+        println(http.fetch("${{base}}/n/${{i}}")?.body)
+    }}
+    let big = http.fetch("${{base}}/big", {{}}, 20000) catch e {{
+        println(e.starts_with("too_large: GET ${{base}}/big: "))
+        return
+    }}
+    println("unexpected ${{big.body.len()}}")
+}}"#
+    );
+    ok("fetch_reuse", &src, "conn 1\nconn 1\nconn 1\ntrue\n");
+    let src = r#"
+import http
+
+fn main() {
+    let r = http.fetch("http://no-such-host.invalid/", {}, 3000) catch e {
+        println(e.starts_with("dns: GET http://no-such-host.invalid/: "))
+        return
+    }
+    println("got ${r.status}")
+}"#;
+    ok("fetch_dns", src, "true\n");
+}
+
+#[test]
+fn url_decode_builtin() {
+    let src = r#"
+fn main() {
+    println(url_decode("Hide%20on%20bush"))
+    println(url_decode("a+b%2Bc"))
+    println(url_decode("Gr%C3%BC%C3%9Fe"))
+    println(url_decode("100%"))
+    println(url_decode(url_encode("a/b?c=d&e+f 🦀")))
+}"#;
+    ok("url_decode", src, "Hide on bush\na b+c\nGrüße\n100%\na/b?c=d&e+f 🦀\n");
+    let (code, _, err) = run("url_decode_bad", "fn main() { url_decode(1) }");
+    assert!(code == -1 && err.contains("expected str"), "{err}");
 }

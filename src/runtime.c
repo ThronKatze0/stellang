@@ -944,9 +944,47 @@ static void bytes_add(Bytes *b, const char *p, size_t n) {
     b->p[b->len] = 0;
 }
 
+// the same cap as a request body on the server side
+#define FETCH_MAX_BODY (64u << 20)
+
+typedef struct { Bytes b; bool too_large; } Body;
+
 static size_t on_body(char *p, size_t size, size_t n, void *ud) {
-    bytes_add(ud, p, size * n);
+    Body *body = ud;
+    if (body->b.len + size * n > FETCH_MAX_BODY) {
+        body->too_large = true;
+        return 0; // makes curl stop with CURLE_WRITE_ERROR
+    }
+    bytes_add(&body->b, p, size * n);
     return size * n;
+}
+
+// What kind of trouble a failed transfer was, as the error's prefix: whether a retry can help shows in it.
+static const char *fetch_kind(CURLcode rc) {
+    switch (rc) {
+    case CURLE_OPERATION_TIMEDOUT: return "timeout";
+    case CURLE_COULDNT_RESOLVE_HOST:
+    case CURLE_COULDNT_RESOLVE_PROXY: return "dns";
+    case CURLE_COULDNT_CONNECT:
+    case CURLE_SEND_ERROR:
+    case CURLE_RECV_ERROR:
+    case CURLE_GOT_NOTHING:
+    case CURLE_PARTIAL_FILE: return "connect";
+    case CURLE_SSL_CONNECT_ERROR:
+    case CURLE_PEER_FAILED_VERIFICATION:
+    case CURLE_SSL_CERTPROBLEM:
+    case CURLE_SSL_CIPHER:
+    case CURLE_SSL_CACERT_BADFILE:
+    case CURLE_SSL_ENGINE_NOTFOUND:
+    case CURLE_SSL_ENGINE_SETFAILED:
+    case CURLE_SSL_ENGINE_INITFAILED:
+    case CURLE_SSL_SHUTDOWN_FAILED:
+    case CURLE_SSL_CRL_BADFILE:
+    case CURLE_SSL_ISSUER_ERROR:
+    case CURLE_SSL_PINNEDPUBKEYNOTMATCH:
+    case CURLE_SSL_INVALIDCERTSTATUS: return "tls";
+    default: return "other";
+    }
 }
 
 // one header line; a new status line (a redirect, `100 Continue`) starts the list over
@@ -970,26 +1008,22 @@ static size_t on_header(char *p, size_t size, size_t n, void *ud) {
 }
 
 // [status, body, name, value, name, value, ...] (names lowercase), or ["", error message].
-// Any HTTP status is an answer; only DNS, connect, TLS, timeout and the like are errors.
+// Any HTTP status is an answer; only DNS, connect, TLS, timeout and the like are errors. Those start with
+// their kind: `timeout:`, `dns:`, `connect:`, `tls:`, `too_large:` or `other:`.
 Vec *st_fetch(const char *method, const char *url, Vec *headers, const char *body, int64_t timeout_ms) {
-    static bool ready;
+    // one handle for the whole program: curl_easy_reset clears the options but keeps its connection cache,
+    // so the next fetch to the same host skips the TCP and TLS handshakes
+    static CURL *c;
     Vec *out = st_vec_new(0, sizeof(char *), 0);
-    if (!ready) {
-        if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+    if (!c) {
+        if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK || !(c = curl_easy_init())) {
             st_vec_push_str(out, "");
-            st_vec_push_str(out, "fetch: cannot initialize libcurl");
+            st_vec_push_str(out, "other: fetch: cannot initialize libcurl");
             return out;
         }
-        ready = true;
-    }
-    CURL *c = curl_easy_init();
-    if (!c) {
-        st_vec_push_str(out, "");
-        st_vec_push_str(out, "fetch: cannot initialize libcurl");
-        return out;
-    }
-    Bytes got = {0};
-    bytes_add(&got, "", 0);
+    } else curl_easy_reset(c);
+    Body got = {0};
+    bytes_add(&got.b, "", 0);
     Vec *hs = st_vec_new(0, sizeof(char *), 0);
     char errbuf[CURL_ERROR_SIZE] = {0};
     struct curl_slist *list = NULL;
@@ -1028,16 +1062,20 @@ Vec *st_fetch(const char *method, const char *url, Vec *headers, const char *bod
     CURLcode rc = curl_easy_perform(c);
     long status = 0;
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+    // the handle outlives this call: don't leave it pointing at our stack or the freed header list
+    curl_easy_setopt(c, CURLOPT_ERRORBUFFER, NULL);
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, NULL);
     curl_slist_free_all(list);
-    curl_easy_cleanup(c);
     if (rc != CURLE_OK) {
-        const char *why = *errbuf ? errbuf : curl_easy_strerror(rc);
+        const char *kind = got.too_large ? "too_large" : fetch_kind(rc);
+        const char *why = got.too_large ? "the response body is over 64 MB" : *errbuf ? errbuf : curl_easy_strerror(rc);
+        char *what = st_concat(st_concat(st_concat(st_concat(kind, ": "), method), " "), url);
         st_vec_push_str(out, "");
-        st_vec_push_str(out, st_concat(st_concat(st_concat(st_concat(method, " "), url), ": "), why));
+        st_vec_push_str(out, st_concat(st_concat(what, ": "), why));
         return out;
     }
     st_vec_push_str(out, st_itoa(status));
-    st_vec_push_str(out, got.p); // shortcut: str is NUL-terminated, so binary bodies get cut; add a byte type if one is ever needed
+    st_vec_push_str(out, got.b.p); // shortcut: str is NUL-terminated, so binary bodies get cut; add a byte type if one is ever needed
     for (int64_t i = 0; i < hs->len; i++) st_vec_push_str(out, ((char **)hs->data)[i]);
     return out;
 }

@@ -473,10 +473,25 @@ struct FetchResponse {
     status: int,          // 200, 404, 429, ...
     headers: {str: str},  // lowercase names; repeated headers joined with ", "
     body: str,
+    header_list: [str] = [], // every header as it came: name, value, name, value, ... (names lowercase)
 
     // A response header (case-insensitive).
     fn header(self, name: str) -> str? {
         return self.headers.get(name.lower())
+    }
+
+    // Every value of a header that can come more than once, like `set-cookie` (JavaScript's `getSetCookie()`).
+    fn header_all(self, name: str) -> [str] {
+        let want = name.lower()
+        let out: [str] = []
+        var i = 0
+        while i + 1 < self.header_list.len() {
+            if self.header_list[i] == want {
+                out.push(self.header_list[i + 1])
+            }
+            i += 2
+        }
+        return out
     }
 
     // The body parsed as JSON.
@@ -503,8 +518,11 @@ fn request(method: str, url: str, headers: {str: str} = {}, body: str = "", time
         return err(r[1])
     }
     let got: {str: str} = {}
+    let list: [str] = []
     var i = 2
     while i + 1 < r.len() {
+        list.push(r[i])
+        list.push(r[i + 1])
         if let prev = got.get(r[i]) {
             got[r[i]] = prev + ", " + r[i + 1]
         } else {
@@ -512,7 +530,16 @@ fn request(method: str, url: str, headers: {str: str} = {}, body: str = "", time
         }
         i += 2
     }
-    return FetchResponse { status: int(r[0])?, headers: got, body: r[1] }
+    return FetchResponse { status: int(r[0])?, headers: got, body: r[1], header_list: list }
+}
+
+// {"start": "0", "q": "a b"} -> "start=0&q=a%20b", in the map's order; names and values url_encode-d.
+fn query(params: {str: str}) -> str {
+    let parts: [str] = []
+    for name, value in params {
+        parts.push(url_encode(name) + "=" + url_encode(value))
+    }
+    return parts.join("&")
 }
 
 // A handler returned an error: answer 500.

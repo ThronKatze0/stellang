@@ -24,6 +24,7 @@ pub struct Unit {
 pub const RESERVED: &[&str] = &[
     "print", "println", "str", "int", "float", "env", "panic", "ok", "err", "bool", "void", "true", "false", "min", "max",
     "abs", "some", "none", "to_json", "self", "sleep", "now_ms", "url_encode",
+    "url_decode",
 ];
 
 /// Signatures of the newer builtins, for hover.
@@ -31,6 +32,7 @@ const BUILTIN_SIGS: &[(&str, &str)] = &[
     ("sleep", "fn sleep(ms: int)"),
     ("now_ms", "fn now_ms() -> int"),
     ("url_encode", "fn url_encode(s: str) -> str"),
+    ("url_decode", "fn url_decode(s: str) -> str"),
 ];
 
 const RUNTIME: &str = r#"%st.vec = type { i64, i64, ptr }
@@ -50,6 +52,7 @@ declare ptr @st_itoa(i64)
 declare ptr @st_parse_int(ptr, ptr)
 declare ptr @st_env(ptr)
 declare ptr @st_url_encode(ptr)
+declare ptr @st_url_decode(ptr)
 declare void @st_sleep(i64)
 declare i64 @st_now_ms()
 declare ptr @st_slice(ptr, i64, i64, ptr)
@@ -2809,6 +2812,11 @@ impl Gen {
                 let v = one(self, Some(&Type::Str))?;
                 expect_ty(&Type::Str, &v.ty, args[0].pos)?;
                 self.rt(Type::Str, "st_url_encode", &[format!("ptr {}", v.v)])
+            }
+            "url_decode" => {
+                let v = one(self, Some(&Type::Str))?;
+                expect_ty(&Type::Str, &v.ty, args[0].pos)?;
+                self.rt(Type::Str, "st_url_decode", &[format!("ptr {}", v.v)])
             }
             "sleep" => {
                 let v = one(self, Some(&Type::Int))?;

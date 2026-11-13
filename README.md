@@ -246,11 +246,14 @@ let area = 3.14 * r * r                     // int and float mix; int(2.9) == 2,
 println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"pt": Point { x: 1.0, y: 2.0 }}
 ```
 
-- Functions: `print println str int float min max abs env panic some to_json sleep now_ms url_encode`.
+- Functions: `print println str int float min max abs env panic some to_json sleep now_ms url_encode
+  url_decode`.
   - `sleep(ms)` blocks; `now_ms() -> int` reads a monotonic clock (for timing, TTL caches, uptime).
   - `url_encode(s) -> str` percent-encodes UTF-8 bytes for a URL path segment or query value; only
     `A-Z a-z 0-9 - _ . ~` stay as they are (a bit stricter than JavaScript's `encodeURIComponent`,
     which also leaves `! * ' ( )`; servers decode both the same).
+  - `url_decode(s) -> str` undoes `%XX` escapes. Like form data and query strings, it also turns `+` into a
+    space, so a literal `+` must arrive as `%2B` (which `url_encode` does).
 - `str`: `len is_empty split lines chars find count slice trim trim_start trim_end lower upper starts_with
   ends_with contains replace repeat reverse`, `s[i]`, `<` `>` compare.
 - `float`: `floor ceil round sqrt abs`.
@@ -279,8 +282,15 @@ println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"p
     `http.request(method, url, headers = {}, body = "", timeout_ms = 8000) -> FetchResponse!` any method.
   - `FetchResponse { status, headers, body }` with `r.header(name) -> str?` (case-insensitive; `headers` has
     lowercase names) and `r.json() -> json.Json!`. Redirects are followed and gzip is decoded.
+  - A header sent more than once is joined with `, ` in `headers`. That breaks `set-cookie`, so
+    `r.header_all("set-cookie") -> [str]` gives each value on its own (like JavaScript's `getSetCookie()`).
+  - `http.query({"start": "0", "count": "20"})` -> `start=0&count=20`, names and values `url_encode`-d, in the
+    map's order.
   - Every HTTP status, `404` and `429` included, is a normal response: check `r.status`. Only DNS, connection,
-    TLS and timeout problems come back as `err(...)`.
+    TLS and timeout problems come back as `err(...)`. The error starts with its kind, so you can tell whether a
+    retry makes sense: `timeout:`, `dns:`, `connect:` (refused, reset or cut off), `tls:`, `too_large:` (the
+    body is over 64 MB) or `other:`, e.g. `if e.starts_with("timeout:") { ... }`.
+  - Connections are kept open and reused: the next fetch to the same host skips the TCP and TLS handshakes.
   - `CURL_CA_BUNDLE` or `SSL_CERT_FILE` point it at a different CA bundle; `https_proxy`/`no_proxy` are honored.
   - It blocks until the answer is there. Inside a server handler that holds up the whole event loop (up to
     `timeout_ms`), so keep timeouts short and cache answers.
