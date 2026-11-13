@@ -2222,6 +2222,7 @@ fn stellaos_procs() {
         "error on line 28: no key \"nobody\" in the map",
         "Circle(1.0) has area 3.0\nRect { w: 2.0, h: 1.0 } has area 2.0\nRect { w: 3.0, h: 3.0 } has area 9.0\nEmpty has area 0.0\n",
         "Add(Num(2), Mul(Num(3), Neg(Num(4)))) = -10\n0\ntom is a cat\nrex is a terrier\nDog(\"terrier\")\n[exit 0]",
+        "42\n-1\nerror: an age can't be negative\n0\n6\ntotal failed: not a whole number: \"oops\"\n-1\nhello ada\ncheck: no name\n2.5\ntrue true true false\nerror: no name\n[exit 1]",
         "found ada ada@example.org 36\nbob: no email none\ntrue\n5 none 4 -1\n3 4 1 none 4\n99\n36 none\ntrue\ntrue now\n6\n\nerror on line 38: unwrap() of none",
         "[exe] from a file",
         "exe parse of junk: true",

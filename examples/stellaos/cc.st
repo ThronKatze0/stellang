@@ -451,7 +451,8 @@ struct Parser {
         let t = self.peek()
         let name = self.ident()
         if self.accept("?") { return name + "?" }
-        if self.is("!") { self.fail("result types (`T!`) aren't supported here yet") }
+        if self.accept("!") { return name + "!" }
+        if self.accept("!") { return name + "!" }
         return name
     }
 
@@ -755,7 +756,23 @@ struct Parser {
         var left = self.binary(level + 1)
         while self.err == "" {
             let t = self.peek()
-            if t.k != "op" || !LEVELS[level].contains(t.s) { break }
+            if level == 0 && t.k == "id" && t.s == "catch" {
+                // x catch default, x catch e { ... }
+                self.next()
+                let n = self.node("catch", t)
+                n.kids.push(left)
+                if self.peek().k == "id" && self.peek2().k == "op" && self.peek2().s == "{" {
+                    n.s = self.ident()
+                    n.n = 1
+                    n.kids.push(self.block())
+                } else {
+                    n.kids.push(self.binary(1))
+                }
+                left = n
+                continue
+            }
+            let is_in = level == 3 && t.k == "id" && t.s == "in"
+            if !is_in && (t.k != "op" || !LEVELS[level].contains(t.s)) { break }
             self.next()
             self.skip_nl()
             let n = self.node("bin", t)
@@ -819,8 +836,11 @@ struct Parser {
                 n.kids.push(self.expr())
                 self.expect("]")
                 x = n
-            } else if self.is("?") {
-                self.fail("`?` isn't supported here yet")
+            } else if self.is("?") && !(self.peek2().k == "op" && self.peek2().s == ".") {
+                self.next()
+                let n = self.node("try", t)
+                n.kids.push(x)
+                x = n
             } else {
                 break
             }
@@ -1342,8 +1362,9 @@ struct Gen {
 
     fn known_type(self, e: Tree, ty: str) {
         if ty == "int" || ty == "bool" || ty == "str" || ty == "float" || ty == "?" { return }
-        if ty.ends_with("?") {
-            self.known_type(e, ty.slice(0, ty.len() - 1))
+        if ty.ends_with("?") || ty.ends_with("!") {
+            let inner = ty.slice(0, ty.len() - 1)
+            if inner != "void" { self.known_type(e, inner) }
             return
         }
         if ty.starts_with("{") {
@@ -1424,6 +1445,14 @@ struct Gen {
         a.sd(rv.SP, rv.T0, 0)
         a.call("g_init")
         a.call("f_main")
+        if self.funcs.contains("main") && self.funcs["main"].ret.ends_with("!") {
+            let fine = a.label()
+            a.ld(rv.T0, rv.A0, 0)
+            a.jump_if_zero(rv.T0, fine)
+            a.push(rv.A0)
+            a.call("f___main_err")
+            a.place(fine)
+        }
         a.li(rv.A0, 0)
         a.li(rv.A7, 0)
         a.ecall()
@@ -1515,7 +1544,11 @@ struct Gen {
             self.store_slot(rv.T0, slot)
         }
         self.block(f.body)
-        if f.ret != "void" && !returns(f.body) {
+        if f.ret == "void!" {
+            a.li(rv.A0, 0)
+            a.push(rv.A0)
+            self.rt("__ok", 1)
+        } else if f.ret != "void" && !returns(f.body) {
             self.die(Tree { k: "", line: f.line, col: f.col }, "fn ${f.name} ended without returning a value")
         }
         self.end_function(patch)
@@ -1703,7 +1736,11 @@ struct Gen {
                 a.jump(self.exit_label)
                 return
             }
-            if st.kids.is_empty() {
+            if st.kids.is_empty() && self.ret == "void!" {
+                a.li(rv.A0, 0)
+                a.push(rv.A0)
+                self.rt("__ok", 1)
+            } else if st.kids.is_empty() {
                 if self.ret != "void" { self.fail(st, "this function returns ${self.ret}: `return` needs a value") }
             } else {
                 if self.ret == "void" { self.fail(st, "this function doesn't return a value (add `-> type` to its signature)") }
@@ -1990,6 +2027,17 @@ struct Gen {
             self.int_to_float(rv.A0)
             return "float"
         }
+        if want.ends_with("!") && t != want && t != "?" && t != "err" {
+            let inner = want.slice(0, want.len() - 1)
+            if t == inner || (inner == "float" && t == "int") {
+                if inner == "float" && t == "int" { self.int_to_float(rv.A0) }
+                let a = self.a
+                a.push(rv.A0)
+                self.rt("__ok", 1)
+                return want
+            }
+        }
+        if t == "err" && want.ends_with("!") { return want }
         if want.ends_with("?") && t != want && t != "?" {
             let inner = want.slice(0, want.len() - 1)
             if t == "none" { return want }
@@ -2098,6 +2146,52 @@ struct Gen {
         }
         if k == "matchx" { return self.match_(e, true, want) }
         if k == "lambda" { return self.lambda(e, want) }
+        if k == "try" {
+            let rt0 = self.expr(e.kids[0], "")
+            if !rt0.ends_with("!") {
+                self.fail(e, "`?` goes after something that can fail (T!), not ${rt0}")
+                return rt0
+            }
+            if !self.ret.ends_with("!") && self.ret != "?" {
+                self.fail(e, "`?` passes the error on, so this function must return a result: -> ${if self.ret == "void" { "void" } else { self.ret }}!")
+            }
+            let ok_l = a.label()
+            a.ld(rv.T0, rv.A0, 0)
+            a.jump_if_zero(rv.T0, ok_l)
+            if self.ret == "?" { self.ret = rt0 }
+            a.jump(self.exit_label)              // the error, as it is, is our result
+            a.place(ok_l)
+            a.ld(rv.A0, rv.A0, 8)
+            return rt0.slice(0, rt0.len() - 1)
+        }
+        if k == "catch" {
+            let rt0 = self.expr(e.kids[0], "")
+            if !rt0.ends_with("!") {
+                self.fail(e, "`catch` goes after something that can fail (T!), not ${rt0}")
+                return rt0
+            }
+            let inner = rt0.slice(0, rt0.len() - 1)
+            let bad = a.label()
+            let end = a.label()
+            a.ld(rv.T0, rv.A0, 0)
+            a.jump_if_not_zero(rv.T0, bad)
+            a.ld(rv.A0, rv.A0, 8)
+            a.jump(end)
+            a.place(bad)
+            var t2 = inner
+            if e.n == 1 {
+                a.ld(rv.A0, rv.A0, 8)
+                self.scope_in()
+                self.bind(e, e.s, "str", false)
+                t2 = self.value_block(e.kids[1], inner)
+                self.scope_out()
+            } else {
+                t2 = self.expr(e.kids[1], inner)
+            }
+            if inner != "void" && t2 != "never" { self.check(e.kids[1], t2, inner, "`catch`") }
+            a.place(end)
+            return inner
+        }
         if k == "none" {
             a.li(rv.A0, 0)
             return if want.ends_with("?") { want } else { "none" }
@@ -2169,7 +2263,10 @@ struct Gen {
         self.scope_in()
         var ty = "void"
         for k, st in b.kids {
-            if k == b.kids.len() - 1 {
+            if k == b.kids.len() - 1 && (st.k == "return" || st.k == "break" || st.k == "continue") {
+                self.statement(st)
+                ty = "never"
+            } else if k == b.kids.len() - 1 {
                 if st.k != "expr" {
                     self.fail(st, "this `if` gives a value: end the block with one")
                 } else {
@@ -2181,6 +2278,7 @@ struct Gen {
         }
         if b.kids.is_empty() { self.fail(b, "this `if` gives a value: the block can't be empty") }
         self.scope_out()
+        if ty == "never" { return if want != "" { want } else { "?" } }
         return ty
     }
 
@@ -2615,6 +2713,33 @@ struct Gen {
             a.place(end)
             return "bool"
         }
+        if op == "in" {
+            // x in list / sub in str / key in map
+            let ct = self.expr(e.kids[1], "")
+            a.push(rv.A0)
+            if ct == "str" {
+                let t = self.expr(e.kids[0], "str")
+                self.check(e.kids[0], t, "str", "`in`")
+                a.push(rv.A0)
+                self.rt("__s_contains", 2)
+            } else if ct.starts_with("{") {
+                let kt = map_types(ct)[0]
+                let t = self.expr(e.kids[0], kt)
+                self.check(e.kids[0], t, kt, "`in`")
+                a.push(rv.A0)
+                self.rt("__m_contains", 2)
+            } else if ct.starts_with("[") {
+                let et = elem(ct)
+                let t = self.expr(e.kids[0], et)
+                self.check(e.kids[0], t, et, "`in`")
+                a.push(rv.A0)
+                self.rt(if et == "str" { "__l_contains_str" } else { "__l_contains_int" }, 2)
+            } else {
+                a.addi(rv.SP, rv.SP, 8)
+                self.fail(e, "`in` looks in a list, a string or a map, not ${ct}")
+            }
+            return "bool"
+        }
         let lt = self.expr(e.kids[0], "")
         a.push(rv.A0)
         let rt2 = self.expr(e.kids[1], if lt == "?" { "" } else { lt })
@@ -2823,6 +2948,18 @@ struct Gen {
         if name.starts_with("__") && self.crt {
             if let t = self.intrinsic(e) { return t }
         }
+        if name == "err" && self.lookup(name) == none {
+            if e.kids.len() != 1 {
+                self.fail(e, "err() takes a message")
+                return "err"
+            }
+            let t = self.expr(e.kids[0], "str")
+            self.check(e.kids[0], t, "str", "err's message")
+            a.push(rv.A0)
+            self.rt("__err", 1)
+            if !want.ends_with("!") { self.fail(e, "err() makes a failed result: return it from a function that returns T!") }
+            return "err"
+        }
         if name == "some" && self.lookup(name) == none {
             if e.kids.len() != 1 {
                 self.fail(e, "some() takes one value")
@@ -2841,7 +2978,10 @@ struct Gen {
             }
             let t = self.expr(e.kids[0], "")
             if t == "str" {
-                self.fail(e, if name == "int" { "for text, use parse_int(s)" } else { "for text, use parse_float(s)" })
+                // a number from text: it can fail
+                a.push(rv.A0)
+                self.rt(if name == "int" { "__int_res" } else { "__float_res" }, 1)
+                return name + "!"
             } else if t != "int" && t != "float" && t != "?" {
                 self.fail(e, "${name}() of ${t}")
             }
