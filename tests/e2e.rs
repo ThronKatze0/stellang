@@ -1509,7 +1509,8 @@ fn kernel_boots_stellaos() {
     let mut stdin = q.stdin.take().unwrap();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(1500));
-        for cmd in ["write a.txt hi there", "cat a.txt", "calc (1 << 10) | 0x0f", "ls", "mem", "nope", "shutdown"] {
+        // a fresh system: the console asks for the first account first
+        for cmd in ["ada", "secret1", "secret1", "write a.txt hi there", "cat a.txt", "calc (1 << 10) | 0x0f", "ls", "mem", "nope", "shutdown"] {
             stdin.write_all(format!("{cmd}\r").as_bytes()).unwrap();
             stdin.flush().unwrap();
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -1518,7 +1519,7 @@ fn kernel_boots_stellaos() {
     let out = q.wait_with_output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
     assert_eq!(out.status.code(), Some(0), "{text}");
-    for want in ["StellaOS 0.3", "hi there\n", "1039  (0x40f)", "a.txt  (9 B)", "hello.st", "RAM      128.0 MiB", "unknown command: nope", "bye!"] {
+    for want in ["StellaOS 0.3", "Hello, ada!", "hi there\n", "1039  (0x40f)", "a.txt  (9 B)", "todo.txt", "RAM      128.0 MiB", "unknown command: nope", "bye!"] {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
 
@@ -1636,6 +1637,9 @@ fn stellaos_desktop() {
 
     let text = boot(
         &|keys, serial| {
+            // the first account, made on the console: the desktop opens for it
+            serial("ada\rsecret1\rsecret1\r");
+            std::thread::sleep(Duration::from_millis(1500));
             serial("windows\r");
             // typed into the Terminal window (focused at boot), run by the shell
             keys("echo typed on the desktop\n");
@@ -1653,6 +1657,8 @@ fn stellaos_desktop() {
     }
     let text = boot(
         &|_keys, serial| {
+            serial("ada\rsecret1\r");
+            std::thread::sleep(Duration::from_millis(1500));
             serial("cat kept.txt\r");
             serial("shutdown\r");
         },
@@ -1866,8 +1872,13 @@ fn stellaos_network() {
     let guest_ip = |st: &std::cell::RefCell<State>| st.borrow().frames.iter().filter(|f| f[12..14] == [8, 0]).count();
 
     pump(Duration::from_millis(2500));
+    sh("ada", 100);
+    sh("secret1", 100);
+    sh("secret1", 1500);
     sh("ifconfig set 10.0.2.15/24 10.0.2.66", 300);
-    sh("dns 10.0.2.66", 300);
+    sh("sudo ifconfig set 10.0.2.15/24 10.0.2.66", 300);
+    sh("secret1", 1200);
+    sh("sudo dns 10.0.2.66", 300);
     // 1. stealth: pings, a SYN scan of 300 ports and UDP to closed ports get no answer at all
     st.borrow_mut().frames.clear();
     for i in 0..5 {
@@ -1924,7 +1935,7 @@ fn stellaos_network() {
     sh("uname", 500);
     assert!(text().contains("StellaOS"), "the kernel didn't survive malformed frames:\n{}", text());
     // 4. a ping flood, with answering on: rate-limited
-    sh("firewall ping on", 300);
+    sh("sudo firewall ping on", 300);
     st.borrow_mut().frames.clear();
     for i in 0..300 {
         send(&ip4(1, &icmp(8, 99, i, b"flood")));
@@ -1932,7 +1943,7 @@ fn stellaos_network() {
     pump(Duration::from_millis(2500));
     let replies = st.borrow().frames.iter().filter(|f| f[12..14] == [8, 0] && f[23] == 1 && f[34] == 0).count();
     assert!(replies > 0 && replies <= 45, "{replies} ping replies");
-    sh("firewall ping off", 300);
+    sh("sudo firewall ping off", 300);
     // 5. hostile DNS answers are all refused; an honest one is taken
     clear();
     sh("host evil.example", 5500);
@@ -1973,7 +1984,9 @@ fn stellaos_crypto() {
     let dir = tmpdir("crypto");
     for e in fs::read_dir(root.join("examples/stellaos")).unwrap() {
         let p = e.unwrap().path();
-        fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+        if p.is_file() {
+            fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+        }
     }
     fs::copy(root.join("tests/stellaos_crypto.st"), dir.join("crypto_test.st")).unwrap();
     let elf = dir.join("t.elf");
@@ -2002,7 +2015,9 @@ fn stellaos_js() {
     let dir = tmpdir("jsengine");
     for e in fs::read_dir(root.join("examples/stellaos")).unwrap() {
         let p = e.unwrap().path();
-        fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+        if p.is_file() {
+            fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+        }
     }
     fs::copy(root.join("tests/stellaos_js.st"), dir.join("js_test.st")).unwrap();
     let elf = dir.join("t.elf");
@@ -2095,9 +2110,14 @@ fn stellaos_https() {
     let mut stdin = q.stdin.take().unwrap();
     std::thread::sleep(Duration::from_millis(3000));
     for (cmd, wait) in [
+        ("ada".to_string(), 100),
+        ("secret1".to_string(), 100),
+        ("secret1".to_string(), 1500),
         (format!("fetch https://10.0.2.2:{good_port}/"), 6000),
         ("mkdir /etc/ca".to_string(), 300),
-        (format!("fetch http://10.0.2.2:{http_port}/ca.pem -o /etc/ca/test.pem"), 2000),
+        ("sudo mkdir /etc/ca".to_string(), 300),
+        ("secret1".to_string(), 1200),
+        (format!("sudo fetch http://10.0.2.2:{http_port}/ca.pem -o /etc/ca/test.pem"), 2000),
         (format!("fetch -i https://10.0.2.2:{good_port}/"), 8000),
         (format!("fetch https://10.0.2.2:{wrong_port}/"), 8000),
         ("shutdown".to_string(), 1000),
@@ -2130,4 +2150,194 @@ fn nested_field_defaults() {
     let m = "struct E {\n    h: [str] = [],\n    n: int = 2,\n}\n";
     let src = "import m\nstruct Outer {\n    e: m.E = m.E {},\n}\nfn main() {\n    let o = Outer {}\n    println(o.e.n + m.E {}.h.len())\n}\n";
     assert_eq!(run_with("nested_defaults", src, &[("m", m)]), (0, "2\n".into(), "".into()));
+}
+
+/// Processes on StellaOS (tests/stellaos_procs.st): machine code that attacks the kernel (a null
+/// pointer, writes to the kernel, a device and its own code, a kernel pointer handed to a system
+/// call, privileged instructions, a runaway stack) ends only itself; an endless loop doesn't stop
+/// the kernel; programs compiled inside the OS run, with runtime and compile errors where they are.
+#[test]
+fn stellaos_procs() {
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-riscv64");
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tmpdir("procs");
+    for e in fs::read_dir(root.join("examples/stellaos")).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_file() {
+            fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+        }
+    }
+    fs::copy(root.join("tests/stellaos_procs.st"), dir.join("procs_test.st")).unwrap();
+    let elf = dir.join("t.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(dir.join("procs_test.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let out = Command::new("qemu-system-riscv64")
+        .args(["-machine", "virt", "-m", "128M", "-nographic", "-bios", "default", "-kernel"])
+        .arg(&elf)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    for want in [
+        "[hello] hi from user mode\n[hello] ended: code 7",
+        "[null] ended: code -1 segmentation fault",
+        "[kernel-write] ended: code -1 segmentation fault: it touched memory that isn't its own (address 0x80200000)",
+        "[device-write] ended: code -1 segmentation fault",
+        "[code-write] ended: code -1 segmentation fault",
+        "[bad-pointer] ended: code -1 bad pointer passed to write",
+        "[recurse] ended: code -1 stack overflow",
+        "[wfi] ended: code -1 illegal instruction",
+        "[csr] ended: code -1 illegal instruction",
+        "[bad-syscall] ended: code -1 unknown system call 999",
+        "[spin] ended: code -1 killed",
+        "0: a x3\n1: b x2\n2: c x1\ntotal 6\n",
+        "hi counter=2 primes=[2, 3, 5]\n[2, 7, 50]\n1 3 5 7 \ntrue\nx=-2 -1 3 1024 -4 -1\n",
+        "ababab 5 [\"a\", \"b\", \"\", \"c\"] [\"line1\", \"line2\"]",
+        "-42 false Aé 9 4\n440\n261\n",
+        "-9223372036854775808\ntrue\n2\ncba\n[exit 0]",
+        "error on line 5: division by zero\n[exit 101]",
+        "=== c_stack.st\n[exit -1] stack overflow",
+        "compile error 3:5: `x` can't change: declare it with `var`",
+        "compile error 2:18: `s`: expected str, found int",
+        "compile error 2:13: no variable called `undefined_thing`",
+        "compile error 2:26: this string never ends",
+        "compile error 4:6: P has no field `y`",
+        "compile error 3:13: add takes 2 arguments, given 1",
+        "=== j_spin.st\n[still running after 3 s: killing]",
+        "error: out of memory\n[exit 101]",
+        "name? hello Ada!\ndouble: 42\n[exit 0]",
+        "[exe] from a file",
+        "exe parse of junk: true",
+        "\ndone",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    // the kernel kept running while a program spun
+    let turns: u32 = text.split("kernel turns while spinning: ").nth(1).unwrap().split(';').next().unwrap().parse().unwrap();
+    assert!(turns > 50, "the kernel barely ran while a program spun: {turns}");
+}
+
+/// StellaOS as a person uses it, on the serial console: the first account, programs written,
+/// compiled and run inside it (with input, files and sound: the sound card's output goes to a WAV
+/// file we check), and users kept apart (private homes, /etc/shadow, sudo, programs that try to
+/// write where they may not).
+#[test]
+fn stellaos_programs() {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::time::Duration;
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-riscv64");
+        return;
+    }
+    let dir = tmpdir("programs");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let elf = dir.join("os.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(root.join("examples/stellaos/os.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let wav = dir.join("sound.wav");
+    let mut q = Command::new("qemu-system-riscv64")
+        .args(["-machine", "virt", "-m", "256M", "-nographic", "-bios", "default"])
+        .args(["-global", "virtio-mmio.force-legacy=false", "-device", "virtio-rng-device"])
+        .arg("-audiodev")
+        .arg(format!("wav,id=snd0,path={}", wav.display()))
+        .args(["-device", "virtio-sound-device,audiodev=snd0", "-kernel"])
+        .arg(&elf)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = q.id();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(120));
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    });
+    let mut stdin = q.stdin.take().unwrap();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1500));
+        for (cmd, wait) in [
+            ("ada", 100),
+            ("secret1", 100),
+            ("secret1", 1500),
+            ("run /home/examples/hello.st", 1500),
+            ("Ada", 1500),
+            ("cc /home/examples/primes.st -o primes", 2000),
+            ("run primes", 3000),
+            ("write boom.st fn main() { let xs = [1, 2]; println(xs[5]) }", 300),
+            ("run boom.st", 1500),
+            ("write bad.st fn main() { let n: int = \"x\" }", 300),
+            ("run bad.st", 1500),
+            ("write grab.st fn main() { println(read_file(\"/etc/shadow\").len()); println(write_file(\"/etc/passwd\", \"x\")); println(write_file(\"mine.txt\", \"ok\")) }", 300),
+            ("run grab.st", 1500),
+            ("cat mine.txt", 300),
+            ("run /home/examples/music.st", 11000),
+            ("cat /etc/shadow", 300),
+            ("peek 0x80200000", 300),
+            ("sudo adduser bob", 300),
+            ("secret1", 1200),
+            ("bobpass", 300),
+            ("bobpass", 1500),
+            ("write ~/diary.txt dear diary", 300),
+            ("logout", 500),
+            ("bob", 200),
+            ("wrong", 1500),
+            ("bob", 2500),
+            ("bobpass", 1500),
+            ("cat /home/ada/diary.txt", 300),
+            ("sudo ls", 300),
+            ("ls -l /home", 300),
+            ("shutdown", 1000),
+        ] {
+            stdin.write_all(format!("{cmd}\r").as_bytes()).unwrap();
+            stdin.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(wait));
+        }
+    });
+    let out = q.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    for want in [
+        "Hello, ada!",
+        "Nice to meet you, Ada.\n1 squared is 1\n",
+        "5 squared is 25\n",
+        "of RISC-V machine code",
+        "9592 primes below 100000",
+        "error on line 1: index 5 is out of range (the length is 2)",
+        "bad.st:1:26: `n`: expected int, found str",
+        "0\nwrite_file /etc/passwd: permission denied: /etc/passwd\nfalse\ntrue\n",
+        "\nok",
+        "E4 E4 F4 G4",
+        "permission denied: /etc/shadow",
+        "`peek` needs an administrator",
+        "added bob, home /home/bob",
+        "logged out",
+        "wrong user name or password",
+        "Hello, bob!",
+        "permission denied: /home/ada/diary.txt",
+        "bob isn't an administrator",
+        "drwx------  ada",
+        "drwx------  bob",
+        "bye!",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    // the music came out of the sound card: somewhere in it, E4 (330 Hz) and G4 (392 Hz) square
+    // waves (the login chime plays first)
+    let data = fs::read(&wav).unwrap();
+    let rate = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
+    let channels = u16::from_le_bytes(data[22..24].try_into().unwrap()) as usize;
+    let samples: Vec<i16> = data[44..].chunks(2 * channels).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+    assert!(samples.iter().any(|&s| s != 0), "the WAV file is silent");
+    let win = rate / 10;
+    let pitches: Vec<f64> = samples
+        .chunks(win)
+        .filter(|w| w.len() == win && w.iter().filter(|&&s| s.abs() > 1000).count() > win * 9 / 10)
+        .map(|w| w.windows(2).filter(|p| (p[0] < 0) != (p[1] < 0)).count() as f64 / 2.0 / 0.1)
+        .collect();
+    for want in [330.0, 392.0] {
+        assert!(pitches.iter().any(|hz| (hz - want).abs() < 10.0), "no {want} Hz tone in the sound: {pitches:?}");
+    }
 }

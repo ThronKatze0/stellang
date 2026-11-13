@@ -109,6 +109,10 @@ struct Desktop {
     busy_ms: int = 0,         // time spent in frames (for the monitor)
     selected_icon: int = -1,
     on_shutdown: fn() = () => {},
+    on_logout: fn() = () => {},
+    session: str = "",            // who is logged in (shown in the menu)
+    overlay: App? = none,         // a full-screen app over everything (the login screen)
+    ov: gfx.Surface? = none,
 
     // ---- windows ----
 
@@ -234,12 +238,34 @@ struct Desktop {
 
     // ---- one frame ----
 
+    // Cover the screen with `app` (everything else waits behind it), or uncover it (none).
+    fn cover(self, app: App?) {
+        self.overlay = app
+        if app.is_some() && self.ov.is_none() { self.ov = some(gfx.surface(self.width, self.height)) }
+        self.menu = false
+        self.captured = 0
+        self.dragging = 0
+        self.resizing = 0
+        self.hurt_all()
+    }
+
     fn frame(self) {
         let start = kernel.uptime()
         let dt = if self.last_frame == 0 { 16 } else { start - self.last_frame }
         self.last_frame = start
         for e in self.inp.poll() { self.handle(e) }
         let signals = kernel_ui_dirty()
+        if let o = self.overlay {
+            if let ov = self.ov {
+                if o.tick(Tick { dt, now: start, signals, focused: true }) {
+                    o.paint(ov)
+                    self.hurt_all()
+                }
+            }
+            self.compose()
+            self.frames += 1
+            return
+        }
         for w in self.windows {
             let t = Tick { dt, now: start, signals, focused: w.id == self.focus }
             if w.app.tick(t) { w.dirty = true }
@@ -262,6 +288,18 @@ struct Desktop {
     // ---- input ----
 
     fn handle(self, e: input.Event) {
+        if let o = self.overlay {
+            if e.kind != "key" {
+                let ox = self.px
+                let oy = self.py
+                self.px = e.x
+                self.py = e.y
+                self.hurt([ox - 2, oy - 2, 18, 24])
+                self.hurt([self.px - 2, self.py - 2, 18, 24])
+            }
+            if e.kind == "key" { o.key(e) } else { o.mouse(e) }
+            return
+        }
         if e.kind == "key" {
             self.key(e)
             return
@@ -495,7 +533,7 @@ struct Desktop {
             self.launchers[i].open()
         } else if y >= r[1] + r[3] - 46 {
             self.menu_close()
-            self.on_shutdown()
+            if x < r[0] + r[2] / 2 { self.on_logout() } else { self.on_shutdown() }
         }
         return true
     }
@@ -526,6 +564,21 @@ struct Desktop {
     fn compose(self) {
         if self.damage.is_empty() { return }
         let b = self.back
+        if let ov = self.ov {
+            if self.overlay.is_some() {
+                for r in self.damage {
+                    b.clip(r[0], r[1], r[2], r[3])
+                    b.draw(ov, 0, 0)
+                    b.sprite(self.cursor, self.px - 1, self.py - 1, 1)
+                    self.screen.clip(r[0], r[1], r[2], r[3])
+                    self.screen.draw(b, 0, 0)
+                }
+                b.unclip()
+                self.screen.unclip()
+                self.damage = []
+                return
+            }
+        }
         for r in self.damage {
             b.clip(r[0], r[1], r[2], r[3])
             b.draw(self.wallpaper, 0, 0)
@@ -648,6 +701,10 @@ struct Desktop {
         b.round(r[0], r[1], r[2], r[3], 12, 0x3b3650)
         b.round(r[0] + 1, r[1] + 1, r[2] - 2, r[3] - 2, 11, 0x1c1929)
         b.text(r[0] + 18, r[1] + 14, "✦ StellaOS", 0xffffff, gfx.TEXT_BOLD)
+        if self.session != "" {
+            let who = fit(self.session, gfx.UI, 110)
+            b.text(r[0] + r[2] - 18 - gfx.text_width(who, gfx.UI), r[1] + 17, who, 0xb8b2e0, gfx.UI)
+        }
         b.text(r[0] + 20, r[1] + 36, "Apps", 0x8d88a8, gfx.UI)
         for i, l in self.launchers {
             let iy = r[1] + 56 + i * 40
@@ -658,13 +715,22 @@ struct Desktop {
         }
         let sy = r[1] + r[3] - 46
         b.shade(r[0] + 12, sy, r[2] - 24, 1, 0xffffff, 30)
-        let over = self.px >= r[0] && self.px < r[0] + r[2] && self.py >= sy && self.py < r[1] + r[3]
-        if over { b.round_shade(r[0] + 8, sy + 6, r[2] - 16, 34, 8, 0xe5484d, 120) }
-        b.circle(r[0] + 28, sy + 23, 7, 0xffffff)
-        b.circle(r[0] + 28, sy + 23, 5, if over { gfx.mix(0x1c1929, 0xe5484d, 120, 255) } else { 0x1c1929 })
-        b.rect(r[0] + 26, sy + 13, 4, 8, if over { gfx.mix(0x1c1929, 0xe5484d, 120, 255) } else { 0x1c1929 })
-        b.rect(r[0] + 27, sy + 14, 2, 8, 0xffffff)
-        b.text(r[0] + 44, sy + 14, "Shut down", 0xffffff, gfx.UI)
+        let half = r[2] / 2
+        let in_row = self.py >= sy && self.py < r[1] + r[3]
+        // log out (left)
+        let over_out = in_row && self.px >= r[0] && self.px < r[0] + half
+        if over_out { b.round_shade(r[0] + 8, sy + 6, half - 12, 34, 8, 0xffffff, 30) }
+        b.text(r[0] + 20, sy + 13, "←", 0xffffff, gfx.TEXT)
+        b.text(r[0] + 42, sy + 14, "Log out", 0xffffff, gfx.UI)
+        // shut down (right)
+        let over = in_row && self.px >= r[0] + half && self.px < r[0] + r[2]
+        let x0 = r[0] + half - 4
+        if over { b.round_shade(x0 + 8, sy + 6, half - 12, 34, 8, 0xe5484d, 120) }
+        b.circle(x0 + 28, sy + 23, 7, 0xffffff)
+        b.circle(x0 + 28, sy + 23, 5, if over { gfx.mix(0x1c1929, 0xe5484d, 120, 255) } else { 0x1c1929 })
+        b.rect(x0 + 26, sy + 13, 4, 8, if over { gfx.mix(0x1c1929, 0xe5484d, 120, 255) } else { 0x1c1929 })
+        b.rect(x0 + 27, sy + 14, 2, 8, 0xffffff)
+        b.text(x0 + 44, sy + 14, "Shut down", 0xffffff, gfx.UI)
     }
 }
 

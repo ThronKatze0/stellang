@@ -39,7 +39,8 @@ const USAGE: &str = "usage:
   stellang --kernel <os.st> [-o <out>]                                 compile an operating system kernel (RISC-V 64, out.elf)
   stellang boot [--gui] [--disk f.img] <os.st|os.elf> [qemu args]      build it and boot it in QEMU (--gui: with a display,
                                                                         keyboard and mouse; a disk image keeps files;
-                                                                        a network card unless --no-net)
+                                                                        a network card unless --no-net, a sound
+                                                                        card unless --no-sound)
   stellang dev [dir]                                                    full-stack dev loop: client.st -> public/, server.st; rebuild on change
   stellang check <file.st>                                             type-check only
   stellang fmt [--emoji|--plain] <file.st>                              re-indent in place
@@ -294,17 +295,37 @@ fn build_kernel(input: &str, out: Option<String>, opt: &str, emit: bool) -> Stri
 
 /// `stellang boot os.st` (or os.elf): build the kernel if needed and boot it in QEMU, the console on
 /// this terminal. QEMU's exit code is the kernel's (main's return value, 101 for a panic).
+/// The host's audio, as QEMU names it: one that is likely there (QEMU won't start with one that isn't).
+fn audio_driver() -> &'static str {
+    if cfg!(target_os = "macos") {
+        return "coreaudio";
+    }
+    if cfg!(windows) {
+        return "dsound";
+    }
+    let runtime = env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+    if env::var_os("PULSE_SERVER").is_some() || (!runtime.is_empty() && Path::new(&runtime).join("pulse/native").exists()) {
+        return "pa";
+    }
+    if Path::new("/dev/snd").exists() {
+        return "alsa";
+    }
+    "none"
+}
+
 fn boot(args: &[String]) {
     let mut gui = false;
     let mut disk: Option<String> = None;
     let mut no_disk = false;
     let mut net = true;
+    let mut sound = true;
     let mut i = 0;
     while i < args.len() && args[i].starts_with("--") {
         match args[i].as_str() {
             "--gui" => gui = true,
             "--no-disk" => no_disk = true,
             "--no-net" => net = false,
+            "--no-sound" => sound = false,
             "--disk" if i + 1 < args.len() => {
                 i += 1;
                 disk = Some(args[i].clone());
@@ -358,6 +379,14 @@ fn boot(args: &[String]) {
         // 10.0.2.2, DNS 10.0.2.3) and reaches the outside through the host; nothing outside can
         // connect in (no ports are forwarded)
         cmd.args(["-netdev", "user,id=net0", "-device", "virtio-net-device,netdev=net0"]);
+    }
+    if sound {
+        // a sound card (virtio-sound), played through the host's audio: PulseAudio/PipeWire or ALSA on
+        // Linux, Core Audio on macOS, DirectSound on Windows (STELLANG_AUDIO picks another QEMU
+        // audio driver, `none` to keep quiet)
+        let driver = env::var("STELLANG_AUDIO").unwrap_or_else(|_| audio_driver().into());
+        cmd.arg("-audiodev").arg(format!("{driver},id=snd0"));
+        cmd.args(["-device", "virtio-sound-device,audiodev=snd0"]);
     }
     if gui {
         // a window with the display (a ramfb framebuffer), a keyboard and a mouse (virtio-input; the
