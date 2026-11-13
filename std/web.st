@@ -29,6 +29,7 @@ extern fn st_location() -> str
 extern fn st_navigate(path: str)
 extern fn st_set_title(title: str)
 extern fn st_raw(html: str) -> Node
+extern fn st_element_text(id: str) -> str
 
 // A value the page depends on. Make one with `signal(initial)` inside a component (it keeps its
 // value from one render to the next) or anywhere else (then it's a plain shared box).
@@ -127,4 +128,16 @@ fn save(key: str, value: str) {
 // Trusted HTML as a Node, as is (never pass it user input).
 fn raw(html: str) -> Node {
     return st_raw(html)
+}
+
+// Data for the browser app, put in the page by the server: `{web.data("todos", to_json(todos))}`
+// renders a <script type="application/json" id="todos">; the app reads it with `web.read_data`.
+fn data(id: str, json_text: str) -> Node {
+    let safe = json_text.replace("<", "\\u003c")
+    return raw("<script type=\"application/json\" id=\"" + id + "\">" + safe + "</script>")
+}
+
+// The text of the page element with this id (like what `web.data` wrote); "" if there's none.
+fn read_data(id: str) -> str {
+    return st_element_text(id)
 }

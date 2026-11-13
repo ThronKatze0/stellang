@@ -99,7 +99,7 @@ impl Gen {
     }
 
     /// Evaluate a field's declared default, in the module that declared it (and without local names).
-    fn default_of(&mut self, dkey: &str, f: &str, ft: &Type) -> R<Option<Val>> {
+    pub(super) fn default_of(&mut self, dkey: &str, f: &str, ft: &Type) -> R<Option<Val>> {
         let Some((m, defs)) = self.defaults.get(dkey) else { return Ok(None) };
         let Some((_, e)) = defs.iter().find(|d| d.0 == f) else { return Ok(None) };
         let (m, e) = (m.clone(), e.clone());

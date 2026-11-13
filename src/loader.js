@@ -260,6 +260,10 @@
     js_set_title(t) {
       document.title = str(t);
     },
+    js_element_text(id) {
+      const el = document.getElementById(str(id));
+      return put(el ? el.textContent : "");
+    },
   };
 
   async function start() {

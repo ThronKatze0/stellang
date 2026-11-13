@@ -29,6 +29,7 @@ pub const STD: &[(&str, &str)] = &[
 const USAGE: &str = "usage:
   stellang <file.st> [-o <out>] [-O0|-O1|-O2|-O3|-Os] [--emit-llvm]   compile
   stellang --web <app.st> [-o <out>]                                   compile for the browser (out.wasm + out.js)
+  stellang dev [dir]                                                    full-stack dev loop: client.st -> public/, server.st; rebuild on change
   stellang check <file.st>                                             type-check only
   stellang fmt [--emoji|--plain] <file.st>                              re-indent in place
   stellang lsp                                                         language server (stdio)
@@ -98,6 +99,7 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("lsp") => return lsp::run(),
+        Some("dev") => return dev(args.get(1).map(String::as_str).unwrap_or(".")),
         Some("--version" | "-V") => return println!("stellang {}", env!("CARGO_PKG_VERSION")),
         Some("grammar") => match args.get(1).map(String::as_str) {
             Some("textmate") => return print!("{}", grammar::textmate()),
@@ -216,10 +218,83 @@ fn build_web(input: &str, out: Option<String>, opt: &str, emit: bool) {
     let name = Path::new(&base).file_name().unwrap().to_string_lossy().into_owned();
     fs::write(format!("{base}.js"), LOADER).unwrap_or_else(|e| die(e));
     let html = format!("{base}.html");
-    if !Path::new(&html).exists() {
+    if !Path::new(&html).exists() && env::var_os("STELLANG_NO_HTML").is_none() {
         let page = format!(
             "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <title>{name}</title>\n</head>\n<body>\n  <div id=\"app\"></div>\n  <script src=\"{name}.js\"></script>\n</body>\n</html>\n"
         );
         fs::write(&html, page).unwrap_or_else(|e| die(e));
+    }
+}
+
+/// `stellang dev [dir]`: build `client.st` for the browser (into `public/client.wasm` + `.js`) and
+/// `server.st` natively, run the server in `dir`, and rebuild + restart when a .st file changes.
+fn dev(dir: &str) {
+    use std::time::{Duration, Instant, SystemTime};
+    let dir = Path::new(dir);
+    let server = dir.join("server.st");
+    if !server.exists() {
+        die(format!("no server.st in {} (a full-stack app has server.st, and client.st for the browser)", dir.display()));
+    }
+    let client = dir.join("client.st");
+    let me = env::current_exe().unwrap_or_else(|e| die(e));
+    let exe = env::temp_dir().join(format!("stellang-dev-{}", std::process::id()));
+    fn sources(d: &Path, out: &mut Vec<(std::path::PathBuf, SystemTime)>) {
+        let Ok(rd) = fs::read_dir(d) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if p.is_dir() && !name.starts_with('.') && name != "public" && name != "target" && name != "node_modules" {
+                sources(&p, out);
+            } else if name.ends_with(".st") {
+                out.push((p.clone(), e.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH)));
+            }
+        }
+    }
+    let snapshot = || {
+        let mut v = vec![];
+        sources(dir, &mut v);
+        v.sort();
+        v
+    };
+    let build = || -> bool {
+        let t = Instant::now();
+        if client.exists() {
+            let out = dir.join("public").join("client");
+            let ok = Command::new(&me).arg("--web").arg(&client).arg("-o").arg(&out).env("STELLANG_NO_HTML", "1").status().is_ok_and(|s| s.success());
+            if !ok {
+                return false;
+            }
+        }
+        let ok = Command::new(&me).arg(&server).arg("-o").arg(&exe).arg("-O1").status().is_ok_and(|s| s.success());
+        if ok {
+            eprintln!("\x1b[2mstellang dev: built in {} ms\x1b[0m", t.elapsed().as_millis());
+        }
+        ok
+    };
+    let start = || Command::new(&exe).current_dir(dir).spawn().ok();
+    eprintln!("stellang dev: {}{} \u{2014} watching for changes (Ctrl+C to stop)", if client.exists() { "client.st -> public/client.wasm, " } else { "" }, "server.st");
+    let mut child = if build() { start() } else { None };
+    let mut seen = snapshot();
+    loop {
+        std::thread::sleep(Duration::from_millis(300));
+        if let Some(c) = &mut child {
+            if let Ok(Some(status)) = c.try_wait() {
+                eprintln!("stellang dev: the server stopped ({status}); waiting for changes");
+                child = None;
+            }
+        }
+        let now = snapshot();
+        if now == seen {
+            continue;
+        }
+        seen = now;
+        if let Some(mut c) = child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        eprintln!("\x1b[2mstellang dev: change detected, rebuilding\x1b[0m");
+        if build() {
+            child = start();
+        }
     }
 }

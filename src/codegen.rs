@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::mem;
 
+mod fromjson;
 mod generics;
 mod helpers;
 mod jsx;
@@ -271,6 +272,10 @@ fn names_expr(e: &Expr, inl: bool, out: &mut HashSet<String>) {
             }
         }
     }
+}
+
+fn is_call_to(e: &Expr, name: &str) -> bool {
+    matches!(&e.kind, ExprKind::Call(c, _) if matches!(&c.kind, ExprKind::Var(n) if n == name))
 }
 
 fn names_element(el: &crate::parser::Element, inl: bool, out: &mut HashSet<String>) {
@@ -2108,11 +2113,14 @@ impl Gen {
             },
             ExprKind::Lambda(l) => self.lambda(l, peel(want), pos)?,
             ExprKind::Try(x) => {
-                let v = self.expr(x, None)?;
+                // `let t: Todo = from_json(s)?`: the call is asked for a Todo!
+                let w = want.filter(|_| is_call_to(x, "from_json")).map(|w| Type::Result(Box::new(w.clone())));
+                let v = self.expr(x, w.as_ref())?;
                 self.try_val(v, pos)?
             }
             ExprKind::CatchValue(x, fallback) => {
-                let v = self.expr(x, None)?;
+                let w = want.filter(|_| is_call_to(x, "from_json")).map(|w| Type::Result(Box::new(w.clone())));
+                let v = self.expr(x, w.as_ref())?;
                 let (e, t) = self.failed(&v, pos)?;
                 if t == Type::Void {
                     return err(pos, "this has no value to fall back from; use `catch e { ... }`");
@@ -2131,7 +2139,8 @@ impl Gen {
                 self.load(&slot, t)
             }
             ExprKind::CatchBlock(x, name, block) => {
-                let v = self.expr(x, None)?;
+                let w = want.filter(|_| is_call_to(x, "from_json")).map(|w| Type::Result(Box::new(w.clone())));
+                let v = self.expr(x, w.as_ref())?;
                 let (e, t) = self.failed(&v, pos)?;
                 let is_opt = matches!(v.ty, Type::Opt(_));
                 if is_opt && name != "_" {
@@ -3077,6 +3086,7 @@ impl Gen {
                 let r = self.load(&cell, st);
                 r
             }
+            "from_json" if !self.funcs.contains_key(&self.key("from_json")) => self.from_json(args, pos, want)?,
             "to_json" => {
                 let v = one(self, None)?;
                 self.json(&v, args[0].pos)?

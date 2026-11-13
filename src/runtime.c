@@ -156,6 +156,7 @@ char *st_location(void) { return "/"; }
 void st_navigate(const char *path) { (void)path; }
 void st_set_title(const char *t) { (void)t; }
 const char *st_raw(const char *html) { return html; }
+char *st_element_text(const char *id) { (void)id; return ""; }
 #endif
 
 char *st_itoa(int64_t n) {

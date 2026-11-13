@@ -220,6 +220,7 @@ JS(js_storage_set) void js_storage_set(const char *key, const char *value);
 JS(js_location) char *js_location(void);
 JS(js_navigate) void js_navigate(const char *path);
 JS(js_set_title) void js_set_title(const char *title);
+JS(js_element_text) char *js_element_text(const char *id);
 
 typedef void *Closure; // points at { fn, captures... }
 #define FN(c) (*(void **)(c))
@@ -325,3 +326,4 @@ char *st_location(void) { return js_location(); }
 void st_navigate(const char *path) { js_navigate(path); }
 void st_set_title(const char *t) { js_set_title(t); }
 const char *st_raw(const char *html) { return html; }
+char *st_element_text(const char *id) { return js_element_text(id); }
