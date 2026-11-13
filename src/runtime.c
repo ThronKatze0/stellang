@@ -4,15 +4,21 @@
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
+#include <dirent.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 void GC_init(void);
@@ -529,3 +535,359 @@ int64_t st_write(int64_t fd, const char *s) {
 }
 
 void st_close(int64_t fd) { close((int)fd); }
+
+// ---- the event loop under std/http.st: non-blocking accept, poll, per-connection input buffers ----
+
+typedef struct { char *data; size_t len, cap; } Buf;
+static Buf *ins, *frags; // indexed by fd: unread input, and a fragmented WebSocket message
+static int nfds;
+static int64_t ws_last_op;
+
+static Buf *buf(Buf **arr, int fd) {
+    if (fd >= nfds) {
+        int n = nfds ? nfds : 64;
+        while (n <= fd) n *= 2;
+        ins = realloc(ins, n * sizeof(Buf));
+        frags = realloc(frags, n * sizeof(Buf));
+        memset(ins + nfds, 0, (n - nfds) * sizeof(Buf));
+        memset(frags + nfds, 0, (n - nfds) * sizeof(Buf));
+        nfds = n;
+    }
+    return &(*arr)[fd];
+}
+
+static void buf_add(Buf *b, const char *p, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        b->cap = (b->len + n + 1) * 2;
+        b->data = realloc(b->data, b->cap);
+        if (!b->data) st_panic("panic: out of memory\n");
+    }
+    memcpy(b->data + b->len, p, n);
+    b->len += n;
+    b->data[b->len] = 0;
+}
+
+static void buf_eat(Buf *b, size_t n) {
+    memmove(b->data, b->data + n, b->len - n);
+    b->len -= n;
+    if (b->data) b->data[b->len] = 0;
+}
+
+int64_t st_nonblock(int64_t fd) {
+    int fl = fcntl((int)fd, F_GETFL, 0);
+    return fl < 0 ? -1 : fcntl((int)fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+// a waiting client, or -1 when there is none right now
+int64_t st_accept_nb(int64_t fd) {
+    int c = accept((int)fd, NULL, NULL);
+    if (c < 0) return -1;
+    struct timeval t = {.tv_sec = 10}; // a client that stops reading must not block the server forever
+    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &t, sizeof t);
+    Buf *b = buf(&ins, c), *f = buf(&frags, c);
+    b->len = f->len = 0;
+    return c;
+}
+
+// the fds (of `fds`) that have input or hung up; waits at most `timeout_ms` (-1: forever)
+Vec *st_poll(Vec *fds, int64_t timeout_ms) {
+    int64_t n = fds->len, *fd = fds->data;
+    struct pollfd *p = alloc(n, sizeof *p, 1);
+    for (int64_t i = 0; i < n; i++) p[i] = (struct pollfd){.fd = (int)fd[i], .events = POLLIN};
+    Vec *out = st_vec_new(0, 8, 1);
+    int r;
+    do r = poll(p, (nfds_t)n, (int)timeout_ms); while (r < 0 && errno == EINTR);
+    for (int64_t i = 0; r > 0 && i < n; i++) {
+        if (!p[i].revents) continue;
+        if (out->len == out->cap) st_vec_grow(out, 8);
+        ((int64_t *)out->data)[out->len++] = fd[i];
+    }
+    return out;
+}
+
+// read what has arrived into fd's buffer: 1 = ok, 0 = the peer closed, -1 = error or too much
+int64_t st_fill(int64_t fd) {
+    Buf *b = buf(&ins, (int)fd);
+    char tmp[16384];
+    for (;;) {
+        ssize_t r = recv((int)fd, tmp, sizeof tmp, MSG_DONTWAIT);
+        if (r > 0) {
+            if (b->len + r > (64u << 20)) return -1;
+            buf_add(b, tmp, (size_t)r);
+            continue;
+        }
+        if (r == 0) return 0;
+        if (errno == EINTR) continue;
+        return errno == EAGAIN || errno == EWOULDBLOCK ? 1 : -1;
+    }
+}
+
+// the next complete HTTP request in fd's buffer (headers + Content-Length body), or ""
+char *st_http_take(int64_t fd) {
+    Buf *b = buf(&ins, (int)fd);
+    if (!b->len) return "";
+    char *end = strstr(b->data, "\r\n\r\n");
+    if (!end) return "";
+    size_t head = (size_t)(end + 4 - b->data);
+    long long body = 0;
+    for (char *p = b->data; p && p < end; p = strstr(p + 1, "\n")) {
+        if (strncasecmp(p + (*p == '\n'), "content-length:", 15) == 0) body = atoll(p + (*p == '\n') + 15);
+    }
+    if (body < 0) body = 0;
+    if (b->len < head + (size_t)body) return "";
+    char *r = mkstr(b->data, head + (size_t)body);
+    buf_eat(b, head + (size_t)body);
+    return r;
+}
+
+// the next complete WebSocket message in fd's buffer; st_ws_op() tells its kind (0 = none yet)
+// 1 text, 2 binary, 8 close, 9 ping, 10 pong. Fragmented messages are joined.
+char *st_ws_take(int64_t fd) {
+    Buf *b = buf(&ins, (int)fd), *f = buf(&frags, (int)fd);
+    for (;;) {
+        ws_last_op = 0;
+        unsigned char *d = (unsigned char *)b->data;
+        if (b->len < 2) return "";
+        int fin = d[0] & 0x80, op = d[0] & 0x0f, masked = d[1] & 0x80;
+        uint64_t n = d[1] & 0x7f;
+        size_t at = 2;
+        if (n == 126) {
+            if (b->len < 4) return "";
+            n = (uint64_t)d[2] << 8 | d[3];
+            at = 4;
+        } else if (n == 127) {
+            if (b->len < 10) return "";
+            n = 0;
+            for (int i = 0; i < 8; i++) n = n << 8 | d[2 + i];
+            at = 10;
+        }
+        if (n > (64u << 20)) { ws_last_op = 8; return ""; }
+        unsigned char mask[4] = {0};
+        if (masked) {
+            if (b->len < at + 4) return "";
+            memcpy(mask, d + at, 4);
+            at += 4;
+        }
+        if (b->len < at + n) return "";
+        char *payload = alloc((int64_t)n + 1, 1, 1);
+        for (uint64_t i = 0; i < n; i++) payload[i] = (char)(d[at + i] ^ mask[i % 4]);
+        payload[n] = 0;
+        buf_eat(b, at + n);
+        if (op >= 8) { ws_last_op = op; return payload; } // control frames may come between fragments
+        if (op != 0) { f->len = 0; buf_add(f, "", 0); f->data[0] = (char)op; f->len = 1; }
+        if (!f->len) continue; // a continuation without a start
+        buf_add(f, payload, n);
+        if (!fin) continue;
+        ws_last_op = f->data[0];
+        char *r = mkstr(f->data + 1, f->len - 1);
+        f->len = 0;
+        return r;
+    }
+}
+
+int64_t st_ws_op(void) { return ws_last_op; }
+
+static int write_all(int fd, const char *p, size_t n) {
+    while (n) {
+        ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return -1;
+        p += w;
+        n -= (size_t)w;
+    }
+    return 0;
+}
+
+int64_t st_ws_send(int64_t fd, int64_t op, const char *msg) {
+    size_t n = strlen(msg), h = 2;
+    unsigned char head[10];
+    head[0] = 0x80 | (unsigned char)op;
+    if (n < 126) {
+        head[1] = (unsigned char)n;
+    } else if (n < 65536) {
+        head[1] = 126, head[2] = (unsigned char)(n >> 8), head[3] = (unsigned char)n, h = 4;
+    } else {
+        head[1] = 127, h = 10;
+        for (int i = 0; i < 8; i++) head[2 + i] = (unsigned char)(n >> (56 - 8 * i));
+    }
+    return write_all((int)fd, (char *)head, h) || write_all((int)fd, msg, n) ? -1 : 0;
+}
+
+// forget fd's buffers and close it
+void st_drop(int64_t fd) {
+    if (fd < nfds) ins[fd].len = frags[fd].len = 0;
+    close((int)fd);
+}
+
+int64_t st_now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+// ---- SHA-1 + base64, for the WebSocket handshake ----
+
+static uint32_t rol(uint32_t x, int n) { return x << n | x >> (32 - n); }
+
+static void sha1(const unsigned char *msg, size_t len, unsigned char out[20]) {
+    uint32_t h[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
+    size_t total = ((len + 8) / 64 + 1) * 64;
+    unsigned char *m = alloc((int64_t)total, 1, 1);
+    memset(m, 0, total);
+    memcpy(m, msg, len);
+    m[len] = 0x80;
+    uint64_t bits = (uint64_t)len * 8;
+    for (int i = 0; i < 8; i++) m[total - 1 - i] = (unsigned char)(bits >> (8 * i));
+    for (size_t c = 0; c < total; c += 64) {
+        uint32_t w[80];
+        for (int i = 0; i < 16; i++) w[i] = (uint32_t)m[c + 4 * i] << 24 | m[c + 4 * i + 1] << 16 | m[c + 4 * i + 2] << 8 | m[c + 4 * i + 3];
+        for (int i = 16; i < 80; i++) w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+        uint32_t a = h[0], b = h[1], cc = h[2], d = h[3], e = h[4];
+        for (int i = 0; i < 80; i++) {
+            uint32_t f, k;
+            if (i < 20) f = (b & cc) | (~b & d), k = 0x5A827999;
+            else if (i < 40) f = b ^ cc ^ d, k = 0x6ED9EBA1;
+            else if (i < 60) f = (b & cc) | (b & d) | (cc & d), k = 0x8F1BBCDC;
+            else f = b ^ cc ^ d, k = 0xCA62C1D6;
+            uint32_t t = rol(a, 5) + f + e + k + w[i];
+            e = d, d = cc, cc = rol(b, 30), b = a, a = t;
+        }
+        h[0] += a, h[1] += b, h[2] += cc, h[3] += d, h[4] += e;
+    }
+    for (int i = 0; i < 5; i++)
+        for (int j = 0; j < 4; j++) out[4 * i + j] = (unsigned char)(h[i] >> (24 - 8 * j));
+}
+
+static char *base64(const unsigned char *p, size_t n) {
+    static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char *r = alloc((int64_t)(n + 2) / 3 * 4 + 1, 1, 1), *o = r;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)p[i] << 16 | (i + 1 < n ? p[i + 1] << 8 : 0) | (i + 2 < n ? p[i + 2] : 0);
+        *o++ = t[v >> 18 & 63];
+        *o++ = t[v >> 12 & 63];
+        *o++ = i + 1 < n ? t[v >> 6 & 63] : '=';
+        *o++ = i + 2 < n ? t[v & 63] : '=';
+    }
+    *o = 0;
+    return r;
+}
+
+char *st_ws_accept(const char *key) {
+    char *s = st_concat(key, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    unsigned char d[20];
+    sha1((unsigned char *)s, strlen(s), d);
+    return base64(d, 20);
+}
+
+// "a%20b+c" -> "a b c"
+char *st_url_decode(const char *s) {
+    char *r = alloc((int64_t)strlen(s) + 1, 1, 1), *o = r;
+    for (; *s; s++) {
+        if (*s == '+') *o++ = ' ';
+        else if (*s == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2])) {
+            char h[3] = {s[1], s[2], 0};
+            *o++ = (char)strtol(h, NULL, 16);
+            s += 2;
+        } else *o++ = *s;
+    }
+    *o = 0;
+    return r;
+}
+
+// ---- files, for std/fs.st and res.send_file ----
+
+// size in bytes of a regular file, or -1
+int64_t st_file_size(const char *path) {
+    struct stat st;
+    if (stat(path, &st) < 0 || !S_ISREG(st.st_mode)) return -1;
+    return st.st_size;
+}
+
+bool st_is_dir(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+// write `head`, then the file's bytes (binary-safe)
+int64_t st_send_file(int64_t fd, const char *head, const char *path) {
+    int f = open(path, O_RDONLY);
+    if (f < 0) return -1;
+    struct stat st;
+    fstat(f, &st);
+    int64_t r = write_all((int)fd, head, strlen(head));
+    off_t off = 0;
+    while (!r && off < st.st_size) {
+        ssize_t w = sendfile((int)fd, f, &off, (size_t)(st.st_size - off));
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) r = -1;
+    }
+    close(f);
+    return r;
+}
+
+char *st_read_file(const char *path) {
+    last_error = "";
+    FILE *f = fopen(path, "rb");
+    if (!f) { failed(); return ""; }
+    size_t cap = 4096, n = 0, r;
+    char *b = alloc((int64_t)cap + 1, 1, 1);
+    while ((r = fread(b + n, 1, cap - n, f)) > 0) {
+        n += r;
+        if (n == cap) {
+            char *nb = alloc((int64_t)cap * 2 + 1, 1, 1);
+            memcpy(nb, b, n);
+            b = nb;
+            cap *= 2;
+        }
+    }
+    if (ferror(f)) failed();
+    fclose(f);
+    b[n] = 0;
+    return b;
+}
+
+int64_t st_write_file(const char *path, const char *data, int64_t append) {
+    last_error = "";
+    FILE *f = fopen(path, append ? "ab" : "wb");
+    if (!f) { failed(); return -1; }
+    size_t n = strlen(data);
+    int bad = fwrite(data, 1, n, f) != n;
+    if (fclose(f) || bad) { failed(); return -1; }
+    return 0;
+}
+
+int64_t st_remove_file(const char *path) {
+    last_error = "";
+    if (remove(path) < 0) { failed(); return -1; }
+    return 0;
+}
+
+int64_t st_mkdir(const char *path) {
+    last_error = "";
+    if (mkdir(path, 0777) < 0 && errno != EEXIST) { failed(); return -1; }
+    return 0;
+}
+
+// the names in a directory (sorted, without . and ..)
+Vec *st_list_dir(const char *path) {
+    last_error = "";
+    Vec *v = st_vec_new(0, sizeof(char *), 0);
+    DIR *d = opendir(path);
+    if (!d) { failed(); return v; }
+    for (struct dirent *e; (e = readdir(d));) {
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) st_vec_push_str(v, mkstr(e->d_name, strlen(e->d_name)));
+    }
+    closedir(d);
+    qsort(v->data, v->len, 8, cmp_s);
+    return v;
+}
+
+// UTF-8 encoding of code point `c`
+char *st_chr(int64_t c) {
+    char b[5] = {0};
+    if (c < 0x80) b[0] = (char)c;
+    else if (c < 0x800) b[0] = (char)(0xC0 | c >> 6), b[1] = (char)(0x80 | (c & 63));
+    else if (c < 0x10000) b[0] = (char)(0xE0 | c >> 12), b[1] = (char)(0x80 | (c >> 6 & 63)), b[2] = (char)(0x80 | (c & 63));
+    else b[0] = (char)(0xF0 | c >> 18), b[1] = (char)(0x80 | (c >> 12 & 63)), b[2] = (char)(0x80 | (c >> 6 & 63)), b[3] = (char)(0x80 | (c & 63));
+    return mkstr(b, strlen(b));
+}

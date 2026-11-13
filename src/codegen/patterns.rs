@@ -209,7 +209,7 @@ impl Gen {
                 Body::Expr(e) => e.pos,
                 Body::Block(_) => arm.pat.pos,
             };
-            self.join(&mut j, v, &lend, at);
+            self.join(&mut j, v, &lend, at, want);
             self.label(&lnext);
             if arm.guard.is_none() {
                 match self.cover(&arm.pat, &s.ty) {
@@ -230,7 +230,7 @@ impl Gen {
                 }
                 return err(subject.pos, format!("this `match` doesn't handle {} (add arms, or `_ => ...`)", missing.join(", ")));
             }
-            self.join(&mut j, void(), &lend, subject.pos); // nothing matched
+            self.join(&mut j, void(), &lend, subject.pos, None); // nothing matched
         }
         self.finish(j, &lend, full)
     }

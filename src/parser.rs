@@ -116,6 +116,8 @@ pub enum ExprKind {
     Match(Box<Expr>, std::rc::Rc<Vec<Arm>>),
     If(Box<Cond>, Vec<Stmt>, Vec<Stmt>), // `if` used as a value
     Member(String),                      // `.Circle`: a variant of the enum the context expects
+    // `a?.b.c`: if `a` is none the whole thing is none; otherwise `rest` with the value of `a` as `name`
+    Chain(String, Box<Expr>, Box<Expr>),
 }
 
 #[derive(Clone)]
@@ -761,7 +763,11 @@ impl Parser {
     }
 
     fn postfix(&mut self) -> P<Expr> {
-        let mut e = self.primary()?;
+        let e = self.primary()?;
+        self.postfix_from(e)
+    }
+
+    fn postfix_from(&mut self, mut e: Expr) -> P<Expr> {
         loop {
             let pos = self.pos();
             e = match self.peek() {
@@ -782,6 +788,12 @@ impl Parser {
                     self.no_struct = saved;
                     self.expect(Tok::RBrack)?;
                     Expr { kind: ExprKind::Index(Box::new(e), Box::new(i)), pos }
+                }
+                Tok::Question if *self.peek_at(1) == Tok::Dot => {
+                    self.next();
+                    let name = format!("?{}", self.i);
+                    let rest = self.postfix_from(Expr { kind: ExprKind::Var(name.clone()), pos })?;
+                    return Ok(Expr { kind: ExprKind::Chain(name, Box::new(e), Box::new(rest)), pos });
                 }
                 Tok::Question => {
                     self.next();
@@ -911,7 +923,13 @@ impl Parser {
         let pat = self.pattern()?;
         let guard = if self.eat(&Tok::If) { Some(self.expr()?) } else { None };
         self.expect(Tok::FatArrow)?;
-        let body = if self.at_open() { Body::Block(self.block()?) } else { Body::Expr(Box::new(self.expr()?)) };
+        let body = if self.at_open() {
+            Body::Block(self.block()?)
+        } else if matches!(self.peek(), Tok::Return | Tok::Break | Tok::Continue) {
+            Body::Block(vec![self.stmt()?]) // `none => return`, `0 => break`
+        } else {
+            Body::Expr(Box::new(self.expr()?))
+        };
         Ok(Arm { pat, guard, body })
     }
 }

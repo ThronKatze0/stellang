@@ -229,7 +229,7 @@ fn names_expr(e: &Expr, inl: bool, out: &mut HashSet<String>) {
             names_stmts(b, inl, out);
         }
         ExprKind::Unary(_, x) | ExprKind::Field(x, _) | ExprKind::Try(x) => names_expr(x, inl, out),
-        ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::CatchValue(a, b) => {
+        ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::CatchValue(a, b) | ExprKind::Chain(_, a, b) => {
             names_expr(a, inl, out);
             names_expr(b, inl, out);
         }
@@ -955,7 +955,7 @@ impl Gen {
         self.ins(format!("store i64 {n1}, ptr {h}"));
     }
 
-    /// `a == b`: by value for everything but maps, sets and functions (structs, enums and lists compare their contents).
+    /// `a == b`: by value for everything but functions (structs, enums, lists, maps and sets compare their contents).
     fn eq(&mut self, a: Val, b: Val, pos: Pos) -> R<String> {
         let (a, b) = match (&a.ty, &b.ty) {
             (Type::Opt(_), t) if *t != a.ty => {
@@ -975,7 +975,7 @@ impl Gen {
             Type::Int | Type::Bool => self.ins(format!("{t} = icmp eq {} {}, {}", ll(&a.ty), a.v, b.v)),
             Type::Float => self.ins(format!("{t} = fcmp oeq double {}, {}", a.v, b.v)),
             Type::Str => return Ok(self.rt(Type::Bool, "st_streq", &[format!("ptr {}", a.v), format!("ptr {}", b.v)]).v),
-            Type::Struct(_) | Type::Enum(_) | Type::List(_) | Type::Opt(_) => {
+            Type::Struct(_) | Type::Enum(_) | Type::List(_) | Type::Opt(_) | Type::Map(..) | Type::Set(_) => {
                 let f = self.eq_fn(&a.ty, pos)?;
                 let l = ll(&a.ty);
                 return Ok(self.emit_call(&Type::Bool, &f, &[format!("{l} {}", a.v), format!("{l} {}", b.v)]).v);
@@ -1495,10 +1495,37 @@ impl Gen {
         r.map(|_| broke)
     }
 
-    fn join(&mut self, j: &mut Join, v: Val, end: &str, pos: Pos) {
+    /// A branch value made to fit the type the context expects, when it easily can (`T` -> `T!` / `T?`, int -> float).
+    fn fit(&mut self, v: Val, want: Option<&Type>) -> Val {
+        let Some(w) = want else { return v };
+        if v.ty == *w || v.ty == Type::Void {
+            return v;
+        }
+        match w {
+            Type::Result(t) if v.ty == **t || (**t == Type::Float && v.ty == Type::Int) => {
+                let t = (**t).clone();
+                let x = self.fit(v, Some(&t));
+                self.ok_of(&t, &x)
+            }
+            Type::Opt(t) if v.ty == **t || (**t == Type::Float && v.ty == Type::Int) => {
+                let t = (**t).clone();
+                let x = self.fit(v, Some(&t));
+                self.some_of(&x)
+            }
+            Type::Float if v.ty == Type::Int => {
+                let t = self.tmp();
+                self.ins(format!("{t} = sitofp i64 {} to double", v.v));
+                val(t, Type::Float)
+            }
+            _ => v,
+        }
+    }
+
+    fn join(&mut self, j: &mut Join, v: Val, end: &str, pos: Pos, want: Option<&Type>) {
         if !self.f.open {
             return;
         }
+        let v = self.fit(v, want);
         j.live = true;
         if matches!(v.ty, Type::Result(_)) {
             j.result_at.get_or_insert(pos);
@@ -1596,10 +1623,10 @@ impl Gen {
         let r = self.test_cond(c, &le).and_then(|_| if value { self.block_value(then, want) } else { self.block(then).map(|_| void()) });
         self.f.scopes.pop();
         let pos = match c { Cond::Expr(e) | Cond::Let(_, e) => e.pos };
-        self.join(&mut j, r?, &lend, pos);
+        self.join(&mut j, r?, &lend, pos, want);
         self.label(&le);
         let v = if value { self.block_value(els, want)? } else { self.block(els).map(|_| void())? };
-        self.join(&mut j, v, &lend, pos);
+        self.join(&mut j, v, &lend, pos, want);
         self.finish(j, &lend, !els.is_empty())
     }
 
@@ -1634,6 +1661,50 @@ impl Gen {
                 self.variant_value(&k, name, pos)?
             }
             ExprKind::If(c, then, els) => self.gen_if(c, then, els, want, true)?,
+            ExprKind::Chain(name, base, rest) => {
+                let v = self.expr(base, None)?;
+                let Type::Opt(t) = v.ty.clone() else {
+                    // on a result, `x?.y` is just `x?` followed by `.y`
+                    let x = self.try_val(v, pos)?;
+                    let tv = self.temp_var(&x);
+                    self.f.scopes.push(HashMap::from([(name.clone(), tv)]));
+                    let r = self.expr(rest, want);
+                    self.f.scopes.pop();
+                    return r;
+                };
+                let has = self.extract(&v, 0, Type::Bool);
+                let (ls, ln, le) = (self.lbl("chain"), self.lbl("nochain"), self.lbl("endchain"));
+                self.term(format!("br i1 {}, label %{ls}, label %{ln}", has.v));
+                self.label(&ls);
+                let x = self.extract(&v, 1, *t);
+                let tv = self.temp_var(&x);
+                self.f.scopes.push(HashMap::from([(name.clone(), tv)]));
+                let r = self.expr(rest, peel(want).filter(|w| matches!(w, Type::Opt(_))));
+                self.f.scopes.pop();
+                let r = r?;
+                let rt = match &r.ty {
+                    Type::Void => Type::Void,
+                    Type::Opt(_) => r.ty.clone(),
+                    t if fits_slot(t) => Type::Opt(Box::new(t.clone())),
+                    t => return err(pos, format!("`?.` can't make an optional of {t}")),
+                };
+                if rt == Type::Void {
+                    self.term(format!("br label %{le}"));
+                    self.label(&ln);
+                    self.label(&le);
+                    return Ok(void());
+                }
+                let slot = self.alloca(&rt);
+                if self.f.open {
+                    let r = self.coerce(r, &rt, pos)?;
+                    self.store(&slot, &r);
+                    self.term(format!("br label %{le}"));
+                }
+                self.label(&ln);
+                self.ins(format!("store {} zeroinitializer, ptr {slot}", ll(&rt)));
+                self.label(&le);
+                self.load(&slot, rt)
+            }
             ExprKind::Field(b, f) => {
                 if let Some(tk) = self.type_path(b) {
                     let k = format!("{tk}::{f}");
@@ -1797,33 +1868,7 @@ impl Gen {
             ExprKind::Lambda(l) => self.lambda(l, peel(want), pos)?,
             ExprKind::Try(x) => {
                 let v = self.expr(x, None)?;
-                if let Type::Opt(t) = v.ty.clone() {
-                    if !matches!(self.f.ret, Type::Opt(_)) {
-                        return err(pos, "`?` on an optional passes `none` up, so the function must return an optional (like `-> int?`). Or use `?? fallback` / `let x = ... else { ... }`");
-                    }
-                    let has = self.extract(&v, 0, Type::Bool);
-                    let (lnone, lok) = (self.lbl("none"), self.lbl("some"));
-                    self.term(format!("br i1 {}, label %{lok}, label %{lnone}", has.v));
-                    self.label(&lnone);
-                    self.term(format!("ret {} zeroinitializer", ll(&self.f.ret)));
-                    self.label(&lok);
-                    return Ok(self.extract(&v, 1, *t));
-                }
-                let Type::Result(t) = v.ty.clone() else {
-                    return err(pos, format!("`?` needs a result (like int!) or an optional (int?), but this is {}", v.ty));
-                };
-                let Type::Result(ft) = self.f.ret.clone() else {
-                    return err(pos, "`?` passes the error up, so the function must return a result (like `-> int!`)");
-                };
-                let e = self.extract(&v, 0, Type::Bool);
-                let (lf, lok) = (self.lbl("fail"), self.lbl("ok"));
-                self.term(format!("br i1 {}, label %{lf}, label %{lok}", e.v));
-                self.label(&lf);
-                let m = self.extract(&v, 2, Type::Str);
-                let r = self.err_of(&ft, &m.v);
-                self.term(format!("ret {} {}", ll(&r.ty), r.v));
-                self.label(&lok);
-                if *t == Type::Void { void() } else { self.extract(&v, 1, *t) }
+                self.try_val(v, pos)?
             }
             ExprKind::CatchValue(x, fallback) => {
                 let v = self.expr(x, None)?;
@@ -1866,11 +1911,19 @@ impl Gen {
                     let m = self.extract(&v, 2, Type::Str);
                     self.declare(name, &m, false);
                 }
-                let r = self.block(block);
+                // the block either leaves, or its last line is the value to use instead
+                let r = match &slot {
+                    Some(_) => self.block_value(block, Some(&t)),
+                    None => self.block(block).map(|_| void()),
+                };
                 self.f.scopes.pop();
-                r?;
-                if self.f.open && slot.is_some() {
-                    return err(pos, format!("this `catch` block must leave (return, break or continue): there is no {t} to use otherwise. Or give a fallback: `catch <value>`"));
+                let fb = r?;
+                if let (true, Some(s)) = (self.f.open, &slot) {
+                    if fb.ty == Type::Void {
+                        return err(pos, format!("this `catch` block must leave (return, break or continue) or end with a {t} to use instead"));
+                    }
+                    let fb = self.coerce(fb, &t, pos)?;
+                    self.store(s, &fb);
                 }
                 self.label(&lend);
                 match slot {
@@ -1935,6 +1988,44 @@ impl Gen {
             self.ins(format!("store ptr {}, ptr {g}", v.addr));
         }
         Ok(val(obj, Type::Fn(params.into_iter().map(|p| p.1).collect(), Box::new(rt))))
+    }
+
+    /// `v?`: the value inside a result or optional, or return the error / none from the function.
+    fn try_val(&mut self, v: Val, pos: Pos) -> R<Val> {
+        if let Type::Opt(t) = v.ty.clone() {
+            if !matches!(self.f.ret, Type::Opt(_)) {
+                return err(pos, "`?` on an optional passes `none` up, so the function must return an optional (like `-> int?`). Or use `?? fallback` / `let x = ... else { ... }`");
+            }
+            let has = self.extract(&v, 0, Type::Bool);
+            let (lnone, lok) = (self.lbl("none"), self.lbl("some"));
+            self.term(format!("br i1 {}, label %{lok}, label %{lnone}", has.v));
+            self.label(&lnone);
+            self.term(format!("ret {} zeroinitializer", ll(&self.f.ret)));
+            self.label(&lok);
+            return Ok(self.extract(&v, 1, *t));
+        }
+        let Type::Result(t) = v.ty.clone() else {
+            return err(pos, format!("`?` needs a result (like int!) or an optional (int?), but this is {}", v.ty));
+        };
+        let Type::Result(ft) = self.f.ret.clone() else {
+            return err(pos, "`?` passes the error up, so the function must return a result (like `-> int!`)");
+        };
+        let e = self.extract(&v, 0, Type::Bool);
+        let (lf, lok) = (self.lbl("fail"), self.lbl("ok"));
+        self.term(format!("br i1 {}, label %{lf}, label %{lok}", e.v));
+        self.label(&lf);
+        let m = self.extract(&v, 2, Type::Str);
+        let r = self.err_of(&ft, &m.v);
+        self.term(format!("ret {} {}", ll(&r.ty), r.v));
+        self.label(&lok);
+        Ok(if *t == Type::Void { void() } else { self.extract(&v, 1, *t) })
+    }
+
+    /// A read-only local holding `v` (for the value inside `a?.b`).
+    fn temp_var(&mut self, v: &Val) -> Var {
+        let a = self.alloca(&v.ty);
+        self.store(&a, v);
+        Var { addr: a, ty: v.ty.clone(), mutable: false }
     }
 
     /// For a result or an optional: (an i1 that is true when it holds no value, the value's type).

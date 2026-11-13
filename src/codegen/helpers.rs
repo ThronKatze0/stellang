@@ -114,6 +114,40 @@ impl Gen {
                     Ok(())
                 })?;
             }
+            Type::Map(kt, vt) => {
+                same_ptr(self);
+                let (la, lb) = (self.len_of(&a).unwrap(), self.len_of(&b).unwrap());
+                let s = self.tmp();
+                self.ins(format!("{s} = icmp eq i64 {la}, {lb}"));
+                self.need(&s, &lno);
+                let (ks, vs) = (self.map_list("%a", 0, kt), self.map_list("%a", 1, vt));
+                let lno2 = lno.clone();
+                self.each(&ks, kt, |g, k, i| {
+                    let (_, d) = g.vec_parts(&vs.v);
+                    let p = g.tmp();
+                    g.ins(format!("{p} = getelementptr inbounds {}, ptr {d}, i64 {i}", ll(vt)));
+                    let x = g.load(&p, (**vt).clone());
+                    let (found, y) = g.map_get("%b", &k, vt);
+                    g.need(&found, &lno2);
+                    let e = g.eq(x, y, pos)?;
+                    g.need(&e, &lno2);
+                    Ok(())
+                })?;
+            }
+            Type::Set(et) => {
+                same_ptr(self);
+                let (la, lb) = (self.len_of(&a).unwrap(), self.len_of(&b).unwrap());
+                let s = self.tmp();
+                self.ins(format!("{s} = icmp eq i64 {la}, {lb}"));
+                self.need(&s, &lno);
+                let xs = self.map_list("%a", 0, et);
+                let lno2 = lno.clone();
+                self.each(&xs, et, |g, x, _| {
+                    let found = g.map_has("%b", &x);
+                    g.need(&found, &lno2);
+                    Ok(())
+                })?;
+            }
             Type::Opt(inner) => {
                 let (ha, hb) = (self.extract(&a, 0, Type::Bool), self.extract(&b, 0, Type::Bool));
                 let s = self.tmp();

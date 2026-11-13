@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>stellang todos</title>
+<style>body{font:16px system-ui;max-width:40rem;margin:2rem auto}li.done{text-decoration:line-through}</style>
+<h1>todos</h1>
+<form id="f"><input id="t" placeholder="what needs doing?" autofocus> <button>add</button></form>
+<ul id="list"></ul>
+<h2>live feed</h2>
+<pre id="feed"></pre>
+<script>
+const list = document.getElementById("list"), feed = document.getElementById("feed");
+async function load() {
+  const todos = await (await fetch("/todos")).json();
+  list.innerHTML = "";
+  for (const t of todos) {
+    const li = document.createElement("li");
+    li.textContent = `${t.title} (${t.priority})`;
+    if (t.status.type === "Done") li.className = "done";
+    li.onclick = () => fetch(`/todos/${t.id}/done`, {method: "PATCH"});
+    list.append(li);
+  }
+}
+document.getElementById("f").onsubmit = async e => {
+  e.preventDefault();
+  const t = document.getElementById("t");
+  await fetch("/todos", {method: "POST", body: JSON.stringify({title: t.value})});
+  t.value = "";
+};
+const ws = new WebSocket(`ws://${location.host}/feed`);
+ws.onmessage = e => { feed.textContent = e.data + "\n" + feed.textContent; load(); };
+load();
+</script>

@@ -314,6 +314,17 @@ fn compile_errors() {
         ("fn main() { let s = {1.5} }", "must be int, str or bool"),
         ("fn main() { for a, b in 0..3 {} }", "one number at a time"),
         ("fn main() { let n = int(\"1\") catch e { println(e) } }", "must leave"),
+        ("enum S { A, B(int) }\nfn main() { match S.A { A => {} } }", "doesn't handle S.B"),
+        ("enum S { A, B }\nfn main() { let s = .A }", "which enum `.A`"),
+        ("enum S { A(int) }\nfn main() { let s = S.A }", "holds values"),
+        ("enum S { A, B(int) }\nfn main() { let B(n) = S.A }", "might not match"),
+        ("fn main() { let x: int? = 1\n println(x + 1) }", "unwrap it first"),
+        ("fn main() { let x = none }", "what kind of `none`"),
+        ("fn f() -> int { let x: int? = none\n return x? }\nfn main() {}", "must return an optional"),
+        ("const X = 1\nfn main() { X = 2 }", "is a constant"),
+        ("struct P { x: int, y: int = 0 }\nfn main() { let p = P { y: 1 } }", "missing field `x`"),
+        ("fn main() { match 1 { 1 | x => {}, _ => {} } }", "can't bind names"),
+        ("fn main() { let x: int? = 1\n let y = x else { println(1) } }", "must leave"),
         ("fn main() { match 1 { _ => 1, 2 => 2 } }", "can never run"),
     ];
     for (i, (src, msg)) in cases.iter().enumerate() {
@@ -362,13 +373,15 @@ fn http_server() {
         }
         panic!("server never came up");
     };
-    let get = |path: &str| send(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+    let get = |path: &str| send(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"));
     let first = get("/");
     let second = get("/");
     let hello = get("/hello/ada");
     let square = get("/square/12");
     let bad = get("/square/abc");
-    let echo = send("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\n{\"a\":1}".into());
+    let echo = send("POST /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 7\r\n\r\n{\"a\":1}".into());
+    // keep-alive: two pipelined requests on one connection, then close
+    let both = send("GET /hello/a HTTP/1.1\r\nHost: x\r\n\r\nGET /hello/b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".into());
     let missing = get("/nope");
     server.kill().unwrap();
     assert!(first.starts_with("HTTP/1.1 200 OK\r\n") && first.contains("visit number 1"), "{first}");
@@ -378,6 +391,7 @@ fn http_server() {
     assert!(bad.starts_with("HTTP/1.1 400 Bad Request") && bad.contains("not a number"), "{bad}");
     assert!(echo.contains("application/json") && echo.ends_with("{\"a\":1}"), "{echo}");
     assert!(missing.starts_with("HTTP/1.1 404 Not Found"), "{missing}");
+    assert!(both.contains("keep-alive") && both.contains("hi a!") && both.ends_with("hi b!"), "{both}");
 }
 
 #[test]
@@ -458,4 +472,267 @@ bob=26 carol=40
 0:8 1:5 2:3 3:99 
 ";
     ok("prelude", src, out);
+}
+
+#[test]
+fn enums_and_options() {
+    let src = r#"
+const PI = 3.0
+
+enum Shape {
+    Circle(radius: float),
+    Rect { w: float, h: float = 1.0 },
+    Empty,
+
+    fn area(self) -> float {
+        return match self {
+            Circle(r) => PI * r * r,
+            Rect { w, h } => w * h,
+            Empty => 0.0,
+        }
+    }
+
+    fn square(side: float) -> Shape {
+        return .Rect { w: side, h: side }
+    }
+}
+
+enum Expr {
+    Num(int),
+    Add(Expr, Expr),
+    Mul(Expr, Expr),
+}
+
+fn eval(e: Expr) -> int {
+    return match e {
+        Num(n) => n,
+        Add(a, b) => eval(a) + eval(b),
+        Mul(Num(0), _) | Mul(_, Num(0)) => 0,
+        Mul(a, b) => eval(a) * eval(b),
+    }
+}
+
+enum Role { Admin, Member }
+
+struct User {
+    name: str,
+    email: str?,
+    role: Role = .Member,
+}
+
+fn domain(users: [User], name: str) -> str? {
+    let u = users.find(u => u.name == name)?
+    return u.email?.split("@")[1]
+}
+
+fn size(n: int) -> str {
+    return match n {
+        0 => "zero",
+        1 | 2 | 3 => "small",
+        x if x < 0 => "negative",
+        _ => "big",
+    }
+}
+
+fn main() -> void! {
+    let shapes: [Shape] = [.Circle(1.0), Shape.Rect { w: 2.0 }, Shape.square(3.0), .Empty]
+    println(shapes)
+    println(shapes.map(s => s.area()))
+    let e = Expr.Add(.Num(2), .Mul(.Num(3), .Num(4)))
+    println("${e} = ${eval(e)} ${eval(.Mul(.Num(0), .Num(9)))}")
+    println([Shape.Circle(1.0) == .Circle(1.0), Shape.Empty == .Circle(1.0), [1, 2] == [1, 2]])
+
+    let users = [User { name: "ada", email: "ada@math.org", role: .Admin }, User { name: "bob" }]
+    println(users[1])
+    println([domain(users, "ada"), domain(users, "bob"), domain(users, "eve")])
+    if let Admin = users[0].role { println("ada is admin") }
+    if let u = users.find(u => u.name == "bob") { println("bob's email: ${u.email ?? "-"}") }
+    let n: int? = none
+    println([n ?? 7, n catch 8, some(3) ?? 0])
+    match users.get(5) {
+        some(u) => println(u.name),
+        none => println("nobody"),
+    }
+    let Circle(r) = shapes[0] else { return err("not a circle") }
+    let kind = if r > 0.5 { "big" } else { "small" }
+    println("${r} ${kind}")
+    println([size(0), size(2), size(-5), size(50)])
+    let stack = [1, 2, 3]
+    while let top = stack.last() {
+        print(top)
+        stack.pop()
+    }
+    println()
+    let ages = {"ann": 3}
+    println([ages.get("ann") ?? 0, ages.get("zed") ?? 0])
+    println(to_json(users))
+    println(to_json([Shape.Circle(1.0), .Empty]))
+    let r2 = int("x") catch e { -1 }
+    println(r2)
+}"#;
+    let out = r#"[Circle(radius: 1.0), Rect { w: 2.0, h: 1.0 }, Rect { w: 3.0, h: 3.0 }, Empty]
+[3.0, 2.0, 9.0, 0.0]
+Add(Num(2), Mul(Num(3), Num(4))) = 14 0
+[true, false, true]
+User { name: "bob", email: none, role: Member }
+["math.org", none, none]
+ada is admin
+bob's email: -
+[7, 8, 3]
+nobody
+1.0 big
+["zero", "small", "negative", "big"]
+321
+[3, 0]
+[{"name":"ada","email":"ada@math.org","role":"Admin"},{"name":"bob","email":null,"role":"Member"}]
+[{"type":"Circle","radius":1.0},{"type":"Empty"}]
+-1
+"#;
+    ok("enums", src, out);
+}
+
+#[test]
+fn json_and_fs() {
+    let dir = tmpdir("jsonfs");
+    let file = dir.join("x.txt");
+    let src = format!(
+        r#"
+import json
+import fs
+
+fn main() -> void! {{
+    let doc = json.parse("{{\"user\": {{\"name\": \"ada\", \"tags\": [1, true, null]}}, \"e\": \"\\u00e9\"}}")?
+    println(doc.stringify())
+    println(doc.get("user")?.get("name")?.as_str() ?? "anon")
+    println(doc.get("nope")?.as_str() ?? "anon")
+    match json.parse("[1, 2") {{
+        ok(v) => println(v),
+        err(e) => println(e),
+    }}
+    fs.write("{f}", "hello\n")?
+    fs.append("{f}", "more\n")?
+    print(fs.read("{f}")?)
+    println(fs.size("{f}"))
+    println(fs.read("/nope") catch e {{ "failed" }})
+}}"#,
+        f = file.display()
+    );
+    ok("jsonfs", &src, "{\"user\":{\"name\":\"ada\",\"tags\":[1,true,null]},\"e\":\"\u{e9}\"}\nada\nanon\nbad JSON at 5: expected `,`, found the end\nhello\nmore\n11\nfailed\n");
+}
+
+/// A minimal WebSocket client: handshake, masked text frames, and reading frames back.
+fn ws_connect(port: u16, path: &str) -> TcpStream {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(s, "GET {path} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").unwrap();
+    let mut head = Vec::new();
+    let mut b = [0u8];
+    while !head.ends_with(b"\r\n\r\n") {
+        s.read_exact(&mut b).unwrap();
+        head.push(b[0]);
+    }
+    let head = String::from_utf8(head).unwrap();
+    // the accept key for the RFC 6455 sample nonce
+    assert!(head.starts_with("HTTP/1.1 101") && head.contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), "{head}");
+    s
+}
+
+fn ws_send(s: &mut TcpStream, msg: &str) {
+    let mask = [1u8, 2, 3, 4];
+    let mut f = vec![0x81, 0x80 | msg.len() as u8];
+    f.extend(mask);
+    f.extend(msg.bytes().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+    s.write_all(&f).unwrap();
+}
+
+fn ws_recv(s: &mut TcpStream) -> String {
+    let mut h = [0u8; 2];
+    s.read_exact(&mut h).unwrap();
+    let mut d = vec![0u8; (h[1] & 127) as usize];
+    s.read_exact(&mut d).unwrap();
+    String::from_utf8(d).unwrap()
+}
+
+#[test]
+fn websockets_and_middleware() {
+    let src = r#"
+import http
+
+fn main() -> void! {
+    let app = http.app()
+    app.log = false
+    app.use((req, res, next) => {
+        res.set("x-seen", "yes")
+        if req.path == "/blocked" {
+            res.status(403).send("no")
+            return
+        }
+        next()
+    })
+    app.get("/fail", (req, res) => {
+        let n = int("x")?
+        res.send(str(n))
+    })
+    app.put("/items/:id", (req, res) => res.status(201).send("put ${req.param("id")} ${req.query.get("q") ?? "-"} ${req.cookie("c") ?? "-"}"))
+    app.get("/files/*", (req, res) => res.send("file ${req.param("*")}"))
+    app.ws("/chat", (ws, req) => {
+        let name = req.query.get("name") ?? "?"
+        ws.send("welcome ${name}")
+        ws.on_message(msg => {
+            if msg == "who" {
+                ws.send("${app.clients("/chat").len()} here")
+            } else {
+                ws.broadcast("${name}: ${msg}")
+            }
+        })
+        ws.on_close(() => ws.broadcast("${name} left"))
+    })
+    let port = int(env("PORT"))?
+    app.listen(port)?
+}"#;
+    let dir = tmpdir("ws");
+    let (file, exe) = (dir.join("main.st"), dir.join("main"));
+    fs::write(&file, src).unwrap();
+    let c = Command::new(BIN).arg(&file).arg("-o").arg(&exe).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let port = (20000 + (std::process::id() + 7) % 20000) as u16;
+    let mut server = Command::new(&exe).env("PORT", port.to_string()).stdout(Stdio::null()).spawn().unwrap();
+    let send = |req: &str| -> String {
+        for _ in 0..50 {
+            if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+                s.write_all(req.as_bytes()).unwrap();
+                let mut out = String::new();
+                s.read_to_string(&mut out).unwrap();
+                return out;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("server never came up");
+    };
+    let blocked = send("GET /blocked HTTP/1.1\r\nConnection: close\r\n\r\n");
+    let fail = send("GET /fail HTTP/1.1\r\nConnection: close\r\n\r\n");
+    let put = send("PUT /items/a%20b?q=hi+there HTTP/1.1\r\nCookie: c=1; d=2\r\nConnection: close\r\n\r\n");
+    let files = send("GET /files/a/b.txt HTTP/1.1\r\nConnection: close\r\n\r\n");
+    let wrong = send("POST /items/1 HTTP/1.1\r\nConnection: close\r\n\r\n");
+
+    let mut a = ws_connect(port, "/chat?name=ann");
+    let mut b = ws_connect(port, "/chat?name=bob");
+    let welcome = (ws_recv(&mut a), ws_recv(&mut b));
+    ws_send(&mut a, "hello");
+    let got = ws_recv(&mut b);
+    ws_send(&mut b, "who");
+    let who = ws_recv(&mut b);
+    drop(b);
+    let left = ws_recv(&mut a);
+    server.kill().unwrap();
+
+    assert!(blocked.starts_with("HTTP/1.1 403") && blocked.contains("x-seen: yes") && blocked.ends_with("no"), "{blocked}");
+    assert!(fail.starts_with("HTTP/1.1 500") && fail.contains("not a number"), "{fail}");
+    assert!(put.starts_with("HTTP/1.1 201") && put.ends_with("put a b hi there 1"), "{put}");
+    assert!(files.ends_with("file a/b.txt"), "{files}");
+    assert!(wrong.starts_with("HTTP/1.1 404"), "{wrong}");
+    assert_eq!(welcome, ("welcome ann".into(), "welcome bob".into()));
+    assert_eq!(got, "ann: hello");
+    assert_eq!(who, "2 here");
+    assert_eq!(left, "bob left");
 }

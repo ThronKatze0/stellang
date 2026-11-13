@@ -12,7 +12,12 @@ use std::{env, fs};
 const RUNTIME: &str = include_str!("runtime.c");
 
 /// The standard library, written in stellang and built into the compiler.
-const STD: &[(&str, &str)] = &[("net", include_str!("../std/net.st")), ("http", include_str!("../std/http.st"))];
+const STD: &[(&str, &str)] = &[
+    ("net", include_str!("../std/net.st")),
+    ("http", include_str!("../std/http.st")),
+    ("fs", include_str!("../std/fs.st")),
+    ("json", include_str!("../std/json.st")),
+];
 
 const USAGE: &str = "usage:
   stellang <file.st> [-o <out>] [-O0|-O1|-O2|-O3|-Os] [--emit-llvm]   compile
