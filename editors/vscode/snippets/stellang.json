@@ -1,0 +1,42 @@
+{
+  "main": { "prefix": "main", "body": ["fn main() -> void! {", "\t$0", "}"], "description": "fn main" },
+  "fn": { "prefix": "fn", "body": ["fn ${1:name}(${2}) ${3:-> ${4:int} }{", "\t$0", "}"], "description": "function" },
+  "struct": { "prefix": "struct", "body": ["struct ${1:Name} {", "\t${2:field}: ${3:int},", "", "\tfn ${4:method}(self) {", "\t\t$0", "\t}", "}"], "description": "struct with a method" },
+  "enum": { "prefix": "enum", "body": ["enum ${1:Name} {", "\t${2:A},", "\t${3:B}(${4:int}),", "\t${5:C} { ${6:x}: ${7:int} },", "}"], "description": "enum" },
+  "impl": { "prefix": "impl", "body": ["impl ${1:Type} {", "\tfn ${2:method}(self) {", "\t\t$0", "\t}", "}"], "description": "impl block" },
+  "match": { "prefix": "match", "body": ["match ${1:value} {", "\t${2:pattern} => ${3:result},", "\t_ => ${0:other},", "}"], "description": "match" },
+  "matchopt": { "prefix": "matchopt", "body": ["match ${1:value} {", "\tsome(${2:x}) => ${3},", "\tnone => ${0},", "}"], "description": "match an optional" },
+  "matchres": { "prefix": "matchres", "body": ["match ${1:value} {", "\tok(${2:x}) => ${3},", "\terr(${4:e}) => ${0},", "}"], "description": "match a result" },
+  "iflet": { "prefix": "iflet", "body": ["if let ${1:x} = ${2:optional} {", "\t$0", "}"], "description": "if let" },
+  "letelse": { "prefix": "letelse", "body": ["let ${1:x} = ${2:optional} else {", "\treturn${0}", "}"], "description": "let ... else" },
+  "for": { "prefix": "for", "body": ["for ${1:x} in ${2:xs} {", "\t$0", "}"], "description": "for loop" },
+  "fori": { "prefix": "fori", "body": ["for ${1:i} in ${2:0}..${3:n} {", "\t$0", "}"], "description": "for over a range" },
+  "while": { "prefix": "while", "body": ["while ${1:cond} {", "\t$0", "}"], "description": "while loop" },
+  "catch": { "prefix": "catch", "body": ["catch ${1:e} {", "\t$0", "}"], "description": "catch block" },
+  "lambda": { "prefix": "lam", "body": ["(${1:x}) => ${0}"], "description": "lambda" },
+  "server": {
+    "prefix": "server",
+    "body": [
+      "import http",
+      "",
+      "fn main() -> void! {",
+      "\tlet app = http.app()",
+      "",
+      "\tapp.get(\"/\", (req, res) => res.send(\"hello\"))",
+      "",
+      "\tapp.get(\"/hello/:name\", (req, res) => res.send(\"hi ${req.param(\"name\")}\"))",
+      "",
+      "\tlet port = int(env(\"PORT\")) catch ${1:8080}",
+      "\tapp.listen(port)?",
+      "}"
+    ],
+    "description": "an http server"
+  },
+  "get": { "prefix": "get", "body": ["app.${1|get,post,put,patch,delete|}(\"${2:/path}\", (req, res) => {", "\t$0", "})"], "description": "a route" },
+  "ws": {
+    "prefix": "ws",
+    "body": ["app.ws(\"${1:/ws}\", (ws, req) => {", "\tws.on_message(msg => ${2:ws.broadcast(msg)})", "\tws.on_close(() => {$0})", "})"],
+    "description": "a WebSocket route"
+  },
+  "use": { "prefix": "use", "body": ["app.use((req, res, next) => {", "\t$0", "\tnext()", "})"], "description": "middleware" }
+}

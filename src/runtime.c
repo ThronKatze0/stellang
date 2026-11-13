@@ -14,7 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
 #include <sys/sendfile.h>
+#endif
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -687,6 +689,10 @@ char *st_ws_take(int64_t fd) {
 
 int64_t st_ws_op(void) { return ws_last_op; }
 
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0 // macOS: SIGPIPE is ignored in st_init anyway
+#endif
+
 static int write_all(int fd, const char *p, size_t n) {
     while (n) {
         ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
@@ -815,12 +821,20 @@ int64_t st_send_file(int64_t fd, const char *head, const char *path) {
     struct stat st;
     fstat(f, &st);
     int64_t r = write_all((int)fd, head, strlen(head));
+#ifdef __linux__
     off_t off = 0;
     while (!r && off < st.st_size) {
         ssize_t w = sendfile((int)fd, f, &off, (size_t)(st.st_size - off));
         if (w < 0 && errno == EINTR) continue;
         if (w <= 0) r = -1;
     }
+#else
+    char buf[65536];
+    for (ssize_t n; !r && (n = read(f, buf, sizeof buf)) != 0;) {
+        if (n < 0 && errno == EINTR) continue;
+        r = n < 0 ? -1 : write_all((int)fd, buf, (size_t)n);
+    }
+#endif
     close(f);
     return r;
 }

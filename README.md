@@ -266,7 +266,8 @@ println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"p
 ## Editor support
 
 `stellang lsp` is a language server built into the compiler: errors as you type, hover types and doc comments,
-completion, go to definition (into `std` too), document symbols, formatting and semantic highlighting.
+inlay type hints, completion, signature help, go to definition (into `std` too), references, rename, symbols,
+folding, formatting and semantic highlighting.
 It runs the real lexer, parser and type checker, so it keeps up with the language by itself.
 The fallback grammars come out of the compiler's keyword table (`stellang grammar textmate|vim`), and a test
 fails if the copies in `editors/` go stale.
@@ -279,9 +280,11 @@ fails if the copies in `editors/` go stale.
   ```
 
   or with no plugin manager: `vim.opt.rtp:append("~/src/stellang/editors/nvim")`.
-- **VS Code**: `cd editors/vscode && npm install`, then either symlink the folder into `~/.vscode/extensions/`
-  or package it with `npx @vscode/vsce package` and install the `.vsix`. Set `stellang.path` if `stellang`
-  isn't on your PATH.
+- **VS Code**: install the `.vsix` (Extensions → `…` → *Install from VSIX…*). The platform builds from CI
+  (`vscode extension` workflow, attached to `v*` releases) include the compiler, so that's all you need for the
+  editor features. Or build it: `cd editors/vscode && npm install && npm run package`. Besides the server features
+  it adds Run (`Ctrl+F5`, ▶ in the title bar, `▶ Run | Build` above `main`), build/check tasks with a problem
+  matcher, snippets, a file icon and Markdown code-block highlighting. See [editors/vscode](editors/vscode/README.md).
 - **Anything else** with LSP support: run `stellang lsp` for `*.st` files.
 
 ## Safety

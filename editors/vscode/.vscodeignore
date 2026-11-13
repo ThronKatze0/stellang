@@ -1,1 +1,9 @@
 **/*.vsix
+scripts/**
+media/icon.svg
+node_modules/@vscode/vsce/**
+node_modules/.bin/**
+.gitignore
+test/**
+node_modules/@vscode/test-electron/**
+.vscode-test/**

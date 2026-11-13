@@ -1347,6 +1347,7 @@ impl Gen {
                         };
                         let v = self.expr(value, ft.as_ref())?;
                         let (p, t) = self.field_ptr(&b, f, target.pos)?;
+                        self.note(target.pos, format!("{}.{f}: {t}", b.ty));
                         (p, t, v)
                     }
                     ExprKind::Index(b, i) => {

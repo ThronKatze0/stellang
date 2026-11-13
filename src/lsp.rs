@@ -97,6 +97,21 @@ pub fn run() {
             "textDocument/completion" => Some(s.completion(&doc_path(params), position(params))),
             "textDocument/documentSymbol" => Some(s.symbols(&doc_path(params))),
             "textDocument/formatting" => Some(s.format(&doc_path(params))),
+            "textDocument/references" => Some(s.references(&doc_path(params), position(params))),
+            "textDocument/documentHighlight" => Some(s.highlights(&doc_path(params), position(params))),
+            "textDocument/prepareRename" => Some(s.prepare_rename(&doc_path(params), position(params))),
+            "textDocument/rename" => match s.rename(&doc_path(params), position(params), params.get("newName").str().unwrap_or("")) {
+                Ok(r) => Some(r),
+                Err(m) => {
+                    send(&obj([("jsonrpc", "2.0".into()), ("id", id), ("error", obj([("code", (-32803i64).into()), ("message", m.into())]))]));
+                    continue;
+                }
+            },
+            "textDocument/inlayHint" => Some(s.inlay_hints(&doc_path(params), params)),
+            "textDocument/signatureHelp" => Some(s.signature_help(&doc_path(params), position(params))),
+            "textDocument/foldingRange" => Some(s.folding(&doc_path(params))),
+            "textDocument/codeLens" => Some(s.code_lens(&doc_path(params))),
+            "workspace/symbol" => Some(s.workspace_symbols(params.get("query").str().unwrap_or(""))),
             _ => (id != Json::Null).then_some(Json::Null), // answer unknown requests, ignore notifications
         };
         if let (Some(r), false) = (result, id == Json::Null) {
@@ -116,6 +131,14 @@ fn capabilities() -> Json {
                 ("documentSymbolProvider", true.into()),
                 ("documentFormattingProvider", true.into()),
                 ("completionProvider", obj([("triggerCharacters", vec!["."].into())])),
+                ("referencesProvider", true.into()),
+                ("documentHighlightProvider", true.into()),
+                ("renameProvider", obj([("prepareProvider", true.into())])),
+                ("inlayHintProvider", true.into()),
+                ("signatureHelpProvider", obj([("triggerCharacters", vec!["(", ","].into())])),
+                ("foldingRangeProvider", true.into()),
+                ("codeLensProvider", obj([("resolveProvider", false.into())])),
+                ("workspaceSymbolProvider", true.into()),
                 (
                     "semanticTokensProvider",
                     obj([
@@ -263,6 +286,11 @@ impl Server {
 
     fn analyze(&self, path: &str) -> Analysis {
         let text = self.docs.get(path).cloned().unwrap_or_default();
+        self.analyze_file(path, &text)
+    }
+
+    fn analyze_file(&self, path: &str, text: &str) -> Analysis {
+        let text = text.to_string();
         let mut units = vec![];
         let srcs = Sources { std_dir: Some(&self.std_dir), open: &self.docs };
         if let Err(e) = load(&mut units, "", path.to_string(), &text, &srcs) {
@@ -344,9 +372,16 @@ impl Server {
     }
 
     /// The declarations a name at token `k` could mean, best first.
-    fn resolve<'a>(&self, decls: &'a [Decl], toks: &[Token], k: usize, units: &[Unit]) -> Vec<&'a Decl> {
+    fn resolve<'a>(&self, path: &str, decls: &'a [Decl], toks: &[Token], k: usize, units: &[Unit], notes: &[Note]) -> Vec<&'a Decl> {
         let Tok::Ident(name) = &toks[k].tok else { return vec![] };
         let prev = |n: usize| k.checked_sub(n).map(|i| &toks[i].tok);
+        // the name in a declaration itself (`fn find`, `struct Todo`, a variant)
+        let here = toks[k].pos;
+        let kw = k.checked_sub(1).map(|i| toks[i].pos);
+        let own: Vec<&Decl> = decls.iter().filter(|d| d.name == *name && d.file == path && (d.pos == here || Some(d.pos) == kw) && d.kind != "field").collect();
+        if !own.is_empty() {
+            return own;
+        }
         let modules: HashSet<&str> = units.iter().map(|u| u.name.as_str()).collect();
         let named = |d: &&Decl| d.name == *name;
         if prev(1) == Some(&Tok::Dot) {
@@ -359,10 +394,17 @@ impl Server {
                     return owned;
                 }
             }
-            return decls.iter().filter(named).filter(|d| d.owner.is_some()).collect();
+            // `x.name`: the type checker noted the receiver's type at the `.`
+            let dot = toks[k - 1].pos;
+            let Some(n) = notes.iter().rev().find(|n| n.file == path && n.pos == dot) else {
+                // no note: a builtin method, or the file doesn't type-check right now
+                return if notes.is_empty() { decls.iter().filter(named).filter(|d| d.owner.is_some()).collect() } else { vec![] };
+            };
+            let qualified = n.text.trim_start_matches("fn ").split(['(', ':']).next().unwrap_or("").to_string();
+            let owner = qualified.rsplit_once('.').map(|(t, _)| t.rsplit('.').next().unwrap_or(t).to_string());
+            return decls.iter().filter(named).filter(|d| d.owner.is_some() && d.owner == owner).collect();
         }
         let mut found: Vec<&Decl> = decls.iter().filter(named).filter(|d| d.owner.is_none() && d.module.is_empty()).collect();
-        found.extend(decls.iter().filter(named).filter(|d| d.owner.is_none() && !d.module.is_empty()));
         found.extend(decls.iter().filter(named).filter(|d| d.kind == "variant"));
         found
     }
@@ -381,7 +423,7 @@ impl Server {
         let prev = k.checked_sub(1).map(|i| &toks[i]);
         let at = |p: Pos| a.notes.iter().rev().find(|n| n.file == path && n.pos == p);
         let note = at(toks[k].pos).or_else(|| prev.filter(|t| matches!(t.tok, Tok::Dot | Tok::Let | Tok::Var)).and_then(|t| at(t.pos)));
-        let found = self.resolve(&decls, &toks, k, &a.units);
+        let found = self.resolve(path, &decls, &toks, k, &a.units, &a.notes);
         // a declaration (with parameter names and its doc comment) beats the checker's bare signature
         let decl = found.first().filter(|d| note.is_none() || !matches!(d.kind, "field" | "const") || d.doc.len() > 0);
         match (note, decl) {
@@ -407,6 +449,43 @@ impl Server {
         obj([("contents", obj([("kind", "markdown".into()), ("value", parts.join("\n\n").into())]))])
     }
 
+    /// Where the name at token `k` of `path` is defined: a declaration, or the binding of a local.
+    fn def_of(&self, path: &str, toks: &[Token], k: usize, decls: &[Decl], units: &[Unit], notes: &[Note]) -> Option<(String, Pos)> {
+        let Tok::Ident(name) = &toks[k].tok else { return None };
+        let found = self.resolve(path, decls, toks, k, units, notes);
+        let own = found.first().filter(|d| d.file == path && (d.pos == toks[k].pos || k > 0 && d.pos == toks[k - 1].pos));
+        if let Some(d) = own.or(if k > 0 && toks[k - 1].tok == Tok::Dot { found.first() } else { None }) {
+            return Some((d.file.clone(), d.pos));
+        }
+        if k > 0 && toks[k - 1].tok == Tok::Dot {
+            return None;
+        }
+        // a local (it shadows anything global): the nearest binding of that name at or above
+        if let Some(p) = self.local_binding(toks, k, name) {
+            return Some((path.to_string(), p));
+        }
+        found.first().map(|d| (d.file.clone(), d.pos))
+    }
+
+    /// The nearest `let`/`var`/`for`/parameter/lambda/pattern binding of `name` at or above token `k`.
+    fn local_binding(&self, toks: &[Token], k: usize, name: &str) -> Option<Pos> {
+        for i in (0..=k).rev() {
+            if toks[i].tok != Tok::Ident(name.to_string()) {
+                continue;
+            }
+            let before = i.checked_sub(1).map(|j| &toks[j].tok);
+            let after = toks.get(i + 1).map(|t| &t.tok);
+            let binds = matches!(before, Some(Tok::Let | Tok::Var | Tok::For | Tok::LParen | Tok::Comma))
+                && matches!(after, Some(Tok::Colon | Tok::Assign | Tok::In | Tok::Comma | Tok::RParen | Tok::FatArrow | Tok::Else))
+                || matches!(after, Some(Tok::FatArrow))
+                || matches!(before, Some(Tok::Catch));
+            if binds {
+                return Some(toks[i].pos);
+            }
+        }
+        None
+    }
+
     fn definition(&self, path: &str, (line, ch): (u32, u32)) -> Json {
         let Some(text) = self.docs.get(path) else { return Json::Null };
         let Ok(toks) = lexer::lex(text) else { return Json::Null };
@@ -414,29 +493,234 @@ impl Server {
         let Some(k) = token_at(text, &toks, line, ch) else { return Json::Null };
         let a = self.analyze(path);
         let decls = self.decls(&a.units);
-        let loc = |file: &str, p: Pos| {
-            let t = self.text_of(file).unwrap_or_default();
-            obj([("uri", to_uri(file).into()), ("range", range(&t, p, p))])
-        };
-        if let Some(d) = self.resolve(&decls, &toks, k, &a.units).first() {
-            return loc(&d.file, d.pos);
+        match self.def_of(path, &toks, k, &decls, &a.units, &a.notes) {
+            Some((file, p)) => {
+                let t = self.text_of(&file).unwrap_or_default();
+                obj([("uri", to_uri(&file).into()), ("range", range(&t, p, p))])
+            }
+            None => Json::Null,
         }
-        // a local: the nearest `let`/`var`/`for`/parameter/pattern binding of that name above
-        let Tok::Ident(name) = &toks[k].tok else { return Json::Null };
-        for i in (0..k).rev() {
-            if toks[i].tok != Tok::Ident(name.clone()) {
+    }
+
+    /// Every use of the name under the cursor that means the same thing: (file, start, end).
+    fn occurrences(&self, path: &str, (line, ch): (u32, u32), only_here: bool) -> Option<(Vec<(String, Pos, Pos)>, String)> {
+        let text = self.docs.get(path)?;
+        let toks = flatten(&lexer::lex(text).ok()?);
+        let k = token_at(text, &toks, line, ch)?;
+        let Tok::Ident(name) = &toks[k].tok else { return None };
+        let a = self.analyze(path);
+        let decls = self.decls(&a.units);
+        let target = self.def_of(path, &toks, k, &decls, &a.units, &a.notes)?;
+        let mut files: Vec<String> = vec![path.to_string()];
+        if !only_here {
+            files.extend(a.units.iter().map(|u| u.file.clone()).filter(|f| f != path && !f.starts_with(&self.std_dir)));
+            files.extend(self.docs.keys().filter(|f| *f != path).cloned());
+        }
+        files.dedup();
+        let mut out = vec![];
+        let mut seen = HashSet::new();
+        for f in files {
+            if !seen.insert(f.clone()) {
                 continue;
             }
-            let before = i.checked_sub(1).map(|j| &toks[j].tok);
-            let after = toks.get(i + 1).map(|t| &t.tok);
-            let binds = matches!(before, Some(Tok::Let | Tok::Var | Tok::For | Tok::LParen | Tok::Comma))
-                && matches!(after, Some(Tok::Colon | Tok::Assign | Tok::In | Tok::Comma | Tok::RParen | Tok::FatArrow))
-                || matches!(after, Some(Tok::FatArrow));
-            if binds {
-                return loc(path, toks[i].pos);
+            let Some(t) = self.text_of(&f) else { continue };
+            let Ok(ft) = lexer::lex(&t) else { continue };
+            let ft = flatten(&ft);
+            // names are resolved in the context of the file that uses them
+            let (fdecls, funits, fnotes);
+            let (dd, uu, nn) = if f == path {
+                (&decls, &a.units, &a.notes)
+            } else {
+                let fa = self.analyze_file(&f, &t);
+                fdecls = self.decls(&fa.units);
+                (funits, fnotes) = (fa.units, fa.notes);
+                (&fdecls, &funits, &fnotes)
+            };
+            for (i, x) in ft.iter().enumerate() {
+                if x.tok == Tok::Ident(name.clone()) && self.def_of(&f, &ft, i, dd, uu, nn).as_ref() == Some(&target) {
+                    out.push((f.clone(), x.pos, Pos { line: x.pos.line, col: x.pos.col + name.chars().count() as u32 }));
+                }
             }
         }
-        Json::Null
+        Some((out, target.0))
+    }
+
+    fn references(&self, path: &str, at: (u32, u32)) -> Json {
+        let Some((occ, _)) = self.occurrences(path, at, false) else { return Json::Null };
+        Json::Arr(occ.iter().map(|(f, a, b)| {
+            let t = self.text_of(f).unwrap_or_default();
+            obj([("uri", to_uri(f).into()), ("range", range(&t, *a, *b))])
+        }).collect())
+    }
+
+    fn highlights(&self, path: &str, at: (u32, u32)) -> Json {
+        let Some((occ, _)) = self.occurrences(path, at, true) else { return Json::Null };
+        let Some(text) = self.docs.get(path) else { return Json::Null };
+        Json::Arr(occ.iter().filter(|o| o.0 == path).map(|(_, a, b)| obj([("range", range(text, *a, *b)), ("kind", 1u32.into())])).collect())
+    }
+
+    fn rename(&self, path: &str, at: (u32, u32), new_name: &str) -> Result<Json, String> {
+        let ok = new_name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && new_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !WORDS.iter().any(|w| w.0 == new_name);
+        if !ok {
+            return Err(format!("`{new_name}` isn't a valid name"));
+        }
+        let Some((occ, def_file)) = self.occurrences(path, at, false) else { return Err("nothing to rename here".into()) };
+        if def_file.starts_with(&self.std_dir) {
+            return Err("that is defined in the standard library".into());
+        }
+        let mut changes: Vec<(String, Json)> = vec![];
+        for (f, a, b) in &occ {
+            let t = self.text_of(f).unwrap_or_default();
+            let edit = obj([("range", range(&t, *a, *b)), ("newText", new_name.into())]);
+            let uri = to_uri(f);
+            match changes.iter_mut().find(|c| c.0 == uri) {
+                Some((_, Json::Arr(es))) => es.push(edit),
+                _ => changes.push((uri, Json::Arr(vec![edit]))),
+            }
+        }
+        Ok(obj([("changes", Json::Obj(changes))]))
+    }
+
+    fn prepare_rename(&self, path: &str, (line, ch): (u32, u32)) -> Json {
+        let Some(text) = self.docs.get(path) else { return Json::Null };
+        let Ok(toks) = lexer::lex(text) else { return Json::Null };
+        let toks = flatten(&toks);
+        let Some(k) = token_at(text, &toks, line, ch) else { return Json::Null };
+        let Tok::Ident(name) = &toks[k].tok else { return Json::Null };
+        if grammar::words().builtins.contains(name) || ["true", "false", "none", "self", "int", "float", "bool", "str", "void"].contains(&name.as_str()) {
+            return Json::Null;
+        }
+        let p = toks[k].pos;
+        range(text, p, Pos { line: p.line, col: p.col + name.chars().count() as u32 })
+    }
+
+    /// `: type` after `let` names that have no written type.
+    fn inlay_hints(&self, path: &str, params: &Json) -> Json {
+        let Some(text) = self.docs.get(path) else { return Json::Null };
+        let Ok(toks) = lexer::lex(text) else { return Json::Null };
+        let toks = flatten(&toks);
+        let a = self.analyze(path);
+        let (from, to) = (params.at(&["range", "start", "line"]).num().unwrap_or(0.0) as u32 + 1, params.at(&["range", "end", "line"]).num().unwrap_or(1e9) as u32 + 1);
+        let mut out = vec![];
+        for (i, t) in toks.iter().enumerate() {
+            if !matches!(t.tok, Tok::Let | Tok::Var) || t.pos.line < from || t.pos.line > to {
+                continue;
+            }
+            let (Some(name), Some(next)) = (toks.get(i + 1), toks.get(i + 2)) else { continue };
+            let Tok::Ident(n) = &name.tok else { continue };
+            if next.tok != Tok::Assign {
+                continue;
+            }
+            let Some(note) = a.notes.iter().find(|x| x.file == path && x.pos == t.pos) else { continue };
+            let Some((_, ty)) = note.text.split_once(": ") else { continue };
+            let end = Pos { line: name.pos.line, col: name.pos.col + n.chars().count() as u32 };
+            out.push(obj([("position", lsp_pos(text, end)), ("label", format!(": {ty}").into()), ("kind", 1u32.into()), ("paddingLeft", false.into())]));
+        }
+        Json::Arr(out)
+    }
+
+    /// The parameters of the call the cursor is in.
+    fn signature_help(&self, path: &str, (line, ch): (u32, u32)) -> Json {
+        let Some(text) = self.docs.get(path) else { return Json::Null };
+        let Ok(toks) = lexer::lex(text) else { return Json::Null };
+        let toks = flatten(&toks);
+        let l = text.lines().nth(line as usize).unwrap_or("");
+        let cur = Pos { line: line + 1, col: char_col(l, ch) };
+        let before = toks.iter().take_while(|t| (t.pos.line, t.pos.col) < (cur.line, cur.col)).count();
+        let (mut depth, mut commas) = (0, 0);
+        let mut open = None;
+        for i in (0..before).rev() {
+            match toks[i].tok {
+                Tok::RParen | Tok::RBrack | Tok::RBrace => depth += 1,
+                Tok::LParen if depth == 0 => {
+                    open = Some(i);
+                    break;
+                }
+                Tok::LParen | Tok::LBrack | Tok::LBrace if depth > 0 => depth -= 1,
+                Tok::LBrack | Tok::LBrace => return Json::Null,
+                Tok::Comma if depth == 0 => commas += 1,
+                _ => {}
+            }
+        }
+        let Some(open) = open.filter(|o| *o > 0) else { return Json::Null };
+        let a = self.analyze(path);
+        let decls = self.decls(&a.units);
+        let Some(d) = self.resolve(path, &decls, &toks, open - 1, &a.units, &a.notes).into_iter().find(|d| matches!(d.kind, "fn" | "method" | "variant")) else { return Json::Null };
+        let sig = d.sig.lines().next().unwrap_or("");
+        let inside = sig.find('(').and_then(|s| sig.rfind(')').map(|e| &sig[s + 1..e])).unwrap_or("");
+        let mut params = split_top(inside);
+        if d.kind == "method" && params.first().is_some_and(|p| p.trim() == "self") {
+            params.remove(0);
+        }
+        let ps: Vec<Json> = params.iter().map(|p| obj([("label", p.trim().into())])).collect();
+        let info = obj([("label", sig.into()), ("documentation", d.doc.as_str().into()), ("parameters", Json::Arr(ps))]);
+        obj([("signatures", Json::Arr(vec![info])), ("activeSignature", 0u32.into()), ("activeParameter", (commas as u32).into())])
+    }
+
+    fn folding(&self, path: &str) -> Json {
+        let Some(text) = self.docs.get(path) else { return Json::Null };
+        let Ok(toks) = lexer::lex(text) else { return Json::Null };
+        let Ok(m) = crate::parser::parse(toks.clone()) else { return Json::Null };
+        let mut stack = vec![];
+        let mut out = vec![];
+        for (k, opens) in m.braces {
+            if opens {
+                stack.push(k);
+            } else if let Some(o) = stack.pop() {
+                let (a, b) = (toks[o].pos.line, toks[k].pos.line);
+                if b > a + 1 {
+                    out.push(obj([("startLine", (a - 1).into()), ("endLine", (b - 2).into())]));
+                }
+            }
+        }
+        // runs of comment lines
+        let lines: Vec<&str> = text.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let start = i;
+            while i < lines.len() && lines[i].trim_start().starts_with("//") { i += 1 }
+            if i - start >= 2 {
+                out.push(obj([("startLine", start.into()), ("endLine", (i - 1).into()), ("kind", "comment".into())]));
+            }
+            i = i.max(start + 1);
+        }
+        Json::Arr(out)
+    }
+
+    /// "▶ Run" and "Build" above `fn main`.
+    fn code_lens(&self, path: &str) -> Json {
+        let Some(text) = self.docs.get(path) else { return Json::Null };
+        let Ok(toks) = lexer::lex(text) else { return Json::Arr(vec![]) };
+        let Some(i) = toks.windows(2).position(|w| w[0].tok == Tok::Fn && w[1].tok == Tok::Ident("main".into())) else { return Json::Arr(vec![]) };
+        let p = toks[i].pos;
+        let r = range(text, p, p);
+        let lens = |title: &str, cmd: &str| obj([("range", r.clone()), ("command", obj([("title", title.into()), ("command", cmd.into()), ("arguments", Json::Arr(vec![to_uri(path).into()]))]))]);
+        Json::Arr(vec![lens("▶ Run", "stellang.run"), lens("Build", "stellang.build")])
+    }
+
+    fn workspace_symbols(&self, query: &str) -> Json {
+        let q = query.to_lowercase();
+        let mut out = vec![];
+        let mut seen = HashSet::new();
+        for path in self.docs.keys() {
+            let a = self.analyze(path);
+            for d in self.decls(&a.units) {
+                if d.kind == "field" || d.file.starts_with(&self.std_dir) || !d.name.to_lowercase().contains(&q) || !seen.insert((d.file.clone(), d.pos.line, d.pos.col, d.name.clone())) {
+                    continue;
+                }
+                let t = self.text_of(&d.file).unwrap_or_default();
+                let kind: u32 = match d.kind { "fn" => 12, "method" => 6, "struct" => 23, "enum" => 10, "variant" => 22, "const" => 14, _ => 13 };
+                out.push(obj([
+                    ("name", d.name.as_str().into()),
+                    ("kind", kind.into()),
+                    ("containerName", d.owner.clone().unwrap_or_default().into()),
+                    ("location", obj([("uri", to_uri(&d.file).into()), ("range", range(&t, d.pos, d.pos))])),
+                ]));
+            }
+        }
+        Json::Arr(out)
     }
 
     fn completion(&self, path: &str, (line, ch): (u32, u32)) -> Json {
@@ -617,7 +901,8 @@ impl Server {
             let (ty, mods) = match &t.tok {
                 Tok::Str(_) | Tok::Interp(_) => ("string", 0),
                 Tok::Int(_) | Tok::Float(_) => ("number", 0),
-                tok if WORDS.iter().any(|w| w.1 == *tok) || lexer::EMOJI.iter().any(|e| e.0 == *tok && e.0 != Tok::Semi) => ("keyword", 0),
+                // keywords are left to the grammar, which tells declarations (`struct`) from control flow (`if`)
+                tok if WORDS.iter().any(|w| w.1 == *tok) || lexer::EMOJI.iter().any(|e| e.0 == *tok) => continue,
                 Tok::Arrow | Tok::FatArrow | Tok::Question | Tok::QuestionQuestion | Tok::Bang | Tok::Pipe | Tok::Eq | Tok::Ne
                 | Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge | Tok::AndAnd | Tok::OrOr | Tok::Plus | Tok::Minus | Tok::Times
                 | Tok::Slash | Tok::Percent | Tok::Assign | Tok::PlusEq | Tok::MinusEq | Tok::TimesEq | Tok::SlashEq | Tok::DotDot => ("operator", 0),
@@ -625,7 +910,7 @@ impl Server {
                     let decl = matches!(prev, Some(Tok::Fn | Tok::Struct | Tok::Enum | Tok::Const)) as u32;
                     let call = next == Some(&Tok::LParen);
                     match n.as_str() {
-                        "true" | "false" | "none" | "self" => ("keyword", 0),
+                        "true" | "false" | "none" | "self" => continue,
                         _ if prev == Some(&Tok::Dot) && variants.contains(n) => ("enumMember", 0),
                         _ if prev == Some(&Tok::Dot) && call => ("method", 0),
                         _ if prev == Some(&Tok::Dot) && (types.contains(n) || enums.contains(n)) => (if enums.contains(n) { "enum" } else { "struct" }, 0),
@@ -814,4 +1099,25 @@ fn block_sig(lines: &[&str], p: Pos) -> String {
         }
     }
     out.join("\n")
+}
+
+/// `a: int, f: fn(int, str) -> bool` split on the commas that aren't nested.
+fn split_top(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut depth) = (vec![], String::new(), 0);
+    for c in s.chars() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
 }

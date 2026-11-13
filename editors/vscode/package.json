@@ -1,37 +1,301 @@
 {
   "name": "stellang",
   "displayName": "stellang",
-  "description": "stellang language support: highlighting, errors as you type, hover types, completion, go to definition, formatting",
-  "version": "0.1.0",
+  "description": "Everything for stellang: highlighting, errors as you type, hover types, completion, go to definition, rename, inlay hints, formatting, run and build.",
+  "version": "0.2.0",
   "publisher": "stellang",
-  "license": "MIT",
-  "engines": { "vscode": "^1.82.0" },
-  "categories": ["Programming Languages", "Formatters"],
+  "icon": "media/icon.png",
+  "galleryBanner": {
+    "color": "#1a1430",
+    "theme": "dark"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ThronKatze0/stellang"
+  },
+  "homepage": "https://github.com/ThronKatze0/stellang#readme",
+  "bugs": {
+    "url": "https://github.com/ThronKatze0/stellang/issues"
+  },
+  "keywords": [
+    "stellang",
+    "language server",
+    "lsp",
+    "syntax",
+    "web framework"
+  ],
+  "engines": {
+    "vscode": "^1.82.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Formatters",
+    "Snippets",
+    "Linters"
+  ],
   "main": "./extension.js",
-  "activationEvents": ["onLanguage:stellang"],
+  "activationEvents": [
+    "onLanguage:stellang",
+    "workspaceContains:**/*.st"
+  ],
   "contributes": {
     "languages": [
       {
         "id": "stellang",
-        "aliases": ["stellang", "Stellang"],
-        "extensions": [".st"],
-        "configuration": "./language-configuration.json"
+        "aliases": [
+          "stellang",
+          "Stellang"
+        ],
+        "extensions": [
+          ".st"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./media/file-icon.svg",
+          "dark": "./media/file-icon.svg"
+        }
       }
     ],
     "grammars": [
-      { "language": "stellang", "scopeName": "source.stellang", "path": "./syntaxes/stellang.tmLanguage.json" }
+      {
+        "language": "stellang",
+        "scopeName": "source.stellang",
+        "path": "./syntaxes/stellang.tmLanguage.json"
+      },
+      {
+        "scopeName": "markdown.stellang.codeblock",
+        "path": "./syntaxes/markdown-codeblock.json",
+        "injectTo": [
+          "text.html.markdown"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.block.stellang": "stellang"
+        }
+      }
+    ],
+    "snippets": [
+      {
+        "language": "stellang",
+        "path": "./snippets/stellang.json"
+      }
     ],
     "configuration": {
       "title": "stellang",
       "properties": {
         "stellang.path": {
           "type": "string",
-          "default": "stellang",
-          "description": "The stellang compiler (it is also the language server: `stellang lsp`)."
+          "default": "",
+          "markdownDescription": "Path to the `stellang` compiler (it is also the language server). Empty: use `stellang` from your PATH or `~/.cargo/bin`, else the copy bundled with this extension."
+        },
+        "stellang.optimization": {
+          "type": "string",
+          "enum": [
+            "-O0",
+            "-O1",
+            "-O2",
+            "-O3",
+            "-Os"
+          ],
+          "default": "-O2",
+          "description": "Optimization level for Run and Build."
+        },
+        "stellang.run.env": {
+          "type": "object",
+          "default": {},
+          "description": "Environment variables for programs started with Run (for example {\"PORT\": \"3000\"})."
+        },
+        "stellang.codeLens": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show \"▶ Run | Build\" above fn main."
+        },
+        "stellang.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Log the messages between VS Code and the language server (Output → stellang)."
         }
       }
     },
-    "commands": [{ "command": "stellang.restart", "title": "stellang: Restart Language Server" }]
+    "configurationDefaults": {
+      "[stellang]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        "editor.formatOnSave": true,
+        "editor.semanticHighlighting.enabled": true
+      }
+    },
+    "commands": [
+      {
+        "command": "stellang.run",
+        "title": "Run File",
+        "category": "stellang",
+        "icon": "$(play)"
+      },
+      {
+        "command": "stellang.build",
+        "title": "Build File",
+        "category": "stellang",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "stellang.check",
+        "title": "Check File",
+        "category": "stellang"
+      },
+      {
+        "command": "stellang.toEmoji",
+        "title": "Convert Keywords to Emoji 🦍",
+        "category": "stellang"
+      },
+      {
+        "command": "stellang.toPlain",
+        "title": "Convert Emoji Keywords Back",
+        "category": "stellang"
+      },
+      {
+        "command": "stellang.restart",
+        "title": "Restart Language Server",
+        "category": "stellang"
+      },
+      {
+        "command": "stellang.showOutput",
+        "title": "Show Language Server Output",
+        "category": "stellang"
+      },
+      {
+        "command": "stellang.newFile",
+        "title": "New stellang File",
+        "category": "stellang",
+        "shortTitle": "stellang File"
+      }
+    ],
+    "menus": {
+      "editor/title/run": [
+        {
+          "command": "stellang.run",
+          "when": "resourceLangId == stellang",
+          "group": "navigation@0"
+        },
+        {
+          "command": "stellang.build",
+          "when": "resourceLangId == stellang",
+          "group": "navigation@1"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "stellang.run",
+          "when": "editorLangId == stellang",
+          "group": "z_stellang@1"
+        },
+        {
+          "command": "stellang.build",
+          "when": "editorLangId == stellang",
+          "group": "z_stellang@2"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "stellang.run",
+          "when": "resourceLangId == stellang",
+          "group": "z_stellang@1"
+        }
+      ],
+      "file/newFile": [
+        {
+          "command": "stellang.newFile"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "stellang.run",
+          "when": "editorLangId == stellang"
+        },
+        {
+          "command": "stellang.build",
+          "when": "editorLangId == stellang"
+        },
+        {
+          "command": "stellang.check",
+          "when": "editorLangId == stellang"
+        },
+        {
+          "command": "stellang.toEmoji",
+          "when": "editorLangId == stellang"
+        },
+        {
+          "command": "stellang.toPlain",
+          "when": "editorLangId == stellang"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "stellang.run",
+        "key": "ctrl+f5",
+        "mac": "cmd+f5",
+        "when": "editorLangId == stellang"
+      }
+    ],
+    "taskDefinitions": [
+      {
+        "type": "stellang",
+        "required": [
+          "command"
+        ],
+        "properties": {
+          "command": {
+            "type": "string",
+            "enum": [
+              "build",
+              "run",
+              "check"
+            ],
+            "description": "What to do with the file."
+          },
+          "file": {
+            "type": "string",
+            "description": "The .st file (default: the open file)."
+          }
+        }
+      }
+    ],
+    "problemMatchers": [
+      {
+        "name": "stellang",
+        "owner": "stellang",
+        "source": "stellang",
+        "fileLocation": [
+          "autoDetect",
+          "${workspaceFolder}"
+        ],
+        "pattern": {
+          "regexp": "^(.+?):(\\d+):(\\d+): (error|panic): (.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+        }
+      }
+    ]
   },
-  "dependencies": { "vscode-languageclient": "^9.0.1" }
+  "scripts": {
+    "bundle": "node scripts/bundle.js",
+    "package": "node scripts/bundle.js && vsce package --skip-license",
+    "package:nobin": "vsce package --skip-license --out stellang-universal.vsix",
+    "test": "node test/run.js"
+  },
+  "dependencies": {
+    "vscode-languageclient": "9.0.1"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "3.2.1",
+    "@vscode/test-electron": "2.4.1"
+  }
 }

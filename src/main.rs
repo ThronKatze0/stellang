@@ -94,6 +94,7 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("lsp") => return lsp::run(),
+        Some("--version" | "-V") => return println!("stellang {}", env!("CARGO_PKG_VERSION")),
         Some("grammar") => match args.get(1).map(String::as_str) {
             Some("textmate") => return print!("{}", grammar::textmate()),
             Some("vim") => return print!("{}", grammar::vim()),

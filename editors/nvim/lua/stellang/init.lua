@@ -5,6 +5,7 @@ local M = {
   config = {
     cmd = { "stellang", "lsp" },
     format_on_save = false,
+    inlay_hints = true, -- `let x = f()` shows `: Type` (Neovim 0.10+)
   },
 }
 
@@ -21,6 +22,9 @@ function M.attach(buf)
   local name = vim.api.nvim_buf_get_name(buf)
   local root = vim.fs.root and vim.fs.root(buf, { ".git" }) or vim.fs.dirname(name)
   vim.lsp.start({ name = "stellang", cmd = M.config.cmd, root_dir = root }, { bufnr = buf })
+  if M.config.inlay_hints and vim.lsp.inlay_hint then
+    pcall(vim.lsp.inlay_hint.enable, true, { bufnr = buf })
+  end
   if M.config.format_on_save then
     vim.api.nvim_create_autocmd("BufWritePre", {
       buffer = buf,
