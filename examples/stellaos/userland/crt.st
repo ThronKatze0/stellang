@@ -509,6 +509,24 @@ fn __l_pop(l: int, line: int) -> int {
     return __ld(__ld(l + 16) + (n - 1) * 8)
 }
 
+// an index for get/first/last: -1 if out of range (negative counts from the end)
+fn __l_at(l: int, i: int) -> int {
+    let n = __ld(l)
+    var k = i
+    if k < 0 { k = n + k }
+    if k < 0 || k >= n { return -1 }
+    return k
+}
+
+fn __l_find(l: int, f: int) -> int {
+    var i = 0
+    while i < __ld(l) {
+        if __call1(f, __ld(__ld(l + 16) + i * 8)) != 0 { return i }
+        i += 1
+    }
+    return -1
+}
+
 fn __l_first(l: int, line: int) -> int {
     if __ld(l) == 0 { __die("first() of an empty list", line) }
     return __ld(__ld(l + 16))

@@ -27,7 +27,7 @@ struct Tok {
 }
 
 const OPS3 = ["..=", "<<=", ">>="]
-const OPS2 = ["..", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "<<", ">>", "&=", "|=", "^="]
+const OPS2 = ["??", "..", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "<<", ">>", "&=", "|=", "^="]
 const OPS1 = "+-*/%=<>!&|^~(){}[],:.;?"
 
 struct Lexer {
@@ -434,6 +434,7 @@ struct Parser {
         if self.accept("[") {
             let inner = self.typ()
             self.expect("]")
+            if self.accept("?") { return "[${inner}]?" }
             return "[${inner}]"
         }
         if self.accept("{") {
@@ -445,7 +446,7 @@ struct Parser {
         }
         let t = self.peek()
         let name = self.ident()
-        if self.is("?") { self.fail("optional types (`T?`) aren't supported here yet") }
+        if self.accept("?") { return name + "?" }
         if self.is("!") { self.fail("result types (`T!`) aren't supported here yet") }
         return name
     }
@@ -634,7 +635,16 @@ struct Parser {
 
     fn if_statement(self, t: Tok) -> Tree {
         let n = self.node("if", t)
-        n.kids.push(self.head())
+        if self.accept("let") {
+            // if let x = option { ... }: kids[0] is an "iflet" node
+            let il = self.node("iflet", self.peek())
+            il.s = self.ident()
+            self.expect("=")
+            il.kids.push(self.head())
+            n.kids.push(il)
+        } else {
+            n.kids.push(self.head())
+        }
         n.kids.push(self.block())
         if self.peek().k == "nl" && self.peek2().k == "id" && self.peek2().s == "else" { self.next() }
         if self.accept("else") {
@@ -664,8 +674,8 @@ struct Parser {
                 arm.n = 1
             } else {
                 self.in_pattern = true
-                arm.kids.push(self.binary(4))          // above `|`: that separates alternatives
-                while self.accept("|") { arm.kids.push(self.binary(4)) }
+                arm.kids.push(self.binary(5))          // above `|`: that separates alternatives
+                while self.accept("|") { arm.kids.push(self.binary(5)) }
                 self.in_pattern = false
             }
             self.expect("=>")
@@ -879,8 +889,8 @@ struct Parser {
                 return n
             }
             if t.s == "none" {
-                self.fail("`none` isn't supported here yet")
-                return self.node("int", t)
+                self.next()
+                return self.node("none", t)
             }
             if t.s == "fn" {
                 self.fail("`${t.s}` can't go inside an expression here")
@@ -1075,7 +1085,7 @@ struct Parser {
 }
 
 const KEYWORDS = ["fn", "struct", "enum", "trait", "const", "impl", "extern", "import", "let", "var", "if", "else", "while", "for", "in", "return", "break", "continue", "match", "catch", "true", "false"]
-const LEVELS = [["||"], ["&&"], ["==", "!=", "<", "<=", ">", ">="], ["|"], ["^"], ["&"], ["<<", ">>"], ["+", "-"], ["*", "/", "%"]]
+const LEVELS = [["??"], ["||"], ["&&"], ["==", "!=", "<", "<=", ">", ">="], ["|"], ["^"], ["&"], ["<<", ">>"], ["+", "-"], ["*", "/", "%"]]
 
 fn is_upper(c: int) -> bool { return c >= 65 && c <= 90 }
 
@@ -1256,6 +1266,10 @@ struct Gen {
 
     fn known_type(self, e: Tree, ty: str) {
         if ty == "int" || ty == "bool" || ty == "str" || ty == "float" || ty == "?" { return }
+        if ty.ends_with("?") {
+            self.known_type(e, ty.slice(0, ty.len() - 1))
+            return
+        }
         if ty.starts_with("{") {
             let kv = map_types(ty)
             if kv[0] != "int" && kv[0] != "str" { self.fail(e, "map keys are int or str, not ${kv[0]}") }
@@ -1455,6 +1469,23 @@ struct Gen {
             self.expr(st.kids[0], "")
         } else if k == "assign" {
             self.assign(st)
+        } else if k == "if" && st.kids[0].k == "iflet" {
+            let il = st.kids[0]
+            let ot = self.expr(il.kids[0], "")
+            if !ot.ends_with("?") { self.fail(il.kids[0], "`if let` needs an option (T?), not ${ot}") }
+            let inner = if ot.ends_with("?") { ot.slice(0, ot.len() - 1) } else { ot }
+            let otherwise = a.label()
+            let end = a.label()
+            a.jump_if_zero(rv.A0, otherwise)
+            self.unwrap_reg(inner)
+            self.scope_in()
+            self.bind(il, il.s, inner, false)
+            self.block(st.kids[1])
+            self.scope_out()
+            if st.kids.len() > 2 { a.jump(end) }
+            a.place(otherwise)
+            if st.kids.len() > 2 { self.block(st.kids[2]) }
+            a.place(end)
         } else if k == "if" {
             let ct = self.expr(st.kids[0], "bool")
             self.check(st.kids[0], ct, "bool", "an `if` condition")
@@ -1867,7 +1898,33 @@ struct Gen {
             self.int_to_float(rv.A0)
             return "float"
         }
+        if want.ends_with("?") && t != want && t != "?" {
+            let inner = want.slice(0, want.len() - 1)
+            if t == "none" { return want }
+            if t == inner || (inner == "float" && t == "int") {
+                if inner == "float" && t == "int" { self.int_to_float(rv.A0) }
+                self.wrap(inner)
+                return want
+            }
+        }
         return t
+    }
+
+    // a value (in a0) as an option: values that aren't pointers go in a box
+    fn wrap(self, inner: str) {
+        if !boxed_option(inner, self.enums) { return }
+        let a = self.a
+        a.push(rv.A0)
+        a.li(rv.A0, 8)
+        a.push(rv.A0)
+        self.rt("__alloc", 1)
+        a.pop(rv.T0)
+        a.sd(rv.T0, rv.A0, 0)
+    }
+
+    // an option (in a0, known not none) -> its value
+    fn unwrap_reg(self, inner: str) {
+        if boxed_option(inner, self.enums) { self.a.ld(rv.A0, rv.A0, 0) }
     }
 
     fn int_to_float(self, reg: int) {
@@ -1955,6 +2012,10 @@ struct Gen {
         }
         if k == "matchx" { return self.match_(e, true, want) }
         if k == "lambda" { return self.lambda(e, want) }
+        if k == "none" {
+            a.li(rv.A0, 0)
+            return if want.ends_with("?") { want } else { "none" }
+        }
         if k == "field" {
             let ot = self.expr(e.kids[0], "")
             if (ot == "str" || ot.starts_with("[")) && e.s == "len" {
@@ -2089,6 +2150,27 @@ struct Gen {
         return ty
     }
 
+    // a0 holds an index (or -1): the element there as an option. `elements` puts the elements'
+    // address in t0 (it may use a0; the index is kept on the stack meanwhile).
+    fn option_from_index(self, e: Tree, inner: str, elements: fn()) {
+        let a = self.a
+        let none_l = a.label()
+        let done = a.label()
+        a.slt(rv.T0, rv.A0, rv.ZERO)
+        a.jump_if_not_zero(rv.T0, none_l)
+        a.push(rv.A0)
+        elements()
+        a.pop(rv.T1)
+        a.slli(rv.T1, rv.T1, 3)
+        a.add(rv.T0, rv.T0, rv.T1)
+        a.ld(rv.A0, rv.T0, 0)
+        self.wrap(inner)
+        a.jump(done)
+        a.place(none_l)
+        a.li(rv.A0, 0)
+        a.place(done)
+    }
+
     fn map_lit(self, e: Tree, want: str) -> str {
         let a = self.a
         var ty = if want.starts_with("{") { want } else { "" }
@@ -2150,6 +2232,8 @@ struct Gen {
             } else if f.has_def {
                 let t = self.expr(f.def, f.ty)
                 self.check(f.def, t, f.ty, "field ${f.name}")
+            } else if f.ty.ends_with("?") {
+                a.li(rv.A0, 0)
             } else {
                 self.fail(e, "${e.s} needs a value for `${f.name}` (it has no default)")
             }
@@ -2163,6 +2247,24 @@ struct Gen {
     fn binary(self, e: Tree) -> str {
         let a = self.a
         let op = e.s
+        if op == "??" {
+            let lt = self.expr(e.kids[0], "")
+            if !lt.ends_with("?") {
+                self.fail(e.kids[0], "`??` needs an option on its left (T?), not ${lt}")
+                return lt
+            }
+            let inner = lt.slice(0, lt.len() - 1)
+            let other = a.label()
+            let end = a.label()
+            a.jump_if_zero(rv.A0, other)
+            self.unwrap_reg(inner)
+            a.jump(end)
+            a.place(other)
+            let rt2 = self.expr(e.kids[1], inner)
+            self.check(e.kids[1], rt2, inner, "`??`")
+            a.place(end)
+            return inner
+        }
         if op == "&&" || op == "||" {
             let end = a.label()
             let lt = self.expr(e.kids[0], "bool")
@@ -2235,7 +2337,11 @@ struct Gen {
             return "bool"
         }
         if op == "==" || op == "!=" {
-            if !self.same(lt, rt2) { self.fail(e, "comparing ${lt} with ${rt2}") }
+            let with_none = lt == "none" || rt2 == "none"
+            if !self.same(lt, rt2) && !(with_none && (lt.ends_with("?") || rt2.ends_with("?") || lt == rt2)) { self.fail(e, "comparing ${lt} with ${rt2}") }
+            if lt.ends_with("?") && !with_none && boxed_option(lt.slice(0, lt.len() - 1), self.enums) {
+                self.fail(e, "compare an option with none, or unwrap it first (?? or if let)")
+            }
             a.xor(rv.A0, rv.T0, rv.A0)
             if op == "==" { a.seqz(rv.A0, rv.A0) } else { a.snez(rv.A0, rv.A0) }
             return "bool"
@@ -2281,6 +2387,23 @@ struct Gen {
     fn to_str(self, e: Tree, ty: str) {
         let a = self.a
         if ty == "str" || ty == "?" { return }
+        if ty == "none" {
+            a.addr_data(rv.A0, self.str_lit("none"))
+            return
+        }
+        if ty.ends_with("?") {
+            let inner = ty.slice(0, ty.len() - 1)
+            let is_none = a.label()
+            let end = a.label()
+            a.jump_if_zero(rv.A0, is_none)
+            self.unwrap_reg(inner)
+            self.to_str(e, inner)
+            a.jump(end)
+            a.place(is_none)
+            a.addr_data(rv.A0, self.str_lit("none"))
+            a.place(end)
+            return
+        }
         a.push(rv.A0)
         if ty == "int" { self.rt("__int_str", 1) }
         else if ty == "float" { self.rt("__float_str", 1) }
@@ -2353,6 +2476,17 @@ struct Gen {
         }
         if name.starts_with("__") && self.crt {
             if let t = self.intrinsic(e) { return t }
+        }
+        if name == "some" && self.lookup(name) == none {
+            if e.kids.len() != 1 {
+                self.fail(e, "some() takes one value")
+                return "?"
+            }
+            let inner = if want.ends_with("?") { want.slice(0, want.len() - 1) } else { "" }
+            let t = self.expr(e.kids[0], inner)
+            if t == "void" || t == "none" { self.fail(e, "some() of nothing") }
+            self.wrap(t)
+            return t + "?"
         }
         if (name == "int" || name == "float") && self.lookup(name) == none {
             if e.kids.len() != 1 {
@@ -2528,6 +2662,23 @@ struct Gen {
             self.fail(e, "str has no method `${name}`")
             return "?"
         }
+        if ot.ends_with("?") {
+            let inner = ot.slice(0, ot.len() - 1)
+            if (name == "is_some" || name == "is_none") && argc == 0 {
+                if name == "is_some" { a.snez(rv.A0, rv.A0) } else { a.seqz(rv.A0, rv.A0) }
+                return "bool"
+            }
+            if name == "unwrap" && argc == 0 {
+                let ok_l = a.label()
+                a.jump_if_not_zero(rv.A0, ok_l)
+                self.die(e, "unwrap() of none")
+                a.place(ok_l)
+                self.unwrap_reg(inner)
+                return inner
+            }
+            self.fail(e, "${ot} is an option: use ?? default, if let v = ..., or unwrap() before .${name}")
+            return "?"
+        }
         if ot.starts_with("{") {
             let kv = map_types(ot)
             if (name == "len" || name == "is_empty") && argc == 0 {
@@ -2545,6 +2696,18 @@ struct Gen {
                 a.push(rv.A0)
                 self.rt("__m_" + name, 2)
                 return if name == "contains" { "bool" } else { "void" }
+            }
+            if name == "get" && argc == 1 {
+                // V?: none when the key isn't there
+                let t = self.expr(e.kids[1], kv[0])
+                self.check(e.kids[1], t, kv[0], "get")
+                a.push(rv.A0)
+                self.rt("__m_find", 2)
+                self.option_from_index(e, kv[1], () => {
+                    self.expr(e.kids[0], "")
+                    a.ld(rv.T0, rv.A0, 32)
+                })
+                return kv[1] + "?"
             }
             if name == "get" && argc == 2 {
                 let t = self.expr(e.kids[1], kv[0])
@@ -2616,10 +2779,36 @@ struct Gen {
                 self.rt("__l_push", 2)
                 return "void"
             }
-            if (name == "pop" || name == "first" || name == "last") && argc == 0 {
+            if name == "pop" && argc == 0 {
                 line_arg()
-                self.rt("__l_" + name, 2)
+                self.rt("__l_pop", 2)
                 return et
+            }
+            if (name == "first" || name == "last" || name == "get") && argc == (if name == "get" { 1 } else { 0 }) {
+                // T?: none when there's no such element
+                if name == "get" {
+                    self.int_arg(e, 1, "get")
+                } else {
+                    a.li(rv.A0, if name == "first" { 0 } else { -1 })
+                    a.push(rv.A0)
+                }
+                self.rt("__l_at", 2)
+                self.option_from_index(e, et, () => {
+                    self.expr(e.kids[0], "")
+                    a.ld(rv.T0, rv.A0, 16)
+                })
+                return et + "?"
+            }
+            if name == "find" && argc == 1 {
+                let ft = self.expr(e.kids[1], "fn(${et})->bool")
+                if !ft.starts_with("fn(") { self.fail(e.kids[1], "find takes a function, like x => x > 2") }
+                a.push(rv.A0)
+                self.rt("__l_find", 2)
+                self.option_from_index(e, et, () => {
+                    self.expr(e.kids[0], "")
+                    a.ld(rv.T0, rv.A0, 16)
+                })
+                return et + "?"
             }
             if name == "insert" && argc == 2 {
                 self.int_arg(e, 1, "insert")
@@ -2898,6 +3087,11 @@ fn float_bits(x: float) -> int {
         return sign | int(v * 4503599627370496.0)
     }
     return sign | (e + 1023) << 52 | int((v - 1.0) * 4503599627370496.0)
+}
+
+// is an option of this type a box (ints, floats, bools, enums), or the pointer itself (none = 0)?
+fn boxed_option(ty: str, enums: {str: EnumDecl}) -> bool {
+    return ty == "int" || ty == "float" || ty == "bool" || enums.contains(ty) || ty.ends_with("?")
 }
 
 // "{str:[int]}" -> ["str", "[int]"]
