@@ -667,7 +667,7 @@ fn parse_sheet(css: str) -> [Rule] {
         let body = block.slice(open + 1, block.len())
         for sel in block.slice(0, open).split(",") {
             let t = sel.trim()
-            if t == "" || t.contains(":") || t.contains(">") || t.contains("[") { continue }   // not supported: skip
+            if t == "" || t.contains(":") || t.contains(">") || t.contains("[") || t.contains("+") || t.contains("~") || t.contains("@") { continue }   // not supported: skip
             let chain = t.split(" ").filter(x => x != "").map(x => compound(x))
             rules.push(Rule { chain, css: body })
         }
@@ -1243,6 +1243,8 @@ fn layout(e: El, x: int, y: int, w: int, h: int, u: Ui) {
         content = if e.tag == "textarea" { field_lines(e, u) * gfx.line_height(st.face()) } else if e.is_field() { gfx.line_height(st.face()) } else { 0 }
     } else if st.columns > 0 {
         content = layout_grid(e, cx, cy, cw, u)
+    } else if e.attr("data-tag") == "table" && !st.flex() {
+        content = layout_table(e, cx, cy, cw, u)
     } else if st.flex() {
         let inner_h = if fixed_h >= 0 { fixed_h - vextra(st) } else { -1 }
         content = if st.row { layout_row(e, cx, cy, cw, inner_h, u) } else { layout_column(e, cx, cy, cw, inner_h, u) }
@@ -1407,6 +1409,114 @@ fn layout_row(e: El, cx: int, cy: int, cw: int, ch: int, u: Ui) -> int {
             x += widths[i] + k.st.margin[1] + st.gap + between
         }
         y += tallest + if li + 1 < lines.len() { st.gap } else { 0 }
+    }
+    return y - cy
+}
+
+// ---- tables (web pages: the browser marks them with data-tag="table") ----
+
+fn table_rows(e: El, out: [El]) {
+    for k in elements(e) {
+        let t = k.attr("data-tag")
+        if k.tag == "tr" { out.push(k) } else if t == "thead" || t == "tbody" || t == "tfoot" { table_rows(k, out) }
+    }
+}
+
+fn span(k: El) -> int {
+    return min(max(int(k.attr("colspan")) catch 1, 1), 20)
+}
+
+// Column widths from the cells' content, across all rows; then each row's cells side by side.
+fn layout_table(e: El, cx: int, cy: int, cw: int, u: Ui) -> int {
+    var rows: [El] = []
+    table_rows(e, rows)
+    var ncol = 0
+    for r in rows {
+        var n = 0
+        for c in elements(r) { n += span(c) }
+        ncol = max(ncol, n)
+    }
+    if ncol == 0 { return layout_blocks(e, cx, cy, cw, u) }
+    var prefs: [int] = []
+    for i in 0..ncol { prefs.push(0) }
+    for r in rows {
+        var col = 0
+        for c in elements(r) {
+            let s = span(c)
+            let w = if c.st.width >= 0 { c.st.width } else { pref(c, u) }
+            if s == 1 { prefs[col] = max(prefs[col], w) }
+            col += s
+        }
+    }
+    var total = 0
+    for p in prefs { total += p }
+    // the table's width: as asked (width="85%"), else its content's, at most what there is
+    var target = min(total, cw)
+    let wa = e.attr("width")
+    if wa.ends_with("%") {
+        target = cw * min(number(wa.slice(0, wa.len() - 1)), 100) / 100
+    } else if e.st.width_pct >= 0 {
+        target = cw * min(e.st.width_pct, 100) / 100
+    } else if wa != "" {
+        target = min(number(wa), cw)
+    }
+    var widths: [int] = []
+    if total <= target {
+        // room to spare: share it out like the content
+        for p in prefs { widths.push(if total > 0 { p + (target - total) * p / total } else { target / ncol }) }
+    } else {
+        // too wide: narrow columns keep their width, the wide ones share the rest
+        let fair = target / ncol
+        var fixed = 0
+        var wide = 0
+        for p in prefs {
+            if p <= fair { fixed += p } else { wide += p }
+        }
+        let room = max(target - fixed, ncol * 20)
+        for p in prefs { widths.push(if p <= fair { p } else { max(p * room / max(wide, 1), 20) }) }
+    }
+    // centered by <center> / align="center" (the table itself; its text starts at the left)
+    var tx = cx
+    if let p = e.parent {
+        if p.st.text_align == "center" || e.attr("align") == "center" || e.st.center { tx = cx + max(cw - target, 0) / 2 }
+    }
+    var y = cy
+    for r in rows {
+        let cells = elements(r)
+        var tallest = 0
+        for pass in 0..2 {
+            var x = tx
+            var col = 0
+            for c in cells {
+                let s = span(c)
+                var w = 0
+                for i in col..min(col + s, ncol) { w += widths[i] }
+                layout(c, x, y, w, if pass == 0 { -1 } else { tallest }, u)
+                tallest = max(tallest, c.h)
+                x += w
+                col += s
+            }
+        }
+        r.x = tx
+        r.y = y
+        r.w = target
+        r.h = tallest
+        r.inner_h = tallest
+        r.words = []
+        y += tallest
+    }
+    // row groups (tbody, ...) cover their rows
+    for g in elements(e) {
+        if g.tag == "tr" { continue }
+        var gr: [El] = []
+        table_rows(g, gr)
+        if gr.is_empty() { continue }
+        g.x = tx
+        g.y = gr[0].y
+        g.w = target
+        g.h = gr[gr.len() - 1].y + gr[gr.len() - 1].h - g.y
+        g.inner_h = g.h
+        g.words = []
     }
     return y - cy
 }

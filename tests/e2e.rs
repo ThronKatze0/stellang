@@ -1944,7 +1944,7 @@ fn stellaos_network() {
     assert!(text().contains("good.example has address 10.0.2.66"), "{}", text());
     // 6. TCP: a reset inside the window, stray data and a SYN while fetching don't break the connection
     clear();
-    sh("fetch good.example/", 4000);
+    sh("fetch http://good.example/", 4000);
     assert!(text().contains("REAL PAGE") && !text().contains("EVIL") && !text().contains("reset"), "{}", text());
     // 7. still well, and the log says what happened
     clear();
@@ -1958,6 +1958,139 @@ fn stellaos_network() {
     assert_eq!(status.code(), Some(0), "{t}");
     for want in ["refused an IP fragment", "challenged, not obeyed", "doesn't match our question"] {
         assert!(t.contains(want), "missing {want:?} in the security log:\n{t}");
+    }
+}
+
+/// StellaOS's cryptography (SHA-2, HMAC, X25519, ChaCha20-Poly1305, AES-GCM, RSA, ECDSA, X.509),
+/// checked against known answers inside QEMU (tests/stellaos_crypto.st).
+#[test]
+fn stellaos_crypto() {
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-riscv64");
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tmpdir("crypto");
+    for e in fs::read_dir(root.join("examples/stellaos")).unwrap() {
+        let p = e.unwrap().path();
+        fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+    }
+    fs::copy(root.join("tests/stellaos_crypto.st"), dir.join("crypto_test.st")).unwrap();
+    let elf = dir.join("t.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(dir.join("crypto_test.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let out = Command::new("qemu-system-riscv64")
+        .args(["-machine", "virt", "-m", "128M", "-nographic", "-bios", "default", "-kernel"])
+        .arg(&elf)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert!(text.contains("ok ecdsa p-384\n") && text.contains("\ndone") && !text.contains("FAIL"), "{text}");
+}
+
+/// HTTPS in StellaOS against real TLS 1.3 servers (openssl s_server on the host, reached through
+/// QEMU's user network): an unknown root is refused, so is a certificate for another name; with the
+/// root added to /etc/ca, the page loads (one server picks AES-128-GCM, the other ChaCha20).
+#[test]
+fn stellaos_https() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Stdio;
+    use std::time::Duration;
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() || Command::new("openssl").arg("version").output().is_err() {
+        eprintln!("skipped: needs qemu-system-riscv64 and openssl");
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tmpdir("https");
+    let elf = dir.join("os.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(root.join("examples/stellaos/os.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    // a test CA (P-384) and two server certificates (P-256): one for 10.0.2.2, one for another name
+    let ssl = |args: &[&str]| {
+        let o = Command::new("openssl").args(args).current_dir(&dir).output().unwrap();
+        assert!(o.status.success(), "openssl {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    };
+    ssl(&["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:secp384r1", "-keyout", "ca.key", "-out", "ca.pem", "-days", "30", "-nodes", "-subj", "/CN=Stella Test CA", "-addext", "basicConstraints=critical,CA:TRUE"]);
+    for (name, san) in [("good", "IP:10.0.2.2"), ("wrong", "DNS:wrong.example")] {
+        fs::write(dir.join(format!("{name}.ext")), format!("subjectAltName={san}\nbasicConstraints=CA:FALSE\n")).unwrap();
+        ssl(&["req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-keyout", &format!("{name}.key"), "-out", &format!("{name}.csr"), "-nodes", "-subj", "/CN=test"]);
+        ssl(&["x509", "-req", "-in", &format!("{name}.csr"), "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-out", &format!("{name}.pem"), "-days", "30", "-extfile", &format!("{name}.ext")]);
+    }
+    let free = || TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (good_port, wrong_port) = (free(), free());
+    let mut servers = vec![];
+    for (name, port, suite) in [("good", good_port, "TLS_AES_128_GCM_SHA256"), ("wrong", wrong_port, "TLS_CHACHA20_POLY1305_SHA256")] {
+        servers.push(
+            Command::new("openssl")
+                .args(["s_server", "-quiet", "-tls1_3", "-www", "-ciphersuites", suite, "-accept"])
+                .arg(port.to_string())
+                .args(["-cert", &format!("{name}.pem"), "-key", &format!("{name}.key")])
+                .current_dir(&dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    // the CA certificate, over plain HTTP, for the kernel to fetch into /etc/ca
+    let pem = fs::read(dir.join("ca.pem")).unwrap();
+    let http = TcpListener::bind("127.0.0.1:0").unwrap();
+    let http_port = http.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in http.incoming() {
+            let mut s = s.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", pem.len()).as_bytes());
+            let _ = s.write_all(&pem);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let mut q = Command::new("qemu-system-riscv64")
+        .args(["-machine", "virt", "-m", "256M", "-nographic", "-bios", "default"])
+        .args(["-global", "virtio-mmio.force-legacy=false", "-device", "virtio-rng-device"])
+        .args(["-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0", "-kernel"])
+        .arg(&elf)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = q.id();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(120));
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    });
+    let mut stdin = q.stdin.take().unwrap();
+    std::thread::sleep(Duration::from_millis(3000));
+    for (cmd, wait) in [
+        (format!("fetch https://10.0.2.2:{good_port}/"), 6000),
+        ("mkdir /etc/ca".to_string(), 300),
+        (format!("fetch http://10.0.2.2:{http_port}/ca.pem -o /etc/ca/test.pem"), 2000),
+        (format!("fetch -i https://10.0.2.2:{good_port}/"), 8000),
+        (format!("fetch https://10.0.2.2:{wrong_port}/"), 8000),
+        ("shutdown".to_string(), 1000),
+    ] {
+        stdin.write_all(format!("{cmd}\r").as_bytes()).unwrap();
+        stdin.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(wait));
+    }
+    let out = q.wait_with_output().unwrap();
+    for mut s in servers {
+        let _ = s.kill();
+    }
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    for want in [
+        "the certificate can't be trusted: the certificate isn't signed by anyone we trust",
+        "saved /etc/ca/test.pem",
+        "HTTP 200 ok",
+        "TLS 1.3 · AES-128-GCM · certificate from",
+        "s_server",
+        "the certificate is for wrong.example, not 10.0.2.2",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
 }
 

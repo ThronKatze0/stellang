@@ -489,17 +489,22 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
   browser sends. Files, Notes, Calculator, System Monitor and Mines are written like that.
 - **Games** draw directly (`gfx`: fast rectangles, anti-aliased circles and rounded shapes, lines, sprites and
   scaled pixel art, text in Inter and DejaVu Sans Mono) and get every frame and key: Snake, Bricks, Paint.
-- **Browser** (`browser.st`, `html.st`): an address bar, back/forward, links and GET forms; real-world HTML
-  (unclosed tags, entities, page stylesheets) laid out by the same toolkit. It never runs code from a page
-  (scripts, `on*` handlers and `javascript:` links are stripped, and the status bar says what was removed), pages
-  can't reach the browser's controls or the machine's files, and pages are capped at 4 MiB, 8,000 elements and
-  40 levels deep. It speaks http only, so it shows **Not secure**: HTTPS (TLS) is the next big piece.
+- **Browser** (`browser.st`, `html.st`): real websites over HTTPS (Wikipedia, Hacker News, Bing and DuckDuckGo
+  searches, ...). An address bar that also searches (Bing), back/forward, links, GET and POST forms, tables laid
+  out by their content, a reader view for pages that mark their main part, Latin, Greek and Cyrillic text.
+  Pages come without scripts or images, and with only the hiding rules of their linked stylesheets, so they
+  read like reader mode. Safe by design: it never runs code from a page (scripts, `on*` handlers and
+  `javascript:` links are stripped, and the status bar says what was removed); pages can't reach the browser's
+  controls or the machine's files; search result links skip the engines' click-tracking redirects; https pages
+  never redirect down to http; pages are capped at 4 MiB, 20,000 elements and 40 levels deep. Sites that need
+  JavaScript (Google search, for one) don't work.
 <p align="center"><img src=".github/stellaos-browser.png" alt="the StellaOS browser showing a page, the Terminal behind it after ping, host and firewall" width="720"></p>
 
 - **Terminal**: the shell in a window (an ANSI terminal: colors, line editing, scrollback).
 - **Shell**: `ls cd mkdir cat write edit rm wc`, `every 500 uptime` / `jobs` / `kill`, `calc`, `mem`, `df`,
   `date`, `open <app>`, `windows`, `keyboard us|de`, and for the network `ifconfig`, `ping`, `host`, `fetch`
-  (an HTTP GET; `-o file` saves), `browse`, `arp`, `netstat`, `firewall`, `dns`.
+  (HTTP or HTTPS; `-i` shows the headers and the TLS details, `-o file` saves), `browse`, `arp`, `netstat`,
+  `firewall`, `dns`.
 - **Network** (`nic.st`, `inet.st`, `tcp.st`, `www.st`): a virtio-net driver, then Ethernet, ARP, IPv4, ICMP,
   UDP, DHCP, DNS, TCP and HTTP/1.1, all in stellang. `stellang boot` plugs in a network card on QEMU's user
   network (`--no-net` for none); nothing outside can connect in. Built to be hard to attack:
@@ -514,6 +519,16 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
     only, 4 MiB per connection
   - `firewall log` keeps what was refused. A test (`stellaos_network`) attacks the kernel on a LAN of its own:
     a port scan, ARP poisoning, 3,000 malformed frames, a ping flood, hostile DNS answers and TCP injection.
+- **HTTPS: TLS 1.3, from scratch in stellang** (`tls.st`): X25519 key exchange (`x25519.st`), ChaCha20-Poly1305
+  and AES-128-GCM (`aead.st`), SHA-256/384/512, HMAC and HKDF (`sha2.st`), big-number RSA (PKCS #1 v1.5 and
+  PSS, `bn.st`, `rsa.st`) and ECDSA on P-256 and P-384 (`ecc.st`), and X.509 certificates (`x509.st`). A
+  server must present a chain to one of Mozilla's 118 root certificates (`roots.st`, made by
+  `tools/genroots.py`), every signature in it must check, every certificate must be in date, CAs must be CAs,
+  the certificate must name the host, and the server must sign the handshake with its key; otherwise nothing is
+  sent. TLS 1.3 only: no older versions to downgrade to. More roots can be trusted by putting PEM files in
+  `/etc/ca` (for a company's own CA, say). `stellaos_crypto` checks the primitives against known answers;
+  `stellaos_https` runs real TLS servers (`openssl s_server`) at the kernel, with a good certificate, an
+  unknown CA and the wrong name.
 - **Drivers, in stellang**: the display (QEMU's ramfb, through fw_cfg DMA), virtio (the transport and its
   queues), keyboard and mouse (virtio-input; US and German layouts), the disk (virtio-blk), the network card
   (virtio-net) and the host's random numbers (virtio-rng). The file system
@@ -551,7 +566,7 @@ fn main() {
   tree, the GC's pages, and the pixel loops of `gfx`. Interrupts never run stellang code: they queue and count,
   and the program picks them up from its loop, so the collector only ever runs in ordinary code. The C library
   is `src/runtime_klibc.c`; the fonts are pre-rendered glyphs (`tools/genfont.py`); nothing else is linked.
-- Next: TLS for HTTPS, then page tables and user mode (processes, system calls) so apps are protected from
+- Next: images (PNG, JPEG), then page tables and user mode (processes, system calls) so apps are protected from
   each other, and more harts.
 
 ## Editor support

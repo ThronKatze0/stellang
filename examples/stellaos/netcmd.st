@@ -208,7 +208,7 @@ fn netstat(t: tcp.Tcp) {
 }
 
 // `fetch [-i] <url> [-o file]`: an HTTP GET; prints the page (or saves it)
-fn fetch(t: tcp.Tcp, fs: ramfs.RamFs, cwd: str, argv: [str]) -> void! {
+fn fetch(t: www.Client, fs: ramfs.RamFs, cwd: str, argv: [str]) -> void! {
     var url = ""
     var file = ""
     var head = false
@@ -229,6 +229,7 @@ fn fetch(t: tcp.Tcp, fs: ramfs.RamFs, cwd: str, argv: [str]) -> void! {
     let r = www.fetch(t, url)?
     if head || file != "" {
         println("${kernel.ESC}[1mHTTP ${r.status} ${r.reason}${kernel.ESC}[0m  (${r.url.text()}, ${r.bytes} bytes in ${r.ms} ms)")
+        if r.secure != "" { println("${kernel.ESC}[32m${r.secure}${kernel.ESC}[0m") }
     }
     if head {
         for k in r.headers.keys() { println("${k}: ${r.headers.get(k) ?? ""}") }

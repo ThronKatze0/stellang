@@ -7,8 +7,8 @@
 // - a page can't reach the browser's own buttons: only a short list of harmless attributes survives,
 //   so a page can't plant the toolkit's event attributes (data-on-click=...) on its elements
 // - embedded content (iframes, objects, embeds, SVG) is dropped; images show their alt text
-// - limits: 8,000 elements, nesting 40 deep (deeper content is flattened, so a hostile page can't
-//   exhaust the kernel's stack), 64 KiB of CSS; inline styles can't load anything (url() is dropped)
+// - limits: 20,000 elements, nesting 40 deep (deeper content is flattened, so a hostile page can't
+//   exhaust the kernel's stack), 1 MiB of CSS; inline styles can't load anything (url() is dropped)
 
 import ui
 
@@ -17,9 +17,9 @@ extern fn st_k_find_at(s: str, sub: str, from: int) -> int
 extern fn st_k_substr(s: str, from: int, to: int) -> str
 extern fn st_chr(code: int) -> str
 
-const MAX_ELEMENTS = 8000
+const MAX_ELEMENTS = 20000
 const MAX_DEPTH = 40
-const MAX_CSS = 65536
+const MAX_CSS = 1 << 20
 
 const VOID = ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr", "keygen"]
 // dropped with everything inside
@@ -33,7 +33,7 @@ const BLOCKS = ["section", "article", "nav", "header", "footer", "main", "aside"
     "menu", "noscript", "search", "h5", "h6", "picture", "output", "optgroup"]
 // harmless attributes (everything else is dropped)
 const ATTRS = ["href", "class", "id", "style", "title", "alt", "name", "value", "type", "placeholder", "action", "method", "checked",
-    "disabled", "width", "height", "colspan", "align", "bgcolor", "color", "lang", "selected", "src"]
+    "disabled", "width", "height", "colspan", "align", "bgcolor", "color", "lang", "selected", "src", "role"]
 // tags that end an open <p>
 const CLOSES_P = ["p", "div", "ul", "ol", "table", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "form", "section", "article", "nav", "header",
     "footer", "main", "aside", "blockquote", "hr", "dl", "figure", "address", "fieldset", "details", "center", "menu"]
@@ -70,6 +70,9 @@ struct Doc {
     css: str = "",
     elements: int = 0,
     truncated: bool = false,
+    main: ui.El? = none,
+    sheets: [str] = [],           // linked stylesheets
+    extra_css: str = "",          // hiding rules from them, once fetched          // the page's main content (<main>, role="main"), if marked
     removed: {str: int} = {},     // what was dropped: "script" -> 3, "on* attributes" -> 12, ...
 
     fn drop(self, what: str) {
@@ -275,7 +278,7 @@ struct Parser {
                     if self.doc.css.len() + content.len() <= MAX_CSS {
                         self.doc.css = self.doc.css + "\n" + content
                     } else {
-                        self.doc.drop("stylesheets over 64 KiB")
+                        self.doc.drop("stylesheets over 1 MiB")
                     }
                 } else if name == "title" {
                     if self.doc.title == "" { self.doc.title = collapse(decode(content)).slice(0, min(collapse(decode(content)).len(), 200)) }
@@ -318,7 +321,16 @@ struct Parser {
                 }
                 continue
             }
-            if name == "head" || name == "html" || name == "body" || name == "meta" || name == "link" || name == "base" { continue }
+            if name == "link" {
+                // a stylesheet: the browser may fetch it (for its hiding rules)
+                let rel = (attrs.get("rel") ?? "").lower()
+                let media = (attrs.get("media") ?? "").lower()
+                if rel.contains("stylesheet") && !media.contains("print") && self.doc.sheets.len() < 4 {
+                    if let href = attrs.get("href") { self.doc.sheets.push(href) }
+                }
+                continue
+            }
+            if name == "head" || name == "html" || name == "body" || name == "meta" || name == "base" { continue }
             self.open(name, attrs)
             if self_closing && !VOID.contains(name) { self.close(name) }
         }
@@ -334,10 +346,11 @@ fn make(tag: str, attrs: {str: str}, doc: Doc) -> ui.El {
         t = if BLOCKS.contains(tag) { "div" } else { "span" }
     }
     if tag == "h5" || tag == "h6" { t = "h4" }
+    if tag == "noscript" { t = "noscript" }     // its own tag (shown: we never run scripts), so page CSS for div doesn't hide it
     if tag == "center" { style = "text-align: center;" }
     if tag == "blockquote" { style = "margin: 6px 0 10px 0; padding: 0 0 0 14px; border-left: 3px solid #d8d6e2; color: #555;" }
     if tag == "dd" { style = "padding: 0 0 0 24px;" }
-    if tag == "table" { style = "margin: 0 0 10px 0;" }
+    if tag == "table" { style = "margin: 0 0 10px 0; text-align: left;" }
     if tag == "th" { style = "font-weight: bold;" }
     if tag == "caption" || tag == "figcaption" { style = "color: #666; font-size: 12px;" }
     if tag == "summary" { style = "font-weight: bold;" }
@@ -410,6 +423,7 @@ fn make(tag: str, attrs: {str: str}, doc: Doc) -> ui.El {
         style = style + "border: 1px solid #cbc8d6; padding: 2px 6px;"
     }
     if tag == "option" && !attrs.contains("selected") { style = style + "display: none;" }
+    if attrs.contains("hidden") { style = style + "display: none;" }
     if style != "" { el.attrs["style"] = style }
     return el
 }
@@ -421,7 +435,111 @@ fn parse(page: str) -> Doc {
     let doc = Doc { root }
     let p = Parser { src: Src { s: page, low: page.lower(), n: page.len() }, doc, stack: [root] }
     p.run()
+    doc.main = find_main(root)
     return doc
+}
+
+// CSS made flat for the toolkit's simple reader: comments gone, @media blocks unwrapped (print-only
+// ones dropped), other @-rules (@font-face, @keyframes, @import, ...) dropped.
+fn flatten_css(css: str) -> str {
+    let src = Src { s: css, low: css.lower(), n: css.len() }
+    var out: [str] = []
+    var i = 0
+    var from = 0
+    var depth = 0             // inside unwrapped @media blocks
+    while i < src.n {
+        let c = src.at(i)
+        if c == 47 && src.at(i + 1) == 42 {           // /* comment */
+            out.push(src.cut(from, i))
+            let end = src.find("*/", i + 2)
+            i = if end < 0 { src.n } else { end + 2 }
+            from = i
+            continue
+        }
+        if c == 64 {                                  // @
+            out.push(src.cut(from, i))
+            let brace = src.find("{", i)
+            let semi = src.find(";", i)
+            if semi >= 0 && (brace < 0 || semi < brace) {
+                i = semi + 1                          // @import ...; @charset ...;
+                from = i
+                continue
+            }
+            if brace < 0 {
+                i = src.n
+                from = i
+                continue
+            }
+            let head = src.cut_low(i, brace)
+            if (head.starts_with("@media") && !head.contains("print")) || head.starts_with("@supports") || head.starts_with("@layer") {
+                depth += 1                            // keep what's inside
+                i = brace + 1
+                from = i
+                continue
+            }
+            // skip the whole block
+            var d = 0
+            var j = brace
+            while j < src.n {
+                let ch = src.at(j)
+                if ch == 123 { d += 1 }
+                if ch == 125 {
+                    d -= 1
+                    if d == 0 { break }
+                }
+                j += 1
+            }
+            i = j + 1
+            from = i
+            continue
+        }
+        if c == 125 && depth > 0 {
+            // (rules' own braces are skipped below, so this ends an unwrapped @media block)
+            out.push(src.cut(from, i))
+            depth -= 1
+            i += 1
+            from = i
+            continue
+        }
+        if c == 123 {
+            // a rule: copy it through its closing brace
+            let close = src.find("}", i)
+            i = if close < 0 { src.n } else { close + 1 }
+            continue
+        }
+        i += 1
+    }
+    out.push(src.cut(from, src.n))
+    return out.join("")
+}
+
+// just the rules that hide things (display: none, visibility: hidden), from flattened CSS
+fn hiding_rules(css: str) -> str {
+    var out: [str] = []
+    for block in css.split("}") {
+        let open = block.find("{")
+        if open < 0 { continue }
+        let body = block.slice(open + 1, block.len()).replace(" ", "").lower()
+        if body.contains("display:none") || body.contains("visibility:hidden") { out.push(block.slice(0, open).trim() + "{display:none}") }
+        if out.len() >= 2000 { break }
+    }
+    return out.join("\n")
+}
+
+fn find_main(e: ui.El) -> ui.El? {
+    if e.attr("data-tag") == "main" || e.attr("role") == "main" { return some(e) }
+    for k in e.kids {
+        if let m = find_main(k) { return some(m) }
+    }
+    return none
+}
+
+// how much text is in an element (for deciding whether its main part is most of the page)
+fn text_size(e: ui.El) -> int {
+    if e.tag == "" { return e.text.trim().len() }
+    var n = 0
+    for k in e.kids { n += text_size(k) }
+    return n
 }
 
 fn letter(c: int) -> bool { return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) }

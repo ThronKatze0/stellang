@@ -70,6 +70,13 @@ struct Conn {
         self.push()
     }
 
+    // Queue bytes to send (binary data: TLS records).
+    fn send(self, data: [int]) {
+        if self.closing || self.done() || data.is_empty() { return }
+        self.out.add_list(data)
+        self.push()
+    }
+
     // Finish sending (the peer may keep sending until it's done too).
     fn close(self) {
         if self.done() { return }

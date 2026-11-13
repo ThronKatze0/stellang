@@ -170,6 +170,14 @@ struct Buffer {
         return true
     }
 
+    // append bytes given as a list
+    fn add_list(self, b: [int]) -> bool {
+        if b.is_empty() { return true }
+        let mem = kernel.alloc(b.len())
+        for i, v in b { kernel.poke8(mem + i, v) }
+        return self.add(View { addr: mem, len: b.len() })
+    }
+
     fn view(self) -> View {
         return View { addr: self.addr, len: self.len }
     }

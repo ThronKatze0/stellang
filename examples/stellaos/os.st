@@ -29,6 +29,8 @@ import rng
 import inet
 import netcmd
 import tcp
+import tls
+import www
 import browser
 
 const VERSION = "0.3"
@@ -52,6 +54,7 @@ struct Shell {
     terminal: int = 0,        // the terminal window's id
     net: inet.Net? = none,
     tcp: tcp.Tcp? = none,
+    web: www.Client? = none,
 
     fn prompt(self) -> str {
         let e = kernel.ESC
@@ -208,7 +211,7 @@ struct Shell {
                 self.browse(argv.get(0) ?? "")
             },
             "netstat" => netcmd.netstat(self.sockets()?),
-            "fetch" | "curl" | "wget" => netcmd.fetch(self.sockets()?, self.fs, self.cwd, argv)?,
+            "fetch" | "curl" | "wget" => netcmd.fetch(self.client()?, self.fs, self.cwd, argv)?,
             "panic" => panic("you asked for it"),
             _ => return err("unknown command: ${cmd} (try `help`)"),
         }
@@ -237,6 +240,22 @@ struct Shell {
     fn sockets(self) -> tcp.Tcp! {
         if let t = self.tcp { return t }
         return err("no network card (`stellang boot` adds one unless --no-net)")
+    }
+
+    fn client(self) -> www.Client! {
+        if let w = self.web { return w }
+        return err("no network card (`stellang boot` adds one unless --no-net)")
+    }
+
+    // extra trusted root certificates: PEM files in /etc/ca
+    fn extra_roots(self) -> str {
+        var all: [str] = []
+        if self.fs.is_dir("/etc/ca") {
+            for name in self.fs.list("/etc/ca") {
+                if !name.ends_with("/") { all.push(self.fs.read("/etc/ca/" + name) catch "") }
+            }
+        }
+        return all.join("\n")
     }
 
     fn desktop(self) -> wm.Desktop! {
@@ -285,7 +304,7 @@ struct Shell {
 
     fn browse(self, url: str) {
         if let d = self.gui {
-            if let t = self.tcp {
+            if let t = self.web {
                 browser.open(d, t, url)
             } else {
                 let w = d.open("Browser", "◎", 0x0984e3, 360, 120, ui.app(() => <p style="padding: 20px">"No network card (boot without --no-net)."</p>))
@@ -395,7 +414,11 @@ fn main() {
     kernel.every(2000, () => sh.sync())
     sh.cwd = "/home"
     sh.net = inet.open(rng.open())
-    if let n = sh.net { sh.tcp = some(tcp.start(n)) }
+    if let n = sh.net {
+        let t = tcp.start(n)
+        sh.tcp = some(t)
+        sh.web = some(www.Client { stack: t, trust: tls.Trust { extra: () => sh.extra_roots() } })
+    }
     banner()
     print(sh.fs.read("/etc/motd") catch "")
     // a display: the desktop comes up by itself, with a terminal on it
