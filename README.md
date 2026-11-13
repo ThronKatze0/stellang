@@ -454,33 +454,54 @@ println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"p
 - `fs`: `read write append remove mkdir list -> T!`, `exists is_dir`, `size -> int?`.
 - `web`: browser apps (see *Full stack* above). On the server the same components render to HTML: `mount` prints
   the page once, and `signal`, timers and requests are inert. `res.page(<html>...</html>)` sends a whole page.
-- `kernel`: bare metal (see *An operating system* above).
+- `kernel`, `gfx`: bare metal, and drawing there (see *An operating system* below).
 - `net`: `net.listen(port) -> Listener!`, `listener.accept() -> Conn!`, `conn.read() -> str!`,
   `conn.write(s) -> void!`, `conn.close()`. Wraps POSIX sockets from the C runtime.
 
 ## An operating system: StellaOS
 
 `stellang --kernel os.st` compiles a program into a kernel (`os.elf`, RISC-V 64, for QEMU's `virt` machine);
-`stellang boot os.st` builds it and boots it with the console on your terminal. It is the same language with
-the same garbage collector, minus the host OS: `import kernel` instead of `http`, `net` and `fs`.
+`stellang boot os.st` builds it and boots it. It is the same language with the same garbage collector, minus
+the host OS: `import kernel` (and `gfx`) instead of `http`, `net` and `fs`.
 
-[`examples/stellaos`](examples/stellaos) is an operating system written that way: a shell with line editing and
-history, a RAM filesystem (`ls cd mkdir cat write edit rm wc`), background jobs on timers (`every 500 uptime`,
-`jobs`, `kill`), a calculator, memory stats, and a desktop drawn by a framebuffer driver written in stellang:
+[`examples/stellaos`](examples/stellaos) is an operating system written that way: a desktop with windows, apps and
+games, a shell, and files that are kept on a disk.
 
-<p align="center"><img src=".github/stellaos.png" alt="the StellaOS desktop" width="640"></p>
+<p align="center"><img src=".github/stellaos.png" alt="the StellaOS desktop: Calculator, Snake and the Terminal" width="720"></p>
 
 ```sh
-stellang boot examples/stellaos/os.st          # the shell, in this terminal (Ctrl-A X force-quits QEMU)
-stellang boot --gui examples/stellaos/os.st    # with a display: type `desktop`
+stellang boot --gui examples/stellaos/os.st    # the desktop in a window (the shell is also on this terminal)
+stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-quits QEMU)
 ```
+
+- **Desktop** (`wm.st`): windows you can drag, resize, maximize and minimize, a taskbar, a launcher, desktop
+  icons, a clock from the real-time clock, Alt+Tab and Alt+F4. It's composited (each window keeps its own
+  picture; only what changed is redrawn) and runs at 60 frames a second next to the shell.
+- **Apps are web apps** (`ui.st`): a window can show a stellang web app (components, JSX, `signal`,
+  `onclick`/`oninput`/`onkeydown`/`onsubmit`) with no browser. The toolkit reads the HTML a render makes, styles
+  it (inline styles and stylesheets with a CSS subset: flexbox, grid, padding, borders, rounded corners,
+  shadows, gradients, fonts), lays it out, paints it, and turns mouse and keys into the same events the
+  browser sends. Files, Notes, Calculator, System Monitor and Mines are written like that.
+- **Games** draw directly (`gfx`: fast rectangles, anti-aliased circles and rounded shapes, lines, sprites and
+  scaled pixel art, text in Inter and DejaVu Sans Mono) and get every frame and key: Snake, Bricks, Paint.
+- **Terminal**: the shell in a window (an ANSI terminal: colors, line editing, scrollback).
+- **Shell**: `ls cd mkdir cat write edit rm wc`, `every 500 uptime` / `jobs` / `kill`, `calc`, `mem`, `df`,
+  `date`, `open <app>`, `windows`, `keyboard us|de`.
+- **Drivers, in stellang**: the display (QEMU's ramfb, through fw_cfg DMA), virtio (the transport and its
+  queues), keyboard and mouse (virtio-input; US and German layouts), and the disk (virtio-blk). The file system
+  is saved to the disk a moment after each change and loaded at boot; `stellang boot` keeps the disk image in
+  `~/.cache/stellang/` (`--disk file.img` to choose one, `--no-disk` for none).
 
 ```rust
 import kernel
+import gfx
 
 fn main() {
     println("hello from bare metal")             // the serial console
     kernel.every(1000, () => println("tick"))    // timers run whenever the program waits
+    let s = gfx.surface(200, 100)                // drawing (see examples/stellaos/display.st for the screen)
+    s.round(10, 10, 180, 80, 12, 0x6c5ce7)
+    s.text(24, 40, "Hello ✦", 0xffffff, gfx.TEXT_BOLD)
     let ed = kernel.LineEditor {}
     while true {
         let line = ed.read("> ")                 // arrows, history, Ctrl-U, ...
@@ -490,20 +511,20 @@ fn main() {
 }
 ```
 
-- `kernel`: `key read_line LineEditor clear_screen ESC`, `uptime after every cancel idle run ticks` (plus the builtins `sleep`, `now_ms`),
-  `memory gc shutdown reboot`, and for drivers `peek8..peek64 poke8..poke64` (device registers),
-  `alloc_pages` (fixed memory a device can read and write: DMA, virtio queues, framebuffers),
-  `copy fill32 read_str write_str`, `irq_enable irq_count`.
+- `kernel`: `key read_line LineEditor clear_screen ESC`, `uptime after every cancel idle run ticks` (plus the builtins
+  `sleep`, `now_ms`), `time_ms date`, `memory gc shutdown reboot`, and for drivers `peek8..peek64 poke8..poke64`
+  (device registers), `alloc_pages` (fixed memory a device can read and write: DMA, virtio queues,
+  framebuffers), `alloc` (byte buffers on the heap), `copy fill32 read_str write_str`, `irq_enable irq_count`.
+- `gfx`: `Surface` (`clear rect shade frame round circle line pixel text text_in draw sprite blit gradient clip`),
+  `surface wrap sprite text_width line_height rgb mix tint`, and the faces `UI TEXT TITLE MONO BIG` (and bold).
 - Ints have the bit operations drivers need: `& | ^ ~ << >>` and `0xFF`, `0b1010`, `0o755` literals (with `_`).
-- Underneath are about 450 lines of C (`src/runtime_kernel.c`): boot, the trap handler (timer ticks through
-  OpenSBI, the UART through the PLIC; a CPU exception prints a panic with its address), the console, the
-  device tree, and the GC's pages. Interrupts never run stellang code: they queue and count, and the program
-  picks them up from its loop, so the collector only ever runs in ordinary code. The C library is
-  `src/runtime_klibc.c`; nothing else is linked.
-- Built on top, in stellang: a ramfb display driver (`examples/stellaos/gfx.st`: fw_cfg DMA, then pixels) and the
-  desktop. The same pieces (registers, interrupts, DMA memory) are what the next drivers need: virtio-blk for
-  a disk that survives reboots, virtio-net for a network stack, virtio-input for a mouse and keyboard on the
-  desktop. Page tables and user mode (processes, syscalls) are the step after, along with more harts.
+- Underneath is about 800 lines of C (`src/runtime_kernel.c`): boot, the trap handler (timer ticks through
+  OpenSBI, devices through the PLIC; a CPU exception prints a panic with its address), the console, the device
+  tree, the GC's pages, and the pixel loops of `gfx`. Interrupts never run stellang code: they queue and count,
+  and the program picks them up from its loop, so the collector only ever runs in ordinary code. The C library
+  is `src/runtime_klibc.c`; the fonts are pre-rendered glyphs (`tools/genfont.py`); nothing else is linked.
+- Next: virtio-net and a TCP/IP stack, then page tables and user mode (processes, system calls) so apps are
+  protected from each other, and more harts.
 
 ## Editor support
 
