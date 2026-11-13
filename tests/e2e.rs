@@ -2227,7 +2227,7 @@ fn stellaos_procs() {
         "found ada ada@example.org 36\nbob: no email none\ntrue\n5 none 4 -1\n3 4 1 none 4\n99\n36 none\ntrue\ntrue now\n6\n\nerror on line 38: unwrap() of none",
         "[exe] from a file",
         "exe parse of junk: true",
-        "example bounce.st compiles\nexample guess.st compiles\nexample hello.st compiles\nexample music.st compiles\nexample notebook.st compiles\nexample orbits.st compiles\nexample paint.st compiles\nexample primes.st compiles\n",
+        "example bounce.st compiles\nexample guess.st compiles\nexample hello.st compiles\nexample music.st compiles\nexample notebook.st compiles\nexample orbits.st compiles\nexample paint.st compiles\nexample primes.st compiles\nexample worm.st compiles\n",
         "\ndone",
     ] {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
