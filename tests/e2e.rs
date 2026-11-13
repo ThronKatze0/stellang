@@ -2220,6 +2220,8 @@ fn stellaos_procs() {
         "{\"ada\": 36, \"linus\": 29, \"grace\": 45}\n3 36 -1 true\n[\"linus\", \"grace\"]\nlinus is 29\ngrace is 45\n",
         "{\"the\": 3, \"cat\": 1, \"and\": 2, \"hat\": 1, \"bat\": 1}\ntotal 14\nbig 2500 true false true\n",
         "error on line 28: no key \"nobody\" in the map",
+        "Circle(1.0) has area 3.0\nRect { w: 2.0, h: 1.0 } has area 2.0\nRect { w: 3.0, h: 3.0 } has area 9.0\nEmpty has area 0.0\n",
+        "Add(Num(2), Mul(Num(3), Neg(Num(4)))) = -10\n0\ntom is a cat\nrex is a terrier\nDog(\"terrier\")\n[exit 0]",
         "found ada ada@example.org 36\nbob: no email none\ntrue\n5 none 4 -1\n3 4 1 none 4\n99\n36 none\ntrue\ntrue now\n6\n\nerror on line 38: unwrap() of none",
         "[exe] from a file",
         "exe parse of junk: true",

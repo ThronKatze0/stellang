@@ -527,7 +527,9 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
   message and nothing else. From the shell: `run hello.st`, `run tool.st a b` (the words come back from
   `args()`), `run long.st &` (in the background), `cc game.st -o game` then `run game`, `ps`, `kill <pid>`. Example programs are in `/home/examples` (a game, bouncing balls, a sketch pad, music, files).
   - **The language** is stellang, the parts a one-file program needs: `fn`, `struct` with fields, defaults and
-    methods, `enum`s of plain variants (`Light.Red`, `.Red`; `match` on them must cover every one),
+    methods (and `Type.function()`s without `self`), `enum`s, plain or carrying values (`Circle(radius: float)`,
+    `Rect { w: float, h: float = 1.0 }`, recursive ones), `Shape.Circle(1.0)` or `.Circle(1.0)`, taken apart by
+    `match` (`Circle(r)`, `Rect { w, h }`, nested patterns, `|`, `_`; every variant must be covered),
     `const`/`let`/`var`, `int`/`float`/`bool`/`str`, lists (`[int]`, `[[str]]`, `[Point]`) and maps (`{str: int}`:
     `m[k]`, `m[k] = v`, `get(k, default) contains remove keys values`, `for k, v in m`), options (`T?`, `none`,
     `some(x)`, `??`, `if let`, `unwrap is_some is_none`; `get first last find` give them), `if`/`else` and
@@ -536,7 +538,8 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
     use, like stellang's), functions as values, `map filter any all count` on lists,
     string interpolation, the string and list methods (`len slice find contains split lines chars upper lower
     trim replace repeat`; `push pop insert remove slice contains index_of sort reverse join sum`; floats'
-    `sqrt floor ceil round abs`, `int(x)` and `float(x)`). Not yet: results (`T!`), enums that carry values, generics, imports. Every index is checked, division by zero is caught,
+    `sqrt floor ceil round abs`, `int(x)` and `float(x)`). Not yet: results (`T!`), generics, traits, imports; `==` compares structs and lists
+    by identity. Every index is checked, division by zero is caught,
     runtime errors name their line, and memory is garbage-collected (a mark-and-sweep collector, also written
     in the language).
   - **Built in**: `print println input read_line sleep now_ms random exit max min abs parse_int parse_float
@@ -634,7 +637,7 @@ fn main() {
   is `src/runtime_klibc.c`; the fonts are pre-rendered glyphs (`tools/genfont.py`); nothing else is linked.
 - The embedded userland (`userland.st`: the programs' runtime and the examples) is made from
   `examples/stellaos/userland/` by `tools/genuserland.py`.
-- Next: images (PNG, JPEG), results and enums with values in the compiler, more harts.
+- Next: images (PNG, JPEG), results and generics in the compiler, more harts.
 
 ## Editor support
 

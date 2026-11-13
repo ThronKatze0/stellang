@@ -289,6 +289,7 @@ struct FnDecl {
     line: int = 0,
     col: int = 0,
     crt: bool = false,       // part of the runtime: may use the intrinsics
+    is_static: bool = false, // in a struct or enum, without self: Type.name(...)
 }
 
 struct Field {
@@ -320,6 +321,9 @@ struct GlobalDecl {
 struct EnumDecl {
     name: str,
     variants: [str] = [],
+    fields: [[Field]] = [],      // each variant's values (none for a plain name)
+    braces: [bool] = [],         // written Variant { a: T } rather than Variant(T)
+    data: bool = false,          // some variant carries values: every value is a pointer to [tag, values...]
     line: int = 0,
     col: int = 0,
 }
@@ -473,9 +477,7 @@ struct Parser {
             self.skip_nl()
         }
         self.expect(")")
-        if owner != "" && (f.params.is_empty() || f.params[0].name != "self") {
-            self.fail_at(t, "a method takes `self` first (functions that don't need it go outside the struct)")
-        }
+        if owner != "" && (f.params.is_empty() || f.params[0].name != "self") { f.is_static = true }
         if self.accept("->") { f.ret = self.typ() }
         f.body = self.block()
         return f
@@ -523,9 +525,43 @@ struct Parser {
             }
             let vt = self.peek()
             let v = self.ident()
-            if self.is("(") || self.is("{") {
-                self.fail("enum variants that carry values aren't supported here yet (plain names are)")
+            var fs: [Field] = []
+            var braces = false
+            if self.accept("(") {
+                // Circle(radius: float) or Pair(int, int)
+                while !self.is(")") && self.err == "" {
+                    if self.peek().k == "id" && self.peek2().k == "op" && self.peek2().s == ":" {
+                        let fname = self.ident()
+                        self.expect(":")
+                        fs.push(Field { name: fname, ty: self.typ(), def: Tree { k: "none" } })
+                    } else {
+                        fs.push(Field { name: "_${fs.len()}", ty: self.typ(), def: Tree { k: "none" } })
+                    }
+                    if !self.accept(",") { break }
+                }
+                self.expect(")")
+                ed.data = true
+            } else if self.accept("{") {
+                // Rect { w: float, h: float = 1.0 }
+                braces = true
+                while self.err == "" {
+                    self.skip_nl()
+                    if self.accept("}") { break }
+                    let fname = self.ident()
+                    self.expect(":")
+                    let f = Field { name: fname, ty: self.typ(), def: Tree { k: "none" } }
+                    if self.accept("=") {
+                        f.def = self.expr()
+                        f.has_def = true
+                    }
+                    fs.push(f)
+                    self.skip_nl()
+                    self.accept(",")
+                }
+                ed.data = true
             }
+            ed.fields.push(fs)
+            ed.braces.push(braces)
             if ed.variants.contains(v) { self.fail_at(vt, "${v} is in ${name} twice") }
             ed.variants.push(v)
             self.skip_nl()
@@ -764,6 +800,13 @@ struct Parser {
                     n.kids.push(x)
                     self.call_args(n)
                     x = n
+                } else if self.is("{") && !self.no_struct && x.k == "name" && is_upper(st_k_byte(x.s, 0)) && is_upper(st_k_byte(name, 0)) {
+                    // Shape.Rect { w: 2.0 }
+                    let n = self.node("variant", t)
+                    n.s = name
+                    n.s2 = x.s
+                    self.variant_values(n)
+                    x = n
                 } else {
                     let n = self.node("field", t)
                     n.s = name
@@ -851,6 +894,7 @@ struct Parser {
             self.next()
             let n = self.node("variant", t)
             n.s = self.ident()
+            self.variant_values(n)
             return n
         }
         if self.accept("match") {
@@ -991,6 +1035,38 @@ struct Parser {
             n.n = 1
         }
         return n
+    }
+
+    // after a variant's name: (values) -> n = 1, kids the values; { name: value } -> n = 2, kids inits
+    fn variant_values(self, n: Tree) {
+        if self.accept("(") {
+            n.n = 1
+            self.call_args(n)
+        } else if self.is("{") && !self.no_struct {
+            self.next()
+            n.n = 2
+            while self.err == "" {
+                self.skip_nl()
+                if self.accept("}") { break }
+                let ft = self.peek()
+                let fi = self.node("init", ft)
+                fi.s = self.ident()
+                if self.accept(":") {
+                    fi.kids.push(self.expr())
+                } else {
+                    let v = self.node("name", ft)
+                    v.s = fi.s
+                    fi.kids.push(v)
+                }
+                n.kids.push(fi)
+                self.skip_nl()
+                if !self.accept(",") {
+                    self.skip_nl()
+                    self.expect("}")
+                    break
+                }
+            }
+        }
     }
 
     fn else_block(self) -> Tree {
@@ -1660,7 +1736,22 @@ struct Gen {
         for k in 1..st.kids.len() {
             let arm = st.kids[k]
             let next = a.label()
-            if arm.n == 0 {
+            self.scope_in()
+            if arm.n == 0 && is_enum {
+                // each alternative: its own test; the first that fits runs the body
+                let body_l = a.label()
+                let alts = arm.kids.len() - 1
+                for pk in 0..alts {
+                    let pat = arm.kids[pk]
+                    let miss = a.label()
+                    self.pattern(pat, v, vt, miss, alts == 1)
+                    covered.push(pattern_variant(pat))
+                    a.jump(body_l)
+                    a.place(miss)
+                }
+                a.jump(next)
+                a.place(body_l)
+            } else if arm.n == 0 {
                 let body_l = a.label()
                 for pk in 0..arm.kids.len() - 1 {
                     let pat = arm.kids[pk]
@@ -1696,6 +1787,7 @@ struct Gen {
             } else {
                 self.block(arm.kids[arm.kids.len() - 1])
             }
+            self.scope_out()
             a.jump(end)
             a.place(next)
         }
@@ -1994,21 +2086,15 @@ struct Gen {
             return "int"
         }
         if k == "field" && e.kids[0].k == "name" && self.enums.contains(e.kids[0].s) && self.lookup(e.kids[0].s) == none {
-            let ty = e.kids[0].s
-            let v = self.variant(ty, e.s)
-            if v < 0 { self.fail(e, "${ty} has no variant ${e.s} (it has ${self.enums[ty].variants.join(", ")})") }
-            a.li(rv.A0, max(v, 0))
-            return ty
+            return self.make_variant(e, e.kids[0].s, e.s, [], 0)
         }
         if k == "variant" {
-            if !self.enums.contains(want) {
+            let ty = if e.s2 != "" { e.s2 } else { want }
+            if !self.enums.contains(ty) {
                 self.fail(e, "`.${e.s}`: which enum? (write Type.${e.s} where the type isn't clear)")
                 return "?"
             }
-            let v = self.variant(want, e.s)
-            if v < 0 { self.fail(e, "${want} has no variant ${e.s} (it has ${self.enums[want].variants.join(", ")})") }
-            a.li(rv.A0, max(v, 0))
-            return want
+            return self.make_variant(e, ty, e.s, e.kids, e.n)
         }
         if k == "matchx" { return self.match_(e, true, want) }
         if k == "lambda" { return self.lambda(e, want) }
@@ -2210,6 +2296,260 @@ struct Gen {
         return ty
     }
 
+    // An enum value: a plain enum's number, or for an enum that carries values, a new [tag, values...].
+    // form: 0 just the name, 1 (positional values), 2 { named values }
+    fn make_variant(self, e: Tree, ty: str, vname: str, vals: [Tree], form: int) -> str {
+        let a = self.a
+        let ed = self.enums[ty]
+        let v = ed.variants.index_of(vname)
+        if v < 0 {
+            self.fail(e, "${ty} has no variant ${vname} (it has ${ed.variants.join(", ")})")
+            return ty
+        }
+        let fs = ed.fields[v]
+        if !ed.data {
+            if form != 0 { self.fail(e, "${ty}.${vname} carries no values") }
+            a.li(rv.A0, v)
+            return ty
+        }
+        if form == 1 && vals.len() != fs.len() {
+            self.fail(e, "${ty}.${vname} takes ${fs.len()} value${if fs.len() == 1 { "" } else { "s" }}, given ${vals.len()}")
+            return ty
+        }
+        if form == 0 && !fs.is_empty() && fs.any(f => !f.has_def && !f.ty.ends_with("?")) {
+            self.fail(e, "${ty}.${vname} carries values: ${ty}.${vname}(...)")
+            return ty
+        }
+        if form == 2 {
+            for fi in vals {
+                if fs.find(f => f.name == fi.s) == none { self.fail(fi, "${ty}.${vname} has no field `${fi.s}`") }
+            }
+        }
+        a.li(rv.A0, 8 * (1 + fs.len()))
+        a.push(rv.A0)
+        self.rt("__alloc", 1)
+        a.li(rv.T0, v)
+        a.sd(rv.T0, rv.A0, 0)
+        a.push(rv.A0)
+        for k, f in fs {
+            if form == 1 {
+                let t = self.expr(vals[k], f.ty)
+                self.check(vals[k], t, f.ty, "${vname}'s value ${k + 1}")
+            } else {
+                var given: Tree? = none
+                if form == 2 { given = vals.find(fi => fi.s == f.name) }
+                if let g = given {
+                    let t = self.expr(g.kids[0], f.ty)
+                    self.check(g.kids[0], t, f.ty, "field ${f.name}")
+                } else if f.has_def {
+                    let t = self.expr(f.def, f.ty)
+                    self.check(f.def, t, f.ty, "field ${f.name}")
+                } else if f.ty.ends_with("?") {
+                    a.li(rv.A0, 0)
+                } else {
+                    self.fail(e, "${ty}.${vname} needs a value for `${f.name}`")
+                }
+            }
+            a.ld(rv.T0, rv.SP, 0)
+            a.sd(rv.A0, rv.T0, 8 * (k + 1))
+        }
+        a.pop(rv.A0)
+        return ty
+    }
+
+    // Code out of line, right here (jumped over): a function `label` taking `nparams` words; `body`
+    // generates it (the parameters are locals " p0", " p1", ...).
+    fn out_of_line(self, label: str, nparams: int, ret: str, body: fn()) {
+        let a = self.a
+        let over = a.label()
+        a.jump(over)
+        self.offsets[label] = a.here()
+        let saved_scopes = self.scopes
+        let saved_slots = self.slots
+        let saved_ret = self.ret
+        let saved_loops = self.loops
+        let saved_exit = self.exit_label
+        let saved_captured = self.captured
+        self.begin_function(ret, self.crt)
+        self.captured = []
+        a.addi(rv.SP, rv.SP, -16)
+        a.sd(rv.RA, rv.SP, 8)
+        a.sd(rv.FP, rv.SP, 0)
+        a.mv(rv.FP, rv.SP)
+        let patch = a.here()
+        a.emit(0)
+        a.emit(0)
+        a.sub(rv.SP, rv.SP, rv.T0)
+        for k in 0..nparams {
+            let slot = self.declare(Tree { k: "" }, " p${k}", "int", false)
+            a.ld(rv.T0, rv.FP, 16 + 8 * (nparams - 1 - k))
+            self.store_slot(rv.T0, slot)
+        }
+        body()
+        self.end_function(patch)
+        self.scopes = saved_scopes
+        self.slots = saved_slots
+        self.ret = saved_ret
+        self.loops = saved_loops
+        self.exit_label = saved_exit
+        self.captured = saved_captured
+        a.place(over)
+    }
+
+    // a value-carrying enum as text: Circle(1.0), Rect { w: 2.0, h: 1.0 }, Empty
+    fn show_enum(self, e: Tree, ty: str) {
+        let a = self.a
+        let label = "s_" + ty
+        if !self.offsets.contains(label) {
+            self.offsets[label] = -1          // taken (recursive types call it from inside)
+            let ed = self.enums[ty]
+            self.out_of_line(label, 1, "str", () => {
+                let done = self.exit_label
+                for v, vname in ed.variants {
+                    let next = a.label()
+                    let p0 = self.lookup(" p0").unwrap()
+                    self.load_slot(rv.T0, p0.slot)
+                    a.ld(rv.T0, rv.T0, 0)
+                    a.li(rv.T1, v)
+                    a.xor(rv.T1, rv.T1, rv.T0)
+                    a.jump_if_not_zero(rv.T1, next)
+                    let fs = ed.fields[v]
+                    let br = ed.braces[v]
+                    a.addr_data(rv.A0, self.str_lit(if fs.is_empty() { vname } else if br { vname + " { " } else { vname + "(" }))
+                    for k, f in fs {
+                        a.push(rv.A0)
+                        var sep = if k == 0 { "" } else { ", " }
+                        if br { sep = sep + f.name + ": " }
+                        if sep != "" {
+                            a.addr_data(rv.A0, self.str_lit(sep))
+                            a.push(rv.A0)
+                            self.rt("__str_cat", 2)
+                            a.push(rv.A0)
+                        }
+                        self.load_slot(rv.T0, p0.slot)
+                        a.ld(rv.A0, rv.T0, 8 * (k + 1))
+                        if f.ty == "str" {
+                            a.push(rv.A0)
+                            a.li(rv.A0, 0)
+                            a.push(rv.A0)
+                            self.rt("__quote", 2)
+                        } else {
+                            self.to_str(e, f.ty)
+                        }
+                        a.push(rv.A0)
+                        self.rt("__str_cat", 2)
+                    }
+                    if !fs.is_empty() {
+                        a.push(rv.A0)
+                        a.addr_data(rv.A0, self.str_lit(if br { " }" } else { ")" }))
+                        a.push(rv.A0)
+                        self.rt("__str_cat", 2)
+                    }
+                    a.jump(done)
+                    a.place(next)
+                }
+                a.addr_data(rv.A0, self.str_lit("?"))
+            })
+        }
+        a.push(rv.A0)
+        self.a.call(label)
+        a.addi(rv.SP, rv.SP, 8)
+    }
+
+    // Does the value in local `slot` (of enum `ty`) fit pattern `pat`? Jumps to `fail` if not;
+    // names in the pattern become locals. `binds`: whether it may bind names.
+    fn pattern(self, pat: Tree, slot: int, ty: str, fail: int, binds: bool) {
+        let a = self.a
+        let ed = self.enums[ty]
+        var vname = ""
+        var subs: [Tree] = []
+        var form = 0
+        if pat.k == "name" { vname = pat.s }
+        else if pat.k == "call" {
+            vname = pat.s
+            subs = pat.kids
+            form = 1
+        } else if pat.k == "new" {
+            vname = pat.s
+            subs = pat.kids
+            form = 2
+        } else if pat.k == "variant" {
+            vname = pat.s
+            subs = pat.kids
+            form = pat.n
+        } else if pat.k == "field" && pat.kids[0].k == "name" && pat.kids[0].s == ty {
+            vname = pat.s
+        } else if pat.k == "mcall" && pat.kids[0].k == "name" && pat.kids[0].s == ty {
+            vname = pat.s
+            subs = pat.kids.slice(1, pat.kids.len())
+            form = 1
+        } else {
+            self.fail(pat, "a pattern for ${ty}: Variant, Variant(x, _), Variant { field }, .Variant")
+            return
+        }
+        let v = ed.variants.index_of(vname)
+        if v < 0 {
+            self.fail(pat, "${ty} has no variant ${vname}")
+            return
+        }
+        // the tag
+        self.load_slot(rv.T0, slot)
+        if ed.data { a.ld(rv.T0, rv.T0, 0) }
+        a.li(rv.T1, v)
+        a.xor(rv.T1, rv.T1, rv.T0)
+        a.jump_if_not_zero(rv.T1, fail)
+        let fs = ed.fields[v]
+        if form == 1 && subs.len() != fs.len() {
+            self.fail(pat, "${vname} carries ${fs.len()} value${if fs.len() == 1 { "" } else { "s" }}: write all of them (_ for any)")
+            return
+        }
+        for k, sub0 in subs {
+            var fi = k
+            var sub = sub0
+            if form == 2 {
+                fi = -1
+                for j, f in fs {
+                    if f.name == sub0.s { fi = j }
+                }
+                if fi < 0 {
+                    self.fail(sub0, "${vname} has no field `${sub0.s}`")
+                    return
+                }
+                sub = sub0.kids[0]
+            }
+            let fty = fs[fi].ty
+            self.load_slot(rv.T0, slot)
+            a.ld(rv.A0, rv.T0, 8 * (fi + 1))
+            if sub.k == "name" && sub.s == "_" { continue }
+            if sub.k == "name" && !(self.enums.contains(fty) && self.variant(fty, sub.s) >= 0) {
+                if !binds { self.fail(sub, "patterns joined with | can't name values") }
+                self.bind(sub, sub.s, fty, false)
+                continue
+            }
+            if self.enums.contains(fty) && (sub.k == "name" || sub.k == "call" || sub.k == "new" || sub.k == "variant" || sub.k == "field" || sub.k == "mcall") {
+                let inner = self.declare(sub, " sub${self.slots}", fty, false)
+                self.store_slot(rv.A0, inner)
+                self.pattern(sub, inner, fty, fail, binds)
+                continue
+            }
+            // a literal: compare
+            let held = self.declare(sub, " lit${self.slots}", fty, false)
+            self.store_slot(rv.A0, held)
+            let lt = self.expr(sub, fty)
+            self.check(sub, lt, fty, "a pattern")
+            self.load_slot(rv.T0, held)
+            if fty == "str" {
+                a.push(rv.T0)
+                a.push(rv.A0)
+                self.rt("__str_eq", 2)
+                a.jump_if_zero(rv.A0, fail)
+            } else {
+                a.xor(rv.A0, rv.A0, rv.T0)
+                a.jump_if_not_zero(rv.A0, fail)
+            }
+        }
+    }
+
     fn construct(self, e: Tree) -> str {
         let a = self.a
         if !self.structs.contains(e.s) {
@@ -2339,6 +2679,9 @@ struct Gen {
         if op == "==" || op == "!=" {
             let with_none = lt == "none" || rt2 == "none"
             if !self.same(lt, rt2) && !(with_none && (lt.ends_with("?") || rt2.ends_with("?") || lt == rt2)) { self.fail(e, "comparing ${lt} with ${rt2}") }
+            if self.enums.contains(lt) && self.enums[lt].data && !with_none {
+                self.fail(e, "${lt} values can't be compared with ==: use match")
+            }
             if lt.ends_with("?") && !with_none && boxed_option(lt.slice(0, lt.len() - 1), self.enums) {
                 self.fail(e, "compare an option with none, or unwrap it first (?? or if let)")
             }
@@ -2418,6 +2761,9 @@ struct Gen {
         } else if ty.starts_with("fn(") {
             a.pop(rv.A0)
             a.addr_data(rv.A0, self.str_lit("<fn>"))
+        } else if self.enums.contains(ty) && self.enums[ty].data {
+            a.pop(rv.A0)
+            self.show_enum(e, ty)
         } else if self.enums.contains(ty) {
             // its variant's name
             a.pop(rv.T0)
@@ -2630,6 +2976,22 @@ struct Gen {
         let a = self.a
         let name = e.s
         let obj = e.kids[0]
+        if obj.k == "name" && (self.structs.contains(obj.s) || self.enums.contains(obj.s)) && self.lookup(obj.s) == none {
+            // Type.function(...) or Enum.Variant(...)
+            let key = "${obj.s}.${name}"
+            if self.funcs.contains(key) && self.funcs[key].is_static {
+                let f = self.funcs[key]
+                self.call_args_typed(e, f.params, 0, 1, key)
+                a.call("m_${obj.s}_${name}")
+                if f.params.len() > 0 { a.addi(rv.SP, rv.SP, 8 * f.params.len()) }
+                return f.ret
+            }
+            if self.enums.contains(obj.s) {
+                return self.make_variant(e, obj.s, name, e.kids.slice(1, e.kids.len()), 1)
+            }
+            self.fail(e, "${obj.s} has no function `${name}` (methods are called on a value)")
+            return "?"
+        }
         let ot = self.expr(obj, "")
         if ot == "?" { return "?" }
         let argc = e.kids.len() - 1
@@ -3087,6 +3449,11 @@ fn float_bits(x: float) -> int {
         return sign | int(v * 4503599627370496.0)
     }
     return sign | (e + 1023) << 52 | int((v - 1.0) * 4503599627370496.0)
+}
+
+// the variant a pattern is about
+fn pattern_variant(p: Tree) -> str {
+    return p.s
 }
 
 // is an option of this type a box (ints, floats, bools, enums), or the pointer itself (none = 0)?

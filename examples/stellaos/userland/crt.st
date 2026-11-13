@@ -750,6 +750,8 @@ fn __l_all(l: int, f: int) -> bool {
     return true
 }
 
+fn __quote(s: str, unused: int) -> str { return "\"" + s + "\"" }
+
 fn __l_int_str(l: int) -> str { return __l_show(l, 0) }
 fn __l_str_str(l: int) -> str { return __l_show(l, 1) }
 fn __l_bool_str(l: int) -> str { return __l_show(l, 2) }
