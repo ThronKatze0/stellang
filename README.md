@@ -440,9 +440,6 @@ No null (use `T?`), no pointers, no manual free, no uninitialized values. Out-of
 a missing map key with `m[k]`, integer division by zero, `pop()` on an empty list and `panic()` stop the program with exit code 101 and a
 `file:line:col` message. An error returned from `main` prints `error: ...` and exits with 1.
 
-The emoji keywords from the beginning still work as a joke: `stellang fmt --emoji file.st` turns
-`fn struct if else while let var return break { } ;` into `🦍 🦧 🦅 🐒 🐭 🦦 🦁 🐺 🦭 ⭐ ❤️` (and `--plain` back).
-
 ## License
 
 MIT, see [LICENSE](LICENSE). Contributions welcome: `./setup.sh` installs the toolchain, `cargo test` runs
