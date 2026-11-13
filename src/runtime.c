@@ -115,6 +115,28 @@ char *st_concat(const char *a, const char *b) {
     return r;
 }
 
+// ---- JSX ----
+
+// text -> HTML-safe text
+char *st_html_escape(const char *s) {
+    size_t n = 0;
+    for (const char *p = s; *p; p++) n += *p == '&' ? 5 : *p == '<' || *p == '>' ? 4 : *p == '"' ? 6 : *p == '\'' ? 5 : 1;
+    char *r = alloc(n + 1, 1, 1), *o = r;
+    for (const char *p = s; *p; p++) {
+        const char *e = *p == '&' ? "&amp;" : *p == '<' ? "&lt;" : *p == '>' ? "&gt;" : *p == '"' ? "&quot;" : *p == '\'' ? "&#39;" : NULL;
+        if (e) { size_t k = strlen(e); memcpy(o, e, k); o += k; } else *o++ = *p;
+    }
+    *o = 0;
+    return r;
+}
+
+#ifndef ST_WASM
+// On the server event handlers aren't rendered and state isn't kept between renders.
+int64_t st_on(void *f, int64_t arity) { (void)f; (void)arity; return 0; }
+void **st_hook(void) { return alloc(1, sizeof(void *), 0); }
+void st_invalidate(void) {}
+#endif
+
 char *st_itoa(int64_t n) {
     char b[24];
     return mkstr(b, snprintf(b, sizeof b, "%lld", (long long)n));

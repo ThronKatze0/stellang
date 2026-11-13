@@ -12,6 +12,7 @@ use std::mem;
 
 mod generics;
 mod helpers;
+mod jsx;
 mod patterns;
 
 use generics::{prim_name, short_name, GDef, GFn, GType, Pending, TraitInfo};
@@ -42,6 +43,9 @@ declare void @st_nl()
 declare i64 @st_strlen(ptr)
 declare zeroext i1 @st_streq(ptr, ptr)
 declare ptr @st_concat(ptr, ptr)
+declare ptr @st_html_escape(ptr)
+declare i64 @st_on(ptr, i64)
+declare ptr @st_hook()
 declare ptr @st_itoa(i64)
 declare ptr @st_parse_int(ptr, ptr)
 declare ptr @st_env(ptr)
@@ -257,12 +261,35 @@ fn names_expr(e: &Expr, inl: bool, out: &mut HashSet<String>) {
             names_expr(x, inl, out);
             names_stmts(ss, inl, out);
         }
+        ExprKind::Element(el) => names_element(el, inl, out),
+        ExprKind::JsxPush(cs) => names_children(cs, inl, out),
         ExprKind::Match(s, arms) => {
             names_expr(s, inl, out);
             for a in arms.iter() {
                 if let Some(g) = &a.guard { names_expr(g, inl, out) }
                 names_body(&a.body, inl, out);
             }
+        }
+    }
+}
+
+fn names_element(el: &crate::parser::Element, inl: bool, out: &mut HashSet<String>) {
+    if el.tag.starts_with(|c: char| c.is_ascii_uppercase()) && inl {
+        out.insert(el.tag.clone());
+    }
+    for a in &el.attrs {
+        if let Some(v) = &a.value { names_expr(v, inl, out) }
+    }
+    names_children(&el.children, inl, out);
+}
+
+fn names_children(cs: &[crate::parser::Child], inl: bool, out: &mut HashSet<String>) {
+    use crate::parser::Child;
+    for c in cs {
+        match c {
+            Child::Text(e) | Child::Value(e) => names_expr(e, inl, out),
+            Child::Elem(el) => names_element(el, inl, out),
+            Child::For(s) | Child::If(s) => names_stmts(std::slice::from_ref(&**s), inl, out),
         }
     }
 }
@@ -291,6 +318,7 @@ struct Var {
 #[derive(Clone)]
 struct Sig {
     params: Vec<Type>,
+    names: Vec<String>, // parameter names (for JSX props); empty for externs
     ret: Type,
     sym: String,
     is_extern: bool,
@@ -362,6 +390,8 @@ struct Gen {
     traits: HashMap<String, TraitInfo>,
     impls_of: HashSet<(String, String)>, // (type key, trait key)
     impl_methods: Vec<(String, String, Vec<Func>)>, // (module, type key, methods incl. trait defaults)
+    jsx: Vec<jsx::JsxBuf>, // elements being built
+    web: bool,             // compiling for the browser (WebAssembly)
 }
 
 /// What the type checker learned about a spot in the source (for editor hovers).
@@ -466,7 +496,7 @@ impl Gen {
                 (Some(t), _) => self.resolve(t, f.pos)?,
             });
         }
-        Ok(Sig { params, ret: self.resolve(&f.ret, f.pos)?, sym, is_extern: false })
+        Ok(Sig { params, names: f.params.iter().map(|p| p.0.clone()).collect(), ret: self.resolve(&f.ret, f.pos)?, sym, is_extern: false })
     }
 
     fn type_of_key(&self, k: &str) -> Type {
@@ -602,7 +632,7 @@ impl Gen {
                     let ps: Vec<String> = params.iter().map(ll).collect();
                     writeln!(self.decls, "declare {} @{}({})", ll(&ret), x.name, ps.join(", ")).unwrap();
                 }
-                let sig = Sig { params, ret, sym: format!("@{}", x.name), is_extern: true };
+                let sig = Sig { params, names: vec![], ret, sym: format!("@{}", x.name), is_extern: true };
                 self.add_fn(self.key(&x.name), sig, x.pos, &x.name)?;
             }
             for im in &u.module.impls {
@@ -972,6 +1002,9 @@ impl Gen {
                 return Ok(self.some_of(&v));
             }
         }
+        if *want == Type::Str && v.ty == Type::Node {
+            return Ok(val(v.v, Type::Str)); // a Node is its HTML
+        }
         if *want == Type::Float && v.ty == Type::Int {
             let t = self.tmp();
             self.ins(format!("{t} = sitofp i64 {} to double", v.v));
@@ -1187,6 +1220,7 @@ impl Gen {
         let p = format!("{} {}", ll(&v.ty), v.v);
         Ok(match &v.ty {
             Type::Str if !nested => v.clone(),
+            Type::Node => val(v.v.clone(), Type::Str),
             Type::Str => self.rt(Type::Str, "st_quote", &[p]),
             Type::Int => self.rt(Type::Str, "st_itoa", &[format!("i64 {}", v.v)]),
             Type::Float => self.rt(Type::Str, "st_ftoa", &[format!("double {}", v.v)]),
@@ -2123,6 +2157,15 @@ impl Gen {
                 }
             }
             ExprKind::Match(subject, arms) => self.match_expr(subject, arms, want)?,
+            ExprKind::Element(el) => self.element_value(el)?,
+            ExprKind::JsxPush(cs) => {
+                if self.jsx.is_empty() {
+                    return err(pos, "JSX children outside an element");
+                }
+                self.jsx_children(cs)?;
+                self.jsx_flush();
+                void()
+            }
         })
     }
 
