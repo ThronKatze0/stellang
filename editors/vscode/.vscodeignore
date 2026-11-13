@@ -8,3 +8,4 @@ test/**
 node_modules/@vscode/test-electron/**
 .vscode-test/**
 PUBLISHING.md
+install.sh

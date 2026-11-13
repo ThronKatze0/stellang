@@ -291,7 +291,8 @@
     "bundle": "node scripts/bundle.js",
     "package": "node scripts/bundle.js && vsce package",
     "package:nobin": "vsce package --out stellang-universal.vsix",
-    "test": "node test/run.js"
+    "test": "node test/run.js",
+    "install-ext": "./install.sh"
   },
   "dependencies": {
     "vscode-languageclient": "9.0.1"

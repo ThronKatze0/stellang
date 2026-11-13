@@ -281,7 +281,8 @@ fails if the copies in `editors/` go stale.
   ```
 
   or with no plugin manager: `vim.opt.rtp:append("~/src/stellang/editors/nvim")`.
-- **VS Code**: install the `.vsix` (Extensions → `…` → *Install from VSIX…*). The platform builds from CI
+- **VS Code**: run `editors/vscode/install.sh` (builds the compiler, packages the extension with it inside, and installs
+  it with `code`; pass `codium` or `cursor` for those). Or install a `.vsix` (Extensions → `…` → *Install from VSIX…*). The platform builds from CI
   (`vscode extension` workflow, attached to `v*` releases) include the compiler, so that's all you need for the
   editor features. Or build it: `cd editors/vscode && npm install && npm run package`. Besides the server features
   it adds Run (`Ctrl+F5`, ▶ in the title bar, `▶ Run | Build` above `main`), build/check tasks with a problem

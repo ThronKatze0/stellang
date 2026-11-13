@@ -32,7 +32,8 @@ compiler, with nothing to update by hand.
 
 ## Setup
 
-Install the `.vsix` (Extensions view → `…` → *Install from VSIX…*) and open a `.st` file.
+From a checkout: `editors/vscode/install.sh` builds everything and installs it into `code` (or pass `codium` / `cursor`).
+Or install a `.vsix` (Extensions view → `…` → *Install from VSIX…*). Then open a `.st` file.
 
 The extension looks for the compiler in this order:
 
