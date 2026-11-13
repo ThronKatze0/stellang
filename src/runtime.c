@@ -6,23 +6,26 @@
 #include <math.h>
 #include <dirent.h>
 #include <fcntl.h>
+#ifndef ST_WASM
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/socket.h>
+#endif
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef __linux__
+#if defined(__linux__) && !defined(ST_WASM)
 #include <sys/sendfile.h>
 #endif
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
+// Boehm GC natively; in the browser the collector in runtime_web.c
 void GC_init(void);
 void *GC_malloc(size_t);
 void *GC_malloc_atomic(size_t);
@@ -62,7 +65,9 @@ void *st_alloc(int64_t size) { return alloc(size, 1, 0); } // objects, closures,
 void st_init(void) {
     GC_init();
     setvbuf(stdout, NULL, _IOLBF, 0);
+#ifndef ST_WASM
     signal(SIGPIPE, SIG_IGN); // a client hanging up must not kill a server
+#endif
 }
 
 Vec *st_vec_new(int64_t n, int64_t esz, int64_t atomic) {
@@ -135,6 +140,22 @@ char *st_html_escape(const char *s) {
 int64_t st_on(void *f, int64_t arity) { (void)f; (void)arity; return 0; }
 void **st_hook(void) { return alloc(1, sizeof(void *), 0); }
 void st_invalidate(void) {}
+
+// std/web.st outside the browser: mount renders once to stdout; the rest does nothing.
+void st_mount(const char *selector, void *app) {
+    (void)selector;
+    char *html = ((char *(*)(void *))(*(void **)app))(app);
+    puts(html);
+}
+int64_t st_timer(void *f, int64_t ms, int64_t repeat) { (void)f; (void)ms; (void)repeat; return 0; }
+void st_clear_timer(int64_t id) { (void)id; }
+void st_fetch(const char *m, const char *u, const char *b, void *done) { (void)m; (void)u; (void)b; (void)done; }
+char *st_storage_get(const char *key) { (void)key; return ""; }
+void st_storage_set(const char *key, const char *value) { (void)key; (void)value; }
+char *st_location(void) { return "/"; }
+void st_navigate(const char *path) { (void)path; }
+void st_set_title(const char *t) { (void)t; }
+const char *st_raw(const char *html) { return html; }
 #endif
 
 char *st_itoa(int64_t n) {
@@ -482,12 +503,13 @@ Vec *st_map_list(Map *m, int64_t which, int64_t esz, int64_t atomic) {
     return v;
 }
 
-// ---- sockets, used by std/net.st through `extern fn` ----
 // Each call clears the last error; on failure it returns -1 (or "") and st_error() explains why.
-
 static const char *last_error = "";
 static void failed(void) { last_error = mkstr(strerror(errno), strlen(strerror(errno))); }
 const char *st_error(void) { return last_error; }
+
+#ifndef ST_WASM
+// ---- sockets, used by std/net.st through `extern fn` ----
 
 int64_t st_listen(int64_t port) {
     last_error = "";
@@ -747,6 +769,8 @@ void st_drop(int64_t fd) {
     close((int)fd);
 }
 
+#endif // sockets
+
 int64_t st_now_ms(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -836,6 +860,7 @@ bool st_is_dir(const char *path) {
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+#ifndef ST_WASM
 // write `head`, then the file's bytes (binary-safe)
 int64_t st_send_file(int64_t fd, const char *head, const char *path) {
     int f = open(path, O_RDONLY);
@@ -860,6 +885,7 @@ int64_t st_send_file(int64_t fd, const char *head, const char *path) {
     close(f);
     return r;
 }
+#endif
 
 char *st_read_file(const char *path) {
     last_error = "";

@@ -406,6 +406,17 @@ pub fn compile(units: &[Unit]) -> Result<String, (String, Pos, String)> {
     check(units, true).0
 }
 
+/// Compile for the browser (WebAssembly): the entry point is `st_start`, event handlers are kept.
+pub fn compile_web(units: &[Unit]) -> Result<String, (String, Pos, String)> {
+    let mut g = Gen { web: true, ..Gen::default() };
+    for u in units {
+        g.files.insert(u.name.clone(), u.file.clone());
+        g.imports.insert(u.name.clone(), u.module.imports.iter().map(|i| i.0.clone()).collect());
+    }
+    let r = g.run(units, true);
+    r.map_err(|(p, m)| (g.files[&g.module].clone(), p, m))
+}
+
 /// Type-check (and generate code for) `units`; also returns the notes for editor hovers.
 /// Without `require_main`, a file without `main` is fine (a module being edited).
 pub fn check(units: &[Unit], require_main: bool) -> (Result<String, (String, Pos, String)>, Vec<Note>) {
@@ -776,10 +787,15 @@ impl Gen {
             let t = ll(&self.consts[k]);
             write!(init, "  %c{i} = call {t} @\"const.{k}\"(ptr null)\n  store {t} %c{i}, ptr @\"g.{k}\"\n").unwrap();
         }
-        writeln!(out, "define i32 @main() {{\n  call void @st_init()\n{init}{entry}\n}}").unwrap();
+        let entry_sym = if self.web { "st_start" } else { "main" };
+        writeln!(out, "define i32 @{entry_sym}() {{\n  call void @st_init()\n{init}{entry}\n}}").unwrap();
         out += &self.globals;
-        // stack-clash protection: big frames touch every page, so they hit the guard page instead of jumping it
-        out += "attributes #0 = { \"probe-stack\"=\"inline-asm\" }\n";
+        if self.web {
+            out += "attributes #0 = { nounwind }\n";
+        } else {
+            // stack-clash protection: big frames touch every page, so they hit the guard page instead of jumping it
+            out += "attributes #0 = { \"probe-stack\"=\"inline-asm\" }\n";
+        }
         Ok(out)
     }
 
@@ -3032,6 +3048,34 @@ impl Gen {
                     return err(args[0].pos, format!("{}? isn't a type", v.ty));
                 }
                 self.some_of(&v)
+            }
+            "signal" if !self.funcs.contains_key(&self.key("signal")) => {
+                if !self.gtypes.contains_key("web.Signal") {
+                    return err(pos, "`signal` comes with `import web`");
+                }
+                let inner = match peel(want) {
+                    Some(Type::Struct(k)) if self.inst_of.get(k).is_some_and(|i| i.0 == "web.Signal") => Some(self.inst_of[k].1[0].clone()),
+                    _ => None,
+                };
+                let v = one(self, inner.as_ref())?;
+                let v = match &inner {
+                    Some(t) => self.coerce(v, t, args[0].pos)?,
+                    None => v,
+                };
+                let st = self.instantiate_type("web.Signal", vec![v.ty.clone()], pos)?;
+                let Type::Struct(k) = st.clone() else { unreachable!() };
+                // the render's next state cell: empty the first time
+                let cell = self.rt(Type::Str, "st_hook", &[]).v;
+                let old = self.load(&cell, Type::Str).v;
+                let (fresh, lnew, ldone) = (self.tmp(), self.lbl("newsig"), self.lbl("sig"));
+                self.ins(format!("{fresh} = icmp eq ptr {old}, null"));
+                self.term(format!("br i1 {fresh}, label %{lnew}, label %{ldone}"));
+                self.label(&lnew);
+                let obj = self.build(&format!("%\"S.{k}\""), None, &[v]);
+                self.ins(format!("store ptr {obj}, ptr {cell}"));
+                self.label(&ldone);
+                let r = self.load(&cell, st);
+                r
             }
             "to_json" => {
                 let v = one(self, None)?;

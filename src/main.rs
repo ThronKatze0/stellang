@@ -14,6 +14,8 @@ use std::process::{exit, Command, Stdio};
 use std::{env, fs};
 
 const RUNTIME: &str = include_str!("runtime.c");
+const RUNTIME_WEB: &str = include_str!("runtime_web.c");
+const LOADER: &str = include_str!("loader.js");
 
 /// The standard library, written in stellang and built into the compiler.
 pub const STD: &[(&str, &str)] = &[
@@ -21,10 +23,12 @@ pub const STD: &[(&str, &str)] = &[
     ("http", include_str!("../std/http.st")),
     ("fs", include_str!("../std/fs.st")),
     ("json", include_str!("../std/json.st")),
+    ("web", include_str!("../std/web.st")),
 ];
 
 const USAGE: &str = "usage:
   stellang <file.st> [-o <out>] [-O0|-O1|-O2|-O3|-Os] [--emit-llvm]   compile
+  stellang --web <app.st> [-o <out>]                                   compile for the browser (out.wasm + out.js)
   stellang check <file.st>                                             type-check only
   stellang fmt [--emoji|--plain] <file.st>                              re-indent in place
   stellang lsp                                                         language server (stdio)
@@ -123,12 +127,13 @@ fn main() {
         return;
     }
 
-    let (mut input, mut out, mut opt, mut emit) = (None, None, "-O2".to_string(), false);
+    let (mut input, mut out, mut opt, mut emit, mut web) = (None, None, "-O2".to_string(), false, false);
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
             "-o" => out = Some(args.next().unwrap_or_else(|| die("-o needs a file name"))),
             "--emit-llvm" | "-S" => emit = true,
+            "--web" => web = true,
             "-O0" | "-O1" | "-O2" | "-O3" | "-Os" | "-Oz" => opt = a.clone(),
             "-h" | "--help" => return println!("{USAGE}"),
             _ if a.starts_with('-') => die(format!("unknown option {a}\n{USAGE}")),
@@ -136,6 +141,9 @@ fn main() {
         }
     }
     let Some(input) = input else { die(USAGE) };
+    if web {
+        return build_web(&input, out, &opt, emit);
+    }
     let units = load_or_exit(&input);
     let ir = codegen::compile(&units).unwrap_or_else(|(file, p, m)| {
         eprintln!("{file}:{}:{}: error: {m}", p.line, p.col);
@@ -161,5 +169,57 @@ fn main() {
     let _ = fs::remove_file(&rt);
     if !ok {
         die("clang rejected the generated code (compiler bug)");
+    }
+}
+
+/// `stellang --web app.st`: app.wasm (the program and the browser runtime) and app.js (the loader
+/// that runs it in the page), plus a starter app.html if there's none.
+fn build_web(input: &str, out: Option<String>, opt: &str, emit: bool) {
+    let units = load_or_exit(input);
+    for u in &units {
+        for (imp, pos) in &u.module.imports {
+            if ["net", "http", "fs"].contains(&imp.as_str()) {
+                eprintln!("{}:{}:{}: error: `import {imp}` only works on the server, not in a --web app", u.file, pos.line, pos.col);
+                exit(1)
+            }
+        }
+    }
+    let ir = codegen::compile_web(&units).unwrap_or_else(|(file, p, m)| {
+        eprintln!("{file}:{}:{}: error: {m}", p.line, p.col);
+        exit(1)
+    });
+    let stem = Path::new(input).file_stem().unwrap().to_string_lossy().into_owned();
+    let base = out.map(|o| o.trim_end_matches(".wasm").trim_end_matches(".js").to_string()).unwrap_or(stem);
+    if let Some(dir) = Path::new(&base).parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::create_dir_all(dir).unwrap_or_else(|e| die(format!("{}: {e}", dir.display())));
+    }
+    if emit {
+        fs::write(format!("{base}.ll"), ir).unwrap_or_else(|e| die(e));
+        return;
+    }
+    let rt = env::temp_dir().join(format!("stellang-rt-web-{}.c", std::process::id()));
+    fs::write(&rt, format!("{RUNTIME}\n{RUNTIME_WEB}")).unwrap_or_else(|e| die(e));
+    let sysroot = env::var("STELLANG_WASI_SYSROOT").unwrap_or_else(|_| "/usr".into());
+    let wasm = format!("{base}.wasm");
+    let mut cmd = Command::new("clang");
+    cmd.args(["--target=wasm32-wasi", &format!("--sysroot={sysroot}"), opt, "-mexec-model=reactor", "-Wno-override-module"]);
+    cmd.args(["-x", "ir", "-", "-x", "c", "-DST_WASM"]).arg(&rt);
+    cmd.args(["-Wl,--export=st_start", "-Wl,--strip-all", "-o", &wasm]);
+    let mut child = cmd.stdin(Stdio::piped()).spawn().unwrap_or_else(|e| die(format!("cannot run clang: {e}")));
+    child.stdin.take().unwrap().write_all(ir.as_bytes()).unwrap_or_else(|e| die(e));
+    let ok = child.wait().is_ok_and(|s| s.success());
+    let _ = fs::remove_file(&rt);
+    if !ok {
+        die("clang couldn't build the WebAssembly module. It needs the WASI C library and the wasm32 compiler runtime \
+             (Debian/Ubuntu: `apt install wasi-libc libclang-rt-dev-wasm32`), or set STELLANG_WASI_SYSROOT");
+    }
+    let name = Path::new(&base).file_name().unwrap().to_string_lossy().into_owned();
+    fs::write(format!("{base}.js"), LOADER).unwrap_or_else(|e| die(e));
+    let html = format!("{base}.html");
+    if !Path::new(&html).exists() {
+        let page = format!(
+            "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <title>{name}</title>\n</head>\n<body>\n  <div id=\"app\"></div>\n  <script src=\"{name}.js\"></script>\n</body>\n</html>\n"
+        );
+        fs::write(&html, page).unwrap_or_else(|e| die(e));
     }
 }
