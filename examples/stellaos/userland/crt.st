@@ -1245,3 +1245,194 @@ fn pow(x: float, y: float) -> float {
     if x < 0.0 { return 0.0 / 0.0 }
     return exp(y * log(x))
 }
+
+// ---- maps: {K: V} ----
+//
+// [count, entries, capacity, keys, values, alive, index, index size, str keys?]: entries in the
+// order they were added (so keys() keeps it), found through an open-addressed index of entry
+// numbers (+1; 0 is empty). Removing marks an entry dead; growing compacts.
+
+fn __m_new(strs: int) -> int {
+    let m = __alloc(72)
+    __st(m + 16, 8)
+    __st(m + 24, __alloc(64))
+    __st(m + 32, __alloc(64))
+    __st(m + 40, __alloc_raw(64))
+    __st(m + 48, __alloc_raw(128))
+    __st(m + 56, 16)
+    __st(m + 64, strs)
+    __zero(__ld(m + 40), 64)
+    __zero(__ld(m + 48), 128)
+    return m
+}
+
+fn __zero(p: int, n: int) {
+    var k = 0
+    while k < n {
+        __st(p + k, 0)
+        k += 8
+    }
+}
+
+fn __m_hash(m: int, k: int) -> int {
+    if __ld(m + 64) == 0 { return (k * -7046029254386353131) >> 7 & 9007199254740991 }
+    // FNV-1a over the bytes
+    var h = -3750763034362895579
+    let n = __ld(k)
+    var i = 0
+    while i < n {
+        h = (h ^ __ld8(k + 8 + i)) * 1099511628211
+        i += 1
+    }
+    return h & 9007199254740991
+}
+
+fn __m_same(m: int, a: int, b: int) -> bool {
+    if __ld(m + 64) == 0 { return a == b }
+    return __str_eq(__str(a), __str(b))
+}
+
+// the entry with key k, or -1
+fn __m_find(m: int, k: int) -> int {
+    let size = __ld(m + 56)
+    let index = __ld(m + 48)
+    var at = __m_hash(m, k) & (size - 1)
+    while true {
+        let e = __ld(index + at * 8)
+        if e == 0 { return -1 }
+        let i = e - 1
+        if __ld(__ld(m + 40) + i * 8) != 0 && __m_same(m, __ld(__ld(m + 24) + i * 8), k) { return i }
+        at = (at + 1) & (size - 1)
+    }
+    return -1
+}
+
+fn __m_set(m: int, k: int, v: int) {
+    let i = __m_find(m, k)
+    if i >= 0 {
+        __st(__ld(m + 32) + i * 8, v)
+        return
+    }
+    if __ld(m + 8) == __ld(m + 16) || (__ld(m + 8) + 1) * 2 > __ld(m + 56) { __m_grow(m) }
+    let n = __ld(m + 8)
+    __st(__ld(m + 24) + n * 8, k)
+    __st(__ld(m + 32) + n * 8, v)
+    __st(__ld(m + 40) + n * 8, 1)
+    __st(m + 8, n + 1)
+    __st(m, __ld(m) + 1)
+    __m_index(m, k, n)
+}
+
+fn __m_index(m: int, k: int, entry: int) {
+    let size = __ld(m + 56)
+    let index = __ld(m + 48)
+    var at = __m_hash(m, k) & (size - 1)
+    while __ld(index + at * 8) != 0 { at = (at + 1) & (size - 1) }
+    __st(index + at * 8, entry + 1)
+}
+
+// room for more: the live entries, compacted, and a fresh index twice the count
+fn __m_grow(m: int) {
+    let live = __ld(m)
+    var cap = 8
+    while cap < live * 2 + 2 { cap = cap * 2 }
+    var size = 16
+    while size < cap * 2 { size = size * 2 }
+    let keys = __alloc(cap * 8)
+    let vals = __alloc(cap * 8)
+    let alive = __alloc_raw(cap * 8)
+    __zero(alive, cap * 8)
+    var j = 0
+    var i = 0
+    while i < __ld(m + 8) {
+        if __ld(__ld(m + 40) + i * 8) != 0 {
+            __st(keys + j * 8, __ld(__ld(m + 24) + i * 8))
+            __st(vals + j * 8, __ld(__ld(m + 32) + i * 8))
+            __st(alive + j * 8, 1)
+            j += 1
+        }
+        i += 1
+    }
+    __st(m + 8, j)
+    __st(m + 16, cap)
+    __st(m + 24, keys)
+    __st(m + 32, vals)
+    __st(m + 40, alive)
+    let index = __alloc_raw(size * 8)
+    __zero(index, size * 8)
+    __st(m + 48, index)
+    __st(m + 56, size)
+    i = 0
+    while i < j {
+        __m_index(m, __ld(keys + i * 8), i)
+        i += 1
+    }
+}
+
+fn __m_get(m: int, k: int, line: int) -> int {
+    let i = __m_find(m, k)
+    if i < 0 {
+        if __ld(m + 64) == 0 { __die("no key " + __int_str(k) + " in the map", line) }
+        __die("no key \"" + __str(k) + "\" in the map", line)
+    }
+    return __ld(__ld(m + 32) + i * 8)
+}
+
+fn __m_get_or(m: int, k: int, other: int) -> int {
+    let i = __m_find(m, k)
+    if i < 0 { return other }
+    return __ld(__ld(m + 32) + i * 8)
+}
+
+fn __m_contains(m: int, k: int) -> bool { return __m_find(m, k) >= 0 }
+
+fn __m_remove(m: int, k: int) {
+    let i = __m_find(m, k)
+    if i < 0 { return }
+    __st(__ld(m + 40) + i * 8, 0)
+    __st(m, __ld(m) - 1)
+}
+
+fn __m_clear(m: int) {
+    let fresh = __m_new(__ld(m + 64))
+    var k = 0
+    while k < 72 {
+        __st(m + k, __ld(fresh + k))
+        k += 8
+    }
+}
+
+fn __m_list(m: int, which: int) -> int {
+    let out = __l_new(max(4, __ld(m)))
+    var i = 0
+    while i < __ld(m + 8) {
+        if __ld(__ld(m + 40) + i * 8) != 0 { __l_push(out, __ld(__ld(m + which) + i * 8)) }
+        i += 1
+    }
+    return out
+}
+
+fn __m_keys(m: int) -> int { return __m_list(m, 24) }
+fn __m_values(m: int) -> int { return __m_list(m, 32) }
+
+fn __show(v: int, kind: int) -> str {
+    if kind == 0 { return __int_str(v) }
+    if kind == 1 { return "\"" + __str(v) + "\"" }
+    if kind == 2 { return __bool_str(v != 0) }
+    if kind == 3 { return __float_str(__float(v)) }
+    return "..."
+}
+
+// {"a": 1, "b": 2}
+fn __m_str(m: int, kinds: int) -> str {
+    let parts = __l_new(max(4, __ld(m)))
+    var i = 0
+    while i < __ld(m + 8) {
+        if __ld(__ld(m + 40) + i * 8) != 0 {
+            let s = __show(__ld(__ld(m + 24) + i * 8), kinds / 8) + ": " + __show(__ld(__ld(m + 32) + i * 8), kinds % 8)
+            __l_push(parts, __int(s))
+        }
+        i += 1
+    }
+    return "{" + __l_join(parts, ", ") + "}"
+}

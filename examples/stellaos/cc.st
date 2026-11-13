@@ -436,6 +436,13 @@ struct Parser {
             self.expect("]")
             return "[${inner}]"
         }
+        if self.accept("{") {
+            let kt = self.typ()
+            self.expect(":")
+            let vt = self.typ()
+            self.expect("}")
+            return "{" + kt + ":" + vt + "}"
+        }
         let t = self.peek()
         let name = self.ident()
         if self.is("?") { self.fail("optional types (`T?`) aren't supported here yet") }
@@ -803,6 +810,23 @@ struct Parser {
             self.no_struct = old
             self.expect(")")
             return e
+        }
+        if self.accept("{") {
+            let n = self.node("map", t)
+            while self.err == "" {
+                self.skip_nl()
+                if self.accept("}") { break }
+                n.kids.push(self.expr())
+                self.expect(":")
+                n.kids.push(self.expr())
+                self.skip_nl()
+                if !self.accept(",") {
+                    self.skip_nl()
+                    self.expect("}")
+                    break
+                }
+            }
+            return n
         }
         if self.accept("[") {
             let n = self.node("list", t)
@@ -1232,6 +1256,12 @@ struct Gen {
 
     fn known_type(self, e: Tree, ty: str) {
         if ty == "int" || ty == "bool" || ty == "str" || ty == "float" || ty == "?" { return }
+        if ty.starts_with("{") {
+            let kv = map_types(ty)
+            if kv[0] != "int" && kv[0] != "str" { self.fail(e, "map keys are int or str, not ${kv[0]}") }
+            self.known_type(e, kv[1])
+            return
+        }
         if ty.starts_with("fn(") {
             for p in fn_params(ty) { self.known_type(e, p) }
             let r = fn_ret(ty)
@@ -1478,15 +1508,37 @@ struct Gen {
             self.scope_out()
         } else if k == "for" {
             self.scope_in()
-            let lt = self.expr(st.kids[0], "")
+            var lt = self.expr(st.kids[0], "")
+            var map_vals = -1
+            if lt.starts_with("{") {
+                // a map: its keys (and values, for `for k, v in m`)
+                let kv = map_types(lt)
+                if st.s2 != "" {
+                    a.push(rv.A0)
+                    self.rt("__m_values", 1)
+                    map_vals = self.declare(st, " values", "[${kv[1]}]", false)
+                    self.store_slot(rv.A0, map_vals)
+                    // the map again for the keys
+                    self.expr(st.kids[0], "")
+                }
+                a.push(rv.A0)
+                self.rt("__m_keys", 1)
+                lt = "[${kv[0]}]"
+            }
             let is_str = lt == "str"
-            if !is_str && !lt.starts_with("[") && lt != "?" { self.fail(st.kids[0], "`for` goes over a list, a string or a range (a..b), not ${lt}") }
+            if !is_str && !lt.starts_with("[") && lt != "?" { self.fail(st.kids[0], "`for` goes over a list, a map, a string or a range (a..b), not ${lt}") }
             let lv = self.declare(st, " list", lt, false)
             self.store_slot(rv.A0, lv)
-            let idx = self.declare(st, if st.s2 != "" { st.s } else { " i" }, "int", false)
+            let pair = st.s2 != "" && map_vals < 0
+            let idx = self.declare(st, if pair { st.s } else { " i" }, "int", false)
             a.li(rv.T0, 0)
             self.store_slot(rv.T0, idx)
-            let ev = self.declare(st, if st.s2 != "" { st.s2 } else { st.s }, if is_str { "str" } else { elem(lt) }, false)
+            let ev = self.declare(st, if pair { st.s2 } else { st.s }, if is_str { "str" } else { elem(lt) }, false)
+            var vv = -1
+            if map_vals >= 0 {
+                let vals_ty = self.lookup(" values").unwrap().ty
+                vv = self.declare(st, st.s2, elem(vals_ty), false)
+            }
             let top = a.label()
             let cont = a.label()
             let end = a.label()
@@ -1507,6 +1559,15 @@ struct Gen {
                 a.ld(rv.A0, rv.T0, 0)
             }
             self.store_slot(rv.A0, ev)
+            if vv >= 0 {
+                self.load_slot(rv.T0, map_vals)
+                a.ld(rv.T0, rv.T0, 16)
+                self.load_slot(rv.T2, idx)
+                a.slli(rv.T2, rv.T2, 3)
+                a.add(rv.T0, rv.T0, rv.T2)
+                a.ld(rv.T0, rv.T0, 0)
+                self.store_slot(rv.T0, vv)
+            }
             self.loops.push(Loop { brk: end, cont })
             self.block(st.kids[1])
             self.loops.pop()
@@ -1675,6 +1736,30 @@ struct Gen {
         }
         if target.k == "index" {
             let lt = self.expr(target.kids[0], "")
+            if lt.starts_with("{") {
+                let kv = map_types(lt)
+                a.push(rv.A0)
+                let kt = self.expr(target.kids[1], kv[0])
+                self.check(target.kids[1], kt, kv[0], "a key")
+                a.push(rv.A0)
+                if op == "=" {
+                    let ty = self.expr(value, kv[1])
+                    self.check(value, ty, kv[1], "a map value")
+                } else {
+                    self.compound(st, kv[1], () => {
+                        a.ld(rv.T0, rv.SP, 8)
+                        a.push(rv.T0)
+                        a.ld(rv.T0, rv.SP, 8)
+                        a.push(rv.T0)
+                        a.li(rv.A0, st.line)
+                        a.push(rv.A0)
+                        self.rt("__m_get", 3)
+                    })
+                }
+                a.push(rv.A0)
+                self.rt("__m_set", 3)
+                return
+            }
             if !lt.starts_with("[") {
                 if lt == "str" { self.fail(target, "strings can't change: build a new one (s.slice, +)") } else { self.fail(target, "only lists can be indexed, not ${lt}") }
                 return
@@ -1831,6 +1916,7 @@ struct Gen {
         }
         if k == "name" { return self.name(e) }
         if k == "list" { return self.list(e, want) }
+        if k == "map" { return self.map_lit(e, want) }
         if k == "new" { return self.construct(e) }
         if k == "bin" { return self.binary(e) }
         if k == "un" {
@@ -1882,6 +1968,16 @@ struct Gen {
         if k == "index" {
             let lt = self.expr(e.kids[0], "")
             a.push(rv.A0)
+            if lt.starts_with("{") {
+                let kv = map_types(lt)
+                let kt = self.expr(e.kids[1], kv[0])
+                self.check(e.kids[1], kt, kv[0], "a key")
+                a.push(rv.A0)
+                a.li(rv.A0, e.line)
+                a.push(rv.A0)
+                self.rt("__m_get", 3)
+                return kv[1]
+            }
             let it = self.expr(e.kids[1], "int")
             self.check(e.kids[1], it, "int", "an index")
             if lt == "str" {
@@ -1891,6 +1987,7 @@ struct Gen {
                 self.rt("__s_at", 3)
                 return "str"
             }
+            if lt.starts_with("{") { self.fail(e, "internal: map index") }
             a.pop(rv.T0)
             if !lt.starts_with("[") {
                 if lt != "?" { self.fail(e, "only lists and strings can be indexed, not ${lt}") }
@@ -1989,6 +2086,45 @@ struct Gen {
             self.fail(e, "an empty list needs a type: `var xs: [int] = []`")
             return "?"
         }
+        return ty
+    }
+
+    fn map_lit(self, e: Tree, want: str) -> str {
+        let a = self.a
+        var ty = if want.starts_with("{") { want } else { "" }
+        if ty == "" && e.kids.is_empty() {
+            self.fail(e, "an empty map needs a type: `var m: {str: int} = {}`")
+            return "?"
+        }
+        // the key type decides how keys compare: find it first
+        var kt = if ty != "" { map_types(ty)[0] } else { "" }
+        let fix_at = a.here()                     // this li (the kind of keys) is patched once that's known
+        a.li(rv.A0, 0)
+        a.push(rv.A0)
+        self.rt("__m_new", 1)
+        a.push(rv.A0)
+        var k = 0
+        while k + 1 < e.kids.len() {
+            a.ld(rv.T0, rv.SP, 0)
+            a.push(rv.T0)
+            let t1 = self.expr(e.kids[k], if ty != "" { map_types(ty)[0] } else { "" })
+            a.push(rv.A0)
+            let t2 = self.expr(e.kids[k + 1], if ty != "" { map_types(ty)[1] } else { "" })
+            a.push(rv.A0)
+            if ty == "" {
+                ty = "{" + t1 + ":" + t2 + "}"
+                kt = t1
+            } else {
+                self.check(e.kids[k], t1, map_types(ty)[0], "a key")
+                self.check(e.kids[k + 1], t2, map_types(ty)[1], "a value")
+            }
+            self.rt("__m_set", 3)
+            k += 2
+        }
+        if kt != "int" && kt != "str" && kt != "?" { self.fail(e, "map keys are int or str, not ${kt}") }
+        // __m_new's argument: 1 for str keys
+        a.code[fix_at / 4] = rv.i(0x13, rv.A0, 0, rv.ZERO, if kt == "str" { 1 } else { 0 }) & 0xffffffff
+        a.pop(rv.A0)
         return ty
     }
 
@@ -2151,6 +2287,11 @@ struct Gen {
         else if ty == "[float]" { self.rt("__l_float_str", 1) } else if ty == "bool" { self.rt("__bool_str", 1) } else if ty == "[int]" { self.rt("__l_int_str", 1) } else if ty == "[str]" { self.rt("__l_str_str", 1) } else if ty == "[bool]" { self.rt("__l_bool_str", 1) } else if ty == "void" {
             self.fail(e, "this has no value to show")
             a.pop(rv.A0)
+        } else if ty.starts_with("{") {
+            let kv = map_types(ty)
+            a.li(rv.A0, show_kind(kv[0]) * 8 + show_kind(kv[1]))
+            a.push(rv.A0)
+            self.rt("__m_str", 2)
         } else if ty.starts_with("fn(") {
             a.pop(rv.A0)
             a.addr_data(rv.A0, self.str_lit("<fn>"))
@@ -2385,6 +2526,44 @@ struct Gen {
                 return m[1]
             }
             self.fail(e, "str has no method `${name}`")
+            return "?"
+        }
+        if ot.starts_with("{") {
+            let kv = map_types(ot)
+            if (name == "len" || name == "is_empty") && argc == 0 {
+                a.ld(rv.A0, rv.A0, 0)
+                if name == "is_empty" {
+                    a.seqz(rv.A0, rv.A0)
+                    return "bool"
+                }
+                return "int"
+            }
+            a.push(rv.A0)
+            if (name == "contains" || name == "remove") && argc == 1 {
+                let t = self.expr(e.kids[1], kv[0])
+                self.check(e.kids[1], t, kv[0], name)
+                a.push(rv.A0)
+                self.rt("__m_" + name, 2)
+                return if name == "contains" { "bool" } else { "void" }
+            }
+            if name == "get" && argc == 2 {
+                let t = self.expr(e.kids[1], kv[0])
+                self.check(e.kids[1], t, kv[0], "get")
+                a.push(rv.A0)
+                let d = self.expr(e.kids[2], kv[1])
+                self.check(e.kids[2], d, kv[1], "get's default")
+                a.push(rv.A0)
+                self.rt("__m_get_or", 3)
+                return kv[1]
+            }
+            if (name == "keys" || name == "values" || name == "clear") && argc == 0 {
+                self.rt("__m_" + name, 1)
+                if name == "keys" { return "[${kv[0]}]" }
+                if name == "values" { return "[${kv[1]}]" }
+                return "void"
+            }
+            a.addi(rv.SP, rv.SP, 8)
+            self.fail(e, "${ot} has no method `${name}` with ${argc} argument${if argc == 1 { "" } else { "s" }} (len is_empty contains get(k, default) remove keys values clear)")
             return "?"
         }
         if ot == "float" {
@@ -2719,6 +2898,29 @@ fn float_bits(x: float) -> int {
         return sign | int(v * 4503599627370496.0)
     }
     return sign | (e + 1023) << 52 | int((v - 1.0) * 4503599627370496.0)
+}
+
+// "{str:[int]}" -> ["str", "[int]"]
+fn map_types(ty: str) -> [str] {
+    var depth = 0
+    var i = 1
+    while i < ty.len() - 1 {
+        let c = ty[i]
+        if c == "(" || c == "[" || c == "{" { depth += 1 }
+        if c == ")" || c == "]" || c == "}" { depth -= 1 }
+        if c == ":" && depth == 0 { return [ty.slice(1, i), ty.slice(i + 1, ty.len() - 1)] }
+        i += 1
+    }
+    return ["?", "?"]
+}
+
+// how the runtime shows a value of this type in a map: 0 int, 1 str, 2 bool, 3 float, else ...
+fn show_kind(ty: str) -> int {
+    if ty == "int" { return 0 }
+    if ty == "str" { return 1 }
+    if ty == "bool" { return 2 }
+    if ty == "float" { return 3 }
+    return 4
 }
 
 // the parts of "fn(int,[str])->bool"

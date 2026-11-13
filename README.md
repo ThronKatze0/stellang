@@ -527,7 +527,8 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
   `args()`), `run long.st &` (in the background), `cc game.st -o game` then `run game`, `ps`, `kill <pid>`. Example programs are in `/home/examples` (a game, bouncing balls, a sketch pad, music, files).
   - **The language** is stellang, the parts a one-file program needs: `fn`, `struct` with fields, defaults and
     methods, `enum`s of plain variants (`Light.Red`, `.Red`; `match` on them must cover every one),
-    `const`/`let`/`var`, `int`/`float`/`bool`/`str` and lists (`[int]`, `[[str]]`, `[Point]`), `if`/`else` and
+    `const`/`let`/`var`, `int`/`float`/`bool`/`str`, lists (`[int]`, `[[str]]`, `[Point]`) and maps (`{str: int}`:
+    `m[k]`, `m[k] = v`, `get(k, default) contains remove keys values`, `for k, v in m`), `if`/`else` and
     `match` (also as values), `while`, `for x in list`, `for i, x in list`, `for i in a..b`, `break`/`continue`,
     closures (`x => x * k`, `(a: int, b: int) => { ... }`, `fn(int) -> bool` types; they share the `var`s they
     use, like stellang's), functions as values, `map filter any all count` on lists,
