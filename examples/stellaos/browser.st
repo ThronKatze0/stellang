@@ -162,8 +162,8 @@ struct Browser {
         self.show_doc(html.parse(page), url, title)
     }
 
-    // Fetch the page's stylesheets (at most 4) and take their rules that hide things: menus, dropdowns
-    // and the like that a page shows only on demand. The rest of their CSS isn't applied.
+    // Fetch the page's stylesheets (at most 4). Pages get their full CSS; in reader view, only the
+    // rules that hide things (menus, dropdowns and the like that a page shows only on demand).
     fn load_sheets(self, doc: html.Doc, base: www.Url) {
         self.page_gen += 1
         let gen = self.page_gen
@@ -171,7 +171,9 @@ struct Browser {
             let u = www.resolve(base, href) catch e { continue }
             www.get(self.client, u, (r: www.Response) => {
                 if gen != self.page_gen || r.error != "" || r.status != 200 { return }
-                doc.extra_css = doc.extra_css + "\n" + html.hiding_rules(html.flatten_css(r.body))
+                let flat = html.flatten_css(r.body)
+                doc.extra_css = doc.extra_css + "\n" + flat
+                doc.extra_hide = doc.extra_hide + "\n" + html.hiding_rules(flat)
                 if let d = self.doc {
                     if d.root.path == doc.root.path && self.doc_url == base.text() { self.show_doc(doc, self.doc_url, self.doc_title) }
                 }
@@ -187,8 +189,8 @@ struct Browser {
         var root = doc.root
         self.has_main = false
         if let m = doc.main {
-            // reader view: when the marked main part holds most of the text
-            if html.text_size(m) * 2 > html.text_size(doc.root) {
+            // reader view: when the marked main part holds a good share (30%) of the text
+            if html.text_size(m) * 10 > html.text_size(doc.root) * 3 {
                 self.has_main = true
                 if self.reader {
                     let wrap = ui.El { tag: "body" }
@@ -200,16 +202,12 @@ struct Browser {
             }
         }
         if let u = self.u {
-            // the page's own CSS: its first 600 rules, and every rule that hides something
-            let flat = html.flatten_css(doc.css)
-            var rules = ui.parse_sheet(flat)
-            if rules.len() > 600 {
-                rules = rules.slice(0, 600)
-                for r in ui.parse_sheet(html.hiding_rules(flat)) { rules.push(r) }
-            }
-            let hide = ui.parse_sheet(doc.extra_css)
-            for r in hide.slice(0, min(hide.len(), 2000)) { rules.push(r) }
-            u.page_sheet = rules
+            // the page's CSS: its <style> blocks, then its linked stylesheets (in reader view, only
+            // their rules that hide things)
+            let sheet = ui.Sheet {}
+            sheet.add_css(html.flatten_css(doc.css), 20000)
+            sheet.add_css(if self.reader && self.has_main { doc.extra_hide } else { doc.extra_css }, 20000)
+            u.page_sheet = sheet
             u.scrolls = {}
             u.set_slot("page", normalize(root))
         }

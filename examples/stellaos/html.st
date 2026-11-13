@@ -72,7 +72,8 @@ struct Doc {
     truncated: bool = false,
     main: ui.El? = none,
     sheets: [str] = [],           // linked stylesheets
-    extra_css: str = "",          // hiding rules from them, once fetched          // the page's main content (<main>, role="main"), if marked
+    extra_css: str = "",          // their CSS, once fetched
+    extra_hide: str = "",         // just their rules that hide things          // the page's main content (<main>, role="main"), if marked
     removed: {str: int} = {},     // what was dropped: "script" -> 3, "on* attributes" -> 12, ...
 
     fn drop(self, what: str) {
