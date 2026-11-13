@@ -6,22 +6,204 @@
 // Values: int and bool are themselves; a str points at [length][bytes][0]; a list at
 // [length][capacity][pointer to the elements]; a struct at its fields, 8 bytes each.
 
-var __hp = __ld(__heap())
+var __hp = __ld(__heap())            // the heap: blocks from __h0 up to __hp, fresh memory up to __he
 var __he = __ld(__heap() + 8)
+var __top = __ld(__heap() + 16)      // where the stack starts
+var __h0 = 0
+var __bm = 0                         // a bit per heap word: does a block start here?
+var __free = 0                       // free lists: [0] big blocks, [w] blocks of w words (1..64)
+var __ms = 0                         // the mark stack
+var __msn = 16384
+var __msp = 0
+var __overflow = false
+var __since = 0                      // bytes handed out since the last collection
+var __limit = 1048576
+var __live = 0
+var __gcs = 0
+var __ready = __gc_init()
 var __lb = 0
 var __kb = 0
 
-// ---- memory ----
+// ---- memory: a garbage collector ----
+//
+// Every block has a header word: its size in bytes | 4 marked | 2 holds pointers | 1 in use. Free
+// blocks sit on free lists by size. When enough has been handed out since the last time (or memory
+// runs out), we collect: mark everything reachable from the globals and the stack (any word that
+// is the start of a block counts: conservative, so it never frees what's in use), then sweep: what
+// isn't marked goes back on the free lists, neighbours merged.
 
-fn __alloc(n: int) -> int {
-    let p = __hp
-    __hp = p + ((n + 7) & -8)
-    if __hp > __he || n < 0 {
-        __hp = p
-        __die("out of memory", 0)
+fn __gc_init() -> int {
+    __ms = __he - __msn * 8
+    __free = __ms - 66 * 8
+    let words = (__free - __hp) / 8
+    __bm = (__free - words / 8 - 16) & -8
+    __he = __bm
+    __h0 = __hp
+    return 1
+}
+
+fn __bm_at(p: int) -> int { return (p - __h0) / 8 }
+
+fn __bm_set(p: int, on: bool) {
+    let i = __bm_at(p)
+    let a = __bm + i / 8
+    let bit = 1 << (i & 7)
+    if on { __st8(a, __ld8(a) | bit) } else { __st8(a, __ld8(a) & (255 - bit)) }
+}
+
+fn __bm_get(p: int) -> bool {
+    let i = __bm_at(p)
+    return (__ld8(__bm + i / 8) >> (i & 7)) & 1 == 1
+}
+
+fn __alloc(n: int) -> int { return __alloc2(n, 2) }       // may hold pointers
+fn __alloc_raw(n: int) -> int { return __alloc2(n, 0) }   // bytes (strings)
+
+fn __alloc2(n: int, scan: int) -> int {
+    if n < 0 { __die("out of memory", 0) }
+    var w = (n + 7) / 8
+    if w < 1 { w = 1 }
+    if __since > __limit { __collect() }
+    var p = __take(w)
+    if p == 0 {
+        __collect()
+        p = __take(w)
+        if p == 0 { __die("out of memory", 0) }
+    }
+    let size = __ld(p - 8) & -8
+    __st(p - 8, size | scan | 1)
+    __bm_set(p, true)
+    __since += size + 8
+    var k = 0
+    while k < size {
+        __st(p + k, 0)
+        k += 8
     }
     return p
 }
+
+// a block of at least w words: from a free list, else fresh memory; 0 if there is none
+fn __take(w: int) -> int {
+    if w <= 64 {
+        let head = __ld(__free + w * 8)
+        if head != 0 {
+            __st(__free + w * 8, __ld(head))
+            return head
+        }
+    }
+    // the big blocks: the first that fits, split
+    var prev = __free
+    var b = __ld(__free)
+    while b != 0 {
+        let bw = (__ld(b - 8) & -8) / 8
+        if bw >= w {
+            __st(prev, __ld(b))
+            if bw - w >= 2 {
+                let r = b + w * 8 + 8
+                __st(r - 8, (bw - w - 1) * 8)
+                __put_free(r)
+                __st(b - 8, w * 8)
+            }
+            return b
+        }
+        prev = b
+        b = __ld(b)
+    }
+    if __hp + 8 + w * 8 > __he { return 0 }
+    let p = __hp + 8
+    __st(__hp, w * 8)
+    __hp = __hp + 8 + w * 8
+    return p
+}
+
+fn __put_free(p: int) {
+    let w = (__ld(p - 8) & -8) / 8
+    let list = if w <= 64 { __free + w * 8 } else { __free }
+    __st(p, __ld(list))
+    __st(list, p)
+}
+
+fn __consider(v: int) {
+    if v < __h0 + 8 || v >= __hp || (v & 7) != 0 { return }
+    if !__bm_get(v) { return }
+    let h = __ld(v - 8)
+    if (h & 4) != 0 { return }
+    __st(v - 8, h | 4)
+    if (h & 2) == 0 { return }
+    if __msp < __msn {
+        __st(__ms + __msp * 8, v)
+        __msp += 1
+    } else {
+        __overflow = true
+    }
+}
+
+fn __scan(a: int, b: int) {
+    var p = a
+    while p < b {
+        __consider(__ld(p))
+        p += 8
+    }
+}
+
+fn __drain() {
+    while __msp > 0 {
+        __msp -= 1
+        let v = __ld(__ms + __msp * 8)
+        __scan(v, v + (__ld(v - 8) & -8))
+    }
+}
+
+fn __collect() {
+    __gcs += 1
+    __scan(__heap(), __heap() + __data_size())
+    __scan(__sp(), __top)
+    __drain()
+    // the mark stack overflowed: go over the marked blocks again until nothing new is found
+    while __overflow {
+        __overflow = false
+        var q = __h0
+        while q < __hp {
+            let h = __ld(q)
+            if (h & 7) == 7 { __scan(q + 8, q + 8 + (h & -8)) }
+            __drain()
+            q = q + 8 + (h & -8)
+        }
+    }
+    // sweep: unmarked blocks are free; runs of free blocks become one
+    var k = 0
+    while k < 65 {
+        __st(__free + k * 8, 0)
+        k += 1
+    }
+    __live = 0
+    var q = __h0
+    var run = 0
+    while q < __hp {
+        let h = __ld(q)
+        let size = h & -8
+        if (h & 5) == 5 {
+            __st(q, h - 4)
+            __live += size + 8
+            if run != 0 {
+                __st(run, q - run - 8)
+                __put_free(run + 8)
+                run = 0
+            }
+        } else {
+            if (h & 1) != 0 { __bm_set(q + 8, false) }
+            __st(q, size)
+            if run == 0 { run = q }
+        }
+        q = q + 8 + size
+    }
+    if run != 0 { __hp = run }      // free at the end: back to fresh memory
+    __since = 0
+    __limit = max(1048576, __live)
+}
+
+fn gc_count() -> int { return __gcs }
+fn memory_used() -> int { return __live + __since }
 
 fn __die(msg: str, line: int) {
     var s = "\nerror"
@@ -37,8 +219,9 @@ fn __oob(i: int, n: int, line: int) {
 // ---- strings ----
 
 fn __str_new(n: int) -> int {
-    let p = __alloc(n + 9)
+    let p = __alloc_raw(n + 9)
     __st(p, n)
+    __st8(p + 8 + n, 0)
     return p
 }
 
@@ -505,7 +688,7 @@ fn __l_bool_str(l: int) -> str { return __l_show(l, 2) }
 // ---- the built-in functions ----
 
 fn read_line() -> str {
-    if __lb == 0 { __lb = __alloc(4096) }
+    if __lb == 0 { __lb = __alloc_raw(4096) }
     let n = __syscall(2, __lb, 4096)
     if n <= 0 { return "" }
     let p = __str_new(n)
@@ -607,7 +790,7 @@ fn char(code: int) -> str {
 }
 
 fn user() -> str {
-    let b = __alloc(64)
+    let b = __alloc_raw(64)
     let n = __syscall(19, b, 64)
     let p = __str_new(n)
     __copy(p + 8, b, n)
@@ -650,7 +833,7 @@ fn rgb(r: int, g: int, b: int) -> int { return (r & 255) << 16 | (g & 255) << 8 
 
 // the next key pressed in the window ("" if none): "a", "A", "Enter", "ArrowLeft", " ", ...
 fn key() -> str {
-    if __kb == 0 { __kb = __alloc(64) }
+    if __kb == 0 { __kb = __alloc_raw(64) }
     let n = __syscall(12, __kb, 64)
     if n <= 0 { return "" }
     let p = __str_new(n)

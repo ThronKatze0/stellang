@@ -2209,6 +2209,7 @@ fn stellaos_procs() {
         "=== j_spin.st\n[still running after 3 s: killing]",
         "error: out of memory\n[exit 101]",
         "name? hello Ada!\ndouble: 42\n[exit 0]",
+        "churn 1398890 sum 12497500 intact true\ncollections true bounded true\n[exit 0]",
         "[exe] from a file",
         "exe parse of junk: true",
         "\ndone",

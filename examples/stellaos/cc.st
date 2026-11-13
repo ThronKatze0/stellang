@@ -1069,12 +1069,14 @@ struct Gen {
         // globals, main, exit(0)
         let a = self.a
         self.offsets["_start"] = 0
-        self.data_size = 16
+        self.data_size = 24
         a.mv(rv.FP, rv.SP)
         a.addr_var(rv.T0, 0)
         a.sd(rv.A0, rv.T0, 0)
         a.addr_var(rv.T0, 8)
         a.sd(rv.A1, rv.T0, 0)
+        a.addr_var(rv.T0, 16)
+        a.sd(rv.SP, rv.T0, 0)
         a.call("g_init")
         a.call("f_main")
         a.li(rv.A0, 0)
@@ -1883,6 +1885,14 @@ struct Gen {
             a.pop(rv.T0)
             if name == "__st" { a.sd(rv.A0, rv.T0, 0) } else { a.sb(rv.A0, rv.T0, 0) }
             return some("void")
+        }
+        if name == "__sp" {
+            a.mv(rv.A0, rv.SP)
+            return some("int")
+        }
+        if name == "__data_size" {
+            a.li(rv.A0, self.data_size)
+            return some("int")
         }
         if name == "__heap" {
             a.addr_var(rv.A0, 0)

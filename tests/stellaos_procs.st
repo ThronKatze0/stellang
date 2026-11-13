@@ -54,7 +54,8 @@ const PROGS = [
     ["i_err6.st", "fn add(a: int, b: int) -> int { return a + b }\nfn main() {\n    println(add(1))\n}\n"],
     ["j_spin.st", "fn main() {\n    var i = 0\n    while true { i += 1 }\n}\n"],
     ["k_mem.st", "fn main() {\n    var s = \"x\"\n    while true { s = s + s }\n}\n"],
-    ["l_input.st", "fn main() {\n    let name = input(\"name? \")\n    println(\"hello \${name}!\")\n    let n = parse_int(read_line())\n    println(\"double: \${n * 2}\")\n}\n"]
+    ["l_input.st", "fn main() {\n    let name = input(\"name? \")\n    println(\"hello \${name}!\")\n    let n = parse_int(read_line())\n    println(\"double: \${n * 2}\")\n}\n"],
+    ["m_gc.st", "struct Cell {\n    v: int,\n    tags: [str] = [],\n}\n\nfn churn(n: int) -> int {\n    var total = 0\n    for i in 0..n {\n        let s = \"item \${i} \" + \"x\".repeat(i % 20)\n        let parts = s.split(\" \")\n        total += parts.len() + s.len()\n    }\n    return total\n}\n\nfn main() {\n    var cells: [Cell] = []\n    for i in 0..5000 {\n        let c = Cell { v: i }\n        c.tags.push(\"t\${i}\")\n        cells.push(c)\n    }\n    let t = churn(60000)\n    var sum = 0\n    var ok = true\n    for i, c in cells {\n        sum += c.v\n        if c.tags[0] != \"t\${i}\" { ok = false }\n    }\n    println(\"churn \${t} sum \${sum} intact \${ok}\")\n    println(\"collections \${gc_count() > 3} bounded \${memory_used() < 3000000}\")\n}\n"]
 ]
 
 fn main() {

@@ -42,7 +42,7 @@ const TYPES = ["int", "bool", "str", "void"]
 const BUILTINS = ["print", "println", "input", "read_line", "sleep", "now_ms", "random", "exit", "max", "min", "abs",
     "parse_int", "is_number", "char", "window", "clear", "rect", "circle", "line", "text", "big_text", "mono_text",
     "text_width", "show", "key", "mouse_x", "mouse_y", "mouse_down", "beep", "note", "read_file", "write_file",
-    "file_exists", "pid", "user", "rgb"]
+    "file_exists", "pid", "user", "rgb", "gc_count", "memory_used"]
 
 // what the editor needs from the system
 struct Env {
