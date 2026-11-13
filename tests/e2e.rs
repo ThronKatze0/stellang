@@ -2216,6 +2216,7 @@ fn stellaos_procs() {
         "parse -125.0 0.0\n[0.5, 1.25]\n1.00000000000792\n[exit 0]",
         "Main St: Red (wait 30)\nMain St: Green (wait 0)\nMain St: Yellow (wait 3)\nMain St: Red (wait 30)\ntrue\n2 Green\ntwo or three\n[exit 0]",
         "compile error 4:5: this match on Dir misses Left (or add `_ =>`)",
+        "[10, 20, 30, 40, 50, 60]\n[2, 4, 6]\ntrue true 4\n42\n42\ncounter 3\nclicks 2\n[4, 3, 6]\nPEAR-FIG-BANANA\n[0, 100, 200]\n5\ntotal 21\n[exit 0]",
         "[exe] from a file",
         "exe parse of junk: true",
         "example bounce.st compiles\nexample guess.st compiles\nexample hello.st compiles\nexample music.st compiles\nexample notebook.st compiles\nexample orbits.st compiles\nexample paint.st compiles\nexample primes.st compiles\n",

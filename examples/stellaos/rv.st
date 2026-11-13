@@ -154,6 +154,14 @@ struct Asm {
         self.emit(0)
     }
     fn ret(self) { self.emit(i(0x67, ZERO, 0, RA, 0)) }
+    fn jalr(self, rs: int) { self.emit(i(0x67, RA, 0, rs, 0)) }     // call the address in rs
+
+    // a function's address (pc-relative), for closures
+    fn addr_fn(self, rd: int, name: str) {
+        self.fixes.push(Fix { at: self.here(), kind: 1, name, rd })
+        self.emit(0)
+        self.emit(0)
+    }
     fn ecall(self) { self.emit(0x73) }
 
     // the address of something in the image (pc-relative, so the code runs wherever it is loaded)

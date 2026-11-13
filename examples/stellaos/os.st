@@ -478,6 +478,8 @@ struct Shell {
         for p in self.procs.running() {
             if p.user == who { p.kill("its user logged out") }
         }
+        for j in self.jobs { kernel.cancel(j.timer) }
+        self.jobs = []
         self.sync()
         self.user = ""
         self.sudo_until = 0

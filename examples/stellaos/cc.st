@@ -37,7 +37,7 @@ struct Lexer {
     line: int = 1,
     lstart: int = 0,
     toks: [Tok] = [],
-    depth: int = 0,          // ( and [ nesting: line breaks inside don't end statements
+    nest: [str] = [],        // open brackets: line breaks inside ( and [ don't end statements, inside { they do
     err: str = "",
     err_line: int = 0,
     err_col: int = 0,
@@ -68,7 +68,8 @@ struct Lexer {
             let at = self.i
             if ch == 10 {
                 self.i += 1
-                if self.depth == 0 && !self.continues() { self.add("nl", "", 0, at) }
+                let in_parens = !self.nest.is_empty() && self.nest[self.nest.len() - 1] != "{"
+                if !in_parens && !self.continues() { self.add("nl", "", 0, at) }
                 self.line += 1
                 self.lstart = self.i
             } else if ch == 32 || ch == 9 || ch == 13 {
@@ -247,8 +248,8 @@ struct Lexer {
             s = one
         }
         self.i += s.len()
-        if s == "(" || s == "[" { self.depth += 1 }
-        if (s == ")" || s == "]") && self.depth > 0 { self.depth -= 1 }
+        if s == "(" || s == "[" || s == "{" { self.nest.push(s) }
+        if (s == ")" || s == "]" || s == "}") && !self.nest.is_empty() { self.nest.pop() }
         self.add("op", s, 0, at)
     }
 }
@@ -340,6 +341,7 @@ struct Parser {
     err_col: int = 0,
     crt: bool = false,
     no_struct: bool = false,     // in `if`/`while`/`for` heads, `Name {` starts the block, not a struct
+    in_pattern: bool = false,    // a match pattern: `Red =>` is an arm, not a lambda
     line_base: int = 0,
 
     fn peek(self) -> Tok { return self.toks[self.i] }
@@ -416,6 +418,19 @@ struct Parser {
     }
 
     fn typ(self) -> str {
+        if self.accept("fn") {
+            // fn(int, str) -> bool
+            self.expect("(")
+            var ps: [str] = []
+            while !self.is(")") && self.err == "" {
+                ps.push(self.typ())
+                if !self.accept(",") { break }
+            }
+            self.expect(")")
+            var r = "void"
+            if self.accept("->") { r = self.typ() }
+            return "fn(" + ps.join(",") + ")->" + r
+        }
         if self.accept("[") {
             let inner = self.typ()
             self.expect("]")
@@ -641,8 +656,10 @@ struct Parser {
                 self.next()
                 arm.n = 1
             } else {
-                arm.kids.push(self.expr())
-                while self.accept("|") { arm.kids.push(self.expr()) }
+                self.in_pattern = true
+                arm.kids.push(self.binary(4))          // above `|`: that separates alternatives
+                while self.accept("|") { arm.kids.push(self.binary(4)) }
+                self.in_pattern = false
             }
             self.expect("=>")
             if self.is("{") {
@@ -778,6 +795,7 @@ struct Parser {
             self.next()
             return self.string(t)
         }
+        if self.lambda_ahead() { return self.lambda() }
         if self.accept("(") {
             let old = self.no_struct
             self.no_struct = false
@@ -884,6 +902,61 @@ struct Parser {
         }
         self.fail("expected a value here, found ${describe(t)}")
         return self.node("int", t)
+    }
+
+    // x => ..., (x, y: int) => ..., () => { ... }
+    fn lambda_ahead(self) -> bool {
+        if self.in_pattern { return false }
+        let t = self.peek()
+        if t.k == "id" && !KEYWORDS.contains(t.s) {
+            let n = self.peek2()
+            return n.k == "op" && n.s == "=>"
+        }
+        if t.k != "op" || t.s != "(" { return false }
+        var depth = 0
+        var j = self.i
+        while j < self.toks.len() {
+            let u = self.toks[j]
+            if u.k == "op" && (u.s == "(" || u.s == "[") { depth += 1 }
+            if u.k == "op" && (u.s == ")" || u.s == "]") {
+                depth -= 1
+                if depth == 0 {
+                    let n = self.toks[min(j + 1, self.toks.len() - 1)]
+                    return n.k == "op" && n.s == "=>"
+                }
+            }
+            if u.k == "eof" { return false }
+            j += 1
+        }
+        return false
+    }
+
+    fn lambda(self) -> Tree {
+        let t = self.peek()
+        let n = self.node("lambda", t)
+        if self.accept("(") {
+            while !self.is(")") && self.err == "" {
+                let pt = self.peek()
+                let prm = self.node("param", pt)
+                prm.s = self.ident()
+                if self.accept(":") { prm.s2 = self.typ() }
+                n.kids.push(prm)
+                if !self.accept(",") { break }
+            }
+            self.expect(")")
+        } else {
+            let prm = self.node("param", t)
+            prm.s = self.ident()
+            n.kids.push(prm)
+        }
+        self.expect("=>")
+        if self.is("{") {
+            n.kids.push(self.block())
+        } else {
+            n.kids.push(self.expr())
+            n.n = 1
+        }
+        return n
     }
 
     fn else_block(self) -> Tree {
@@ -995,6 +1068,7 @@ struct Local {
     slot: int,
     ty: str,
     mutable: bool,
+    boxed: bool = false,       // a `var` a closure captured: the slot holds a heap cell
 }
 
 struct GlobalInfo {
@@ -1029,6 +1103,8 @@ struct Gen {
     loops: [Loop] = [],
     exit_label: int = 0,
     crt: bool = false,
+    captured: [str] = [],         // names closures in this function use (their `var`s get boxed)
+    lambdas: int = 0,
 
     fn fail(self, e: Tree, msg: str) {
         if self.err == "" {
@@ -1074,6 +1150,37 @@ struct Gen {
             k -= 1
         }
         return none
+    }
+
+    // a variable's value into rd, or rs into it (through its box when a closure shares it)
+    fn read_var(self, l: Local, rd: int) {
+        self.load_slot(rd, l.slot)
+        if l.boxed { self.a.ld(rd, rd, 0) }
+    }
+    fn write_var(self, l: Local, rs: int) {
+        if l.boxed {
+            self.load_slot(rv.T1, l.slot)
+            self.a.sd(rs, rv.T1, 0)
+        } else {
+            self.store_slot(rs, l.slot)
+        }
+    }
+
+    // a new variable holding a0
+    fn bind(self, e: Tree, name: str, ty: str, mutable: bool) {
+        let slot = self.declare(e, name, ty, mutable)
+        if mutable && self.captured.contains(name) {
+            let top = self.scopes[self.scopes.len() - 1]
+            top[name] = Local { slot, ty, mutable, boxed: true }
+            let a = self.a
+            a.push(rv.A0)
+            a.li(rv.A0, 8)
+            a.push(rv.A0)
+            self.rt("__alloc", 1)
+            a.pop(rv.T0)
+            a.sd(rv.T0, rv.A0, 0)
+        }
+        self.store_slot(rv.A0, slot)
     }
 
     fn slot_off(self, slot: int) -> int { return -8 * (slot + 1) }
@@ -1125,6 +1232,12 @@ struct Gen {
 
     fn known_type(self, e: Tree, ty: str) {
         if ty == "int" || ty == "bool" || ty == "str" || ty == "float" || ty == "?" { return }
+        if ty.starts_with("fn(") {
+            for p in fn_params(ty) { self.known_type(e, p) }
+            let r = fn_ret(ty)
+            if r != "void" { self.known_type(e, r) }
+            return
+        }
         if ty.starts_with("[") {
             self.known_type(e, elem(ty))
             return
@@ -1265,6 +1378,7 @@ struct Gen {
     fn function(self, f: FnDecl) {
         let a = self.a
         self.begin_function(f.ret, f.crt)
+        self.captured = names_in_lambdas(f.body)
         a.addi(rv.SP, rv.SP, -16)
         a.sd(rv.RA, rv.SP, 8)
         a.sd(rv.FP, rv.SP, 0)
@@ -1306,8 +1420,7 @@ struct Gen {
             let ty = self.expr(st.kids[0], st.s2)
             if ty == "void" { self.fail(st.kids[0], "this has no value to put in `${st.s}`") }
             if st.s2 != "" { self.check(st.kids[0], ty, st.s2, "`${st.s}`") }
-            let slot = self.declare(st, st.s, if st.s2 != "" { st.s2 } else { ty }, st.n == 1)
-            self.store_slot(rv.A0, slot)
+            self.bind(st, st.s, if st.s2 != "" { st.s2 } else { ty }, st.n == 1)
         } else if k == "expr" {
             self.expr(st.kids[0], "")
         } else if k == "assign" {
@@ -1412,6 +1525,16 @@ struct Gen {
             let l = self.loops[self.loops.len() - 1]
             a.jump(if k == "break" { l.brk } else { l.cont })
         } else if k == "return" {
+            if self.ret == "?" {
+                // a lambda whose type comes from its first return
+                if st.kids.is_empty() {
+                    self.ret = "void"
+                } else {
+                    self.ret = self.expr(st.kids[0], "")
+                }
+                a.jump(self.exit_label)
+                return
+            }
             if st.kids.is_empty() {
                 if self.ret != "void" { self.fail(st, "this function returns ${self.ret}: `return` needs a value") }
             } else {
@@ -1508,9 +1631,9 @@ struct Gen {
                     let ty = self.expr(value, l.ty)
                     self.check(value, ty, l.ty, "`${target.s}`")
                 } else {
-                    self.compound(st, l.ty, () => self.load_slot(rv.A0, l.slot))
+                    self.compound(st, l.ty, () => self.read_var(l, rv.A0))
                 }
-                self.store_slot(rv.A0, l.slot)
+                self.write_var(l, rv.A0)
                 return
             }
             if self.globals.contains(target.s) {
@@ -1745,6 +1868,7 @@ struct Gen {
             return want
         }
         if k == "matchx" { return self.match_(e, true, want) }
+        if k == "lambda" { return self.lambda(e, want) }
         if k == "field" {
             let ot = self.expr(e.kids[0], "")
             if (ot == "str" || ot.starts_with("[")) && e.s == "len" {
@@ -1819,7 +1943,7 @@ struct Gen {
     fn name(self, e: Tree) -> str {
         let a = self.a
         if let l = self.lookup(e.s) {
-            self.load_slot(rv.A0, l.slot)
+            self.read_var(l, rv.A0)
             return l.ty
         }
         if self.globals.contains(e.s) {
@@ -1829,8 +1953,15 @@ struct Gen {
             a.ld(rv.A0, rv.T0, 0)
             return g.ty
         }
-        if self.funcs.contains(e.s) {
-            self.fail(e, "`${e.s}` is a function: call it with ()")
+        if self.funcs.contains(e.s) && !e.s.starts_with("__") {
+            // a function as a value: a closure with nothing captured
+            let f = self.funcs[e.s]
+            a.li(rv.A0, 8)
+            a.push(rv.A0)
+            self.rt("__alloc", 1)
+            a.addr_fn(rv.T0, "f_" + e.s)
+            a.sd(rv.T0, rv.A0, 0)
+            return "fn(" + f.params.map(p => p.ty).join(",") + ")->" + f.ret
         } else {
             self.fail(e, "no variable called `${e.s}`")
         }
@@ -2020,6 +2151,9 @@ struct Gen {
         else if ty == "[float]" { self.rt("__l_float_str", 1) } else if ty == "bool" { self.rt("__bool_str", 1) } else if ty == "[int]" { self.rt("__l_int_str", 1) } else if ty == "[str]" { self.rt("__l_str_str", 1) } else if ty == "[bool]" { self.rt("__l_bool_str", 1) } else if ty == "void" {
             self.fail(e, "this has no value to show")
             a.pop(rv.A0)
+        } else if ty.starts_with("fn(") {
+            a.pop(rv.A0)
+            a.addr_data(rv.A0, self.str_lit("<fn>"))
         } else if self.enums.contains(ty) {
             // its variant's name
             a.pop(rv.T0)
@@ -2097,7 +2231,19 @@ struct Gen {
             }
             return name
         }
-        if self.lookup(name) != none { self.fail(e, "`${name}` is a variable, not a function") }
+        if let l = self.lookup(name) {
+            if l.ty.starts_with("fn(") {
+                return self.call_value(e, l.ty, 0, () => self.read_var(l, rv.A0))
+            }
+            self.fail(e, "`${name}` is a variable, not a function")
+        }
+        if self.globals.contains(name) && self.globals[name].ty.starts_with("fn(") {
+            let g = self.globals[name]
+            return self.call_value(e, g.ty, 0, () => {
+                a.addr_var(rv.T0, g.off)
+                a.ld(rv.A0, rv.T0, 0)
+            })
+        }
         if !self.funcs.contains(name) {
             if self.structs.contains(name) {
                 self.fail(e, "to make a ${name}, write ${name} { field: value, ... }")
@@ -2167,6 +2313,18 @@ struct Gen {
         if name == "__float" {
             self.expr(e.kids[0], "")
             return some("float")
+        }
+        if name == "__call1" {
+            // __call1(f, x): call a closure with one argument
+            self.expr(e.kids[0], "")
+            a.push(rv.A0)
+            self.expr(e.kids[1], "")
+            a.push(rv.A0)
+            a.ld(rv.T0, rv.SP, 8)
+            a.ld(rv.T0, rv.T0, 0)
+            a.jalr(rv.T0)
+            a.addi(rv.SP, rv.SP, 16)
+            return some("int")
         }
         if name == "__copy" {
             // __copy(dst, src, n): bytes, front to back
@@ -2313,6 +2471,24 @@ struct Gen {
                 self.rt("__l_${name}_${kind}", 2)
                 return if name == "contains" { "bool" } else { "int" }
             }
+            if (name == "map" || name == "filter" || name == "any" || name == "all" || name == "count") && argc == 1 && e.kids[1].k != "str" {
+                let want_f = if name == "map" { "fn(${et})->?" } else { "fn(${et})->bool" }
+                let ft = self.expr(e.kids[1], want_f)
+                if !ft.starts_with("fn(") || fn_params(ft).len() != 1 {
+                    self.fail(e.kids[1], "${name} takes a function of one ${et}, like x => ...")
+                    return "?"
+                }
+                self.check(e.kids[1], fn_params(ft)[0], et, name)
+                let r = fn_ret(ft)
+                if name != "map" { self.check(e.kids[1], r, "bool", name) }
+                if name == "map" && r == "void" { self.fail(e.kids[1], "map's function gives no value") }
+                a.push(rv.A0)
+                self.rt("__l_" + name, 2)
+                if name == "map" { return "[${r}]" }
+                if name == "filter" { return ot }
+                if name == "count" { return "int" }
+                return "bool"
+            }
             if (name == "reverse" || name == "clear") && argc == 0 {
                 self.rt("__l_" + name, 1)
                 return "void"
@@ -2348,6 +2524,12 @@ struct Gen {
             return "?"
         }
         let key = "${ot}.${name}"
+        if !self.funcs.contains(key) && self.field_type(ot, name).starts_with("fn(") {
+            // a field holding a function: call it
+            let off = self.field_offset(e, ot, name)
+            a.ld(rv.A0, rv.A0, off)
+            return self.call_value(e, self.field_type(ot, name), 1, () => {})
+        }
         if !self.funcs.contains(key) {
             self.fail(e, "${ot} has no method `${name}`")
             return "?"
@@ -2358,6 +2540,131 @@ struct Gen {
         self.a.call("m_${ot}_${name}")
         a.addi(rv.SP, rv.SP, 8 * f.params.len())
         return f.ret
+    }
+
+    // Call a function value (a closure): `load` puts it in a0. Its arguments are e.kids[first..].
+    // The closure goes on the stack first, then the arguments: a plain function ignores it.
+    fn call_value(self, e: Tree, ty: str, first: int, load: fn()) -> str {
+        let a = self.a
+        load()
+        a.push(rv.A0)
+        let ps = fn_params(ty)
+        let n = ps.len()
+        if e.kids.len() - first != n {
+            self.fail(e, "this function takes ${n} argument${if n == 1 { "" } else { "s" }}, given ${e.kids.len() - first}")
+            return "?"
+        }
+        for k in 0..n {
+            let x = e.kids[k + first]
+            let t = self.expr(x, ps[k])
+            self.check(x, t, ps[k], "argument ${k + 1}")
+            a.push(rv.A0)
+        }
+        a.ld(rv.T0, rv.SP, 8 * n)
+        a.ld(rv.T0, rv.T0, 0)
+        a.jalr(rv.T0)
+        a.addi(rv.SP, rv.SP, 8 * (n + 1))
+        return fn_ret(ty)
+    }
+
+    // A lambda: its code right here (jumped over), and a closure object holding what it uses from
+    // around it: the value of a `let` or a parameter, the box of a `var` (so both sides share it).
+    fn lambda(self, e: Tree, want: str) -> str {
+        let a = self.a
+        var wp: [str] = []
+        if want.starts_with("fn(") { wp = fn_params(want) }
+        let wr = if want.starts_with("fn(") { fn_ret(want) } else { "?" }
+        let body = e.kids[e.kids.len() - 1]
+        var ptypes: [str] = []
+        for k in 0..e.kids.len() - 1 {
+            let prm = e.kids[k]
+            if prm.s2 != "" {
+                self.known_type(prm, prm.s2)
+                ptypes.push(prm.s2)
+            } else if k < wp.len() {
+                ptypes.push(wp[k])
+            } else {
+                self.fail(prm, "give `${prm.s}` a type: (${prm.s}: int) => ...")
+                ptypes.push("?")
+            }
+        }
+        // what it captures: the locals around it that it names
+        var caps: [str] = []
+        for nm in names_in(body) {
+            if !caps.contains(nm) && self.lookup(nm) != none && e.kids.slice(0, e.kids.len() - 1).find(p => p.s == nm) == none {
+                caps.push(nm)
+            }
+        }
+        a.li(rv.A0, 8 * (1 + caps.len()))
+        a.push(rv.A0)
+        self.rt("__alloc", 1)
+        a.push(rv.A0)
+        self.lambdas += 1
+        let label = "l_${self.lambdas}"
+        a.addr_fn(rv.T0, label)
+        a.sd(rv.T0, rv.A0, 0)
+        for k, nm in caps {
+            let l = self.lookup(nm).unwrap()
+            self.load_slot(rv.T0, l.slot)          // the value, or the box
+            a.ld(rv.T1, rv.SP, 0)
+            a.sd(rv.T0, rv.T1, 8 * (k + 1))
+        }
+        // the code
+        let over = a.label()
+        a.jump(over)
+        self.offsets[label] = a.here()
+        let saved_scopes = self.scopes
+        let saved_slots = self.slots
+        let saved_ret = self.ret
+        let saved_loops = self.loops
+        let saved_exit = self.exit_label
+        let saved_captured = self.captured
+        let outer: [Local] = caps.map(nm => self.lookup(nm).unwrap())
+        self.begin_function(wr, self.crt)
+        self.captured = names_in_lambdas(body)
+        a.addi(rv.SP, rv.SP, -16)
+        a.sd(rv.RA, rv.SP, 8)
+        a.sd(rv.FP, rv.SP, 0)
+        a.mv(rv.FP, rv.SP)
+        let patch = a.here()
+        a.emit(0)
+        a.emit(0)
+        a.sub(rv.SP, rv.SP, rv.T0)
+        let n = ptypes.len()
+        for k in 0..n {
+            let slot = self.declare(e.kids[k], e.kids[k].s, ptypes[k], false)
+            a.ld(rv.T0, rv.FP, 16 + 8 * (n - 1 - k))
+            self.store_slot(rv.T0, slot)
+        }
+        a.ld(rv.T1, rv.FP, 16 + 8 * n)               // the closure
+        for k, nm in caps {
+            let o = outer[k]
+            let slot = self.declare(e, nm, o.ty, o.mutable)
+            let top = self.scopes[self.scopes.len() - 1]
+            top[nm] = Local { slot, ty: o.ty, mutable: o.mutable && o.boxed, boxed: o.boxed }
+            a.ld(rv.T0, rv.T1, 8 * (k + 1))
+            self.store_slot(rv.T0, slot)
+        }
+        var ret = self.ret
+        if body.k == "block" {
+            self.block(body)
+            ret = if self.ret == "?" { "void" } else { self.ret }
+            if ret != "void" && !returns(body) { self.die(e, "a function ended without returning a value") }
+        } else {
+            ret = self.expr(body, if wr == "?" { "" } else { wr })
+            if wr != "?" && wr != "void" { self.check(body, ret, wr, "the function's value") }
+            if wr == "void" { ret = "void" }
+        }
+        self.end_function(patch)
+        self.scopes = saved_scopes
+        self.slots = saved_slots
+        self.ret = saved_ret
+        self.loops = saved_loops
+        self.exit_label = saved_exit
+        self.captured = saved_captured
+        a.place(over)
+        a.pop(rv.A0)
+        return "fn(" + ptypes.join(",") + ")->" + ret
     }
 
     fn int_arg(self, e: Tree, k: int, what: str) {
@@ -2412,6 +2719,70 @@ fn float_bits(x: float) -> int {
         return sign | int(v * 4503599627370496.0)
     }
     return sign | (e + 1023) << 52 | int((v - 1.0) * 4503599627370496.0)
+}
+
+// the parts of "fn(int,[str])->bool"
+fn fn_params(ty: str) -> [str] {
+    var out: [str] = []
+    if !ty.starts_with("fn(") { return out }
+    var depth = 0
+    var start = 3
+    var i = 3
+    while i < ty.len() {
+        let c = ty[i]
+        if c == "(" || c == "[" { depth += 1 }
+        if c == ")" || c == "]" {
+            if depth == 0 {
+                if i > start { out.push(ty.slice(start, i)) }
+                return out
+            }
+            depth -= 1
+        }
+        if c == "," && depth == 0 {
+            out.push(ty.slice(start, i))
+            start = i + 1
+        }
+        i += 1
+    }
+    return out
+}
+
+fn fn_ret(ty: str) -> str {
+    var depth = 0
+    var i = 3
+    while i < ty.len() {
+        let c = ty[i]
+        if c == "(" || c == "[" { depth += 1 }
+        if c == ")" || c == "]" {
+            if depth == 0 { return ty.slice(i + 3, ty.len()) }
+            depth -= 1
+        }
+        i += 1
+    }
+    return "?"
+}
+
+// every name a tree mentions
+fn names_in(t: Tree) -> [str] {
+    var out: [str] = []
+    collect_names(t, out, false)
+    return out
+}
+
+// the names mentioned inside the lambdas in a tree
+fn names_in_lambdas(t: Tree) -> [str] {
+    var out: [str] = []
+    collect_names(t, out, true)
+    return out
+}
+
+fn collect_names(t: Tree, out: [str], only_lambdas: bool) {
+    if t.k == "lambda" && only_lambdas {
+        collect_names(t, out, false)
+        return
+    }
+    if !only_lambdas && (t.k == "name" || t.k == "call") && !out.contains(t.s) { out.push(t.s) }
+    for k in t.kids { collect_names(k, out, only_lambdas) }
 }
 
 fn elem(ty: str) -> str {

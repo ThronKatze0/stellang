@@ -529,9 +529,11 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
     methods, `enum`s of plain variants (`Light.Red`, `.Red`; `match` on them must cover every one),
     `const`/`let`/`var`, `int`/`float`/`bool`/`str` and lists (`[int]`, `[[str]]`, `[Point]`), `if`/`else` and
     `match` (also as values), `while`, `for x in list`, `for i, x in list`, `for i in a..b`, `break`/`continue`,
+    closures (`x => x * k`, `(a: int, b: int) => { ... }`, `fn(int) -> bool` types; they share the `var`s they
+    use, like stellang's), functions as values, `map filter any all count` on lists,
     string interpolation, the string and list methods (`len slice find contains split lines chars upper lower
     trim replace repeat`; `push pop insert remove slice contains index_of sort reverse join sum`; floats'
-    `sqrt floor ceil round abs`, `int(x)` and `float(x)`). Not yet: `T?`/`T!`, enums that carry values, closures, generics, imports. Every index is checked, division by zero is caught,
+    `sqrt floor ceil round abs`, `int(x)` and `float(x)`). Not yet: `T?`/`T!`, enums that carry values, generics, imports. Every index is checked, division by zero is caught,
     runtime errors name their line, and memory is garbage-collected (a mark-and-sweep collector, also written
     in the language).
   - **Built in**: `print println input read_line sleep now_ms random exit max min abs parse_int parse_float
@@ -629,7 +631,7 @@ fn main() {
   is `src/runtime_klibc.c`; the fonts are pre-rendered glyphs (`tools/genfont.py`); nothing else is linked.
 - The embedded userland (`userland.st`: the programs' runtime and the examples) is made from
   `examples/stellaos/userland/` by `tools/genuserland.py`.
-- Next: images (PNG, JPEG), closures and options in the compiler, more harts.
+- Next: images (PNG, JPEG), options and enums with values in the compiler, more harts.
 
 ## Editor support
 
