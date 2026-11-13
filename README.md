@@ -6,7 +6,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ThronKatze0/stellang/actions/workflows/ci.yml"><img src="https://github.com/ThronKatze0/stellang/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <img src="https://img.shields.io/badge/frontend-Rust-orange?logo=rust" alt="Rust">
   <img src="https://img.shields.io/badge/backend-LLVM-262D3A?logo=llvm" alt="LLVM">
   <img src="https://img.shields.io/badge/memory-Boehm%20GC-7b5cff" alt="GC">
@@ -282,9 +281,8 @@ fails if the copies in `editors/` go stale.
 
   or with no plugin manager: `vim.opt.rtp:append("~/src/stellang/editors/nvim")`.
 - **VS Code**: run `editors/vscode/install.sh` (builds the compiler, packages the extension with it inside, and installs
-  it with `code`; pass `codium` or `cursor` for those). Or install a `.vsix` (Extensions → `…` → *Install from VSIX…*). The platform builds from CI
-  (`vscode extension` workflow, attached to `v*` releases) include the compiler, so that's all you need for the
-  editor features. Or build it: `cd editors/vscode && npm install && npm run package`. Besides the server features
+  it with `code`; pass `codium` or `cursor` for those). Or build a `.vsix` to share (`cd editors/vscode && npm install && npm run package`; it includes the
+  compiler) and install it from Extensions → `…` → *Install from VSIX…*. Besides the server features
   it adds Run (`Ctrl+F5`, ▶ in the title bar, `▶ Run | Build` above `main`), build/check tasks with a problem
   matcher, snippets, a file icon and Markdown code-block highlighting. See [editors/vscode](editors/vscode/README.md).
 - **Anything else** with LSP support: run `stellang lsp` for `*.st` files.

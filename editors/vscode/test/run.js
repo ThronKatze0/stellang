@@ -1,5 +1,5 @@
 // Downloads VS Code, starts it with this extension on the repo's examples/, runs test/suite.js.
-// `npm test` (needs a display: use xvfb-run on Linux CI).
+// `npm test` (needs a display; on a headless Linux box: `xvfb-run -a npm test`).
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
