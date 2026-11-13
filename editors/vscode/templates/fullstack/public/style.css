@@ -1,0 +1,26 @@
+:root { --bg: #0c0f22; --panel: #151a36; --text: #e8e9f3; --dim: #8a8fb3; --gold: #ffd166; --pink: #ff79c6; --line: #262c55; }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; background: radial-gradient(1200px 600px at 50% -200px, #1d2350, var(--bg)); color: var(--text); font: 16px/1.5 system-ui, sans-serif; }
+.app { max-width: 560px; margin: 0 auto; padding: 48px 16px; }
+h1 { margin: 0; font-size: 40px; letter-spacing: -0.02em; color: var(--gold); }
+.sub { margin: 4px 0 24px; color: var(--dim); }
+form.new { display: flex; gap: 8px; }
+form.new input { flex: 1; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font: inherit; }
+form.new input:focus { outline: 2px solid var(--pink); outline-offset: -1px; }
+button { padding: 10px 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font: inherit; cursor: pointer; }
+button:disabled { opacity: 0.4; cursor: default; }
+form.new button { background: var(--gold); color: #1b1600; border: 0; font-weight: 600; }
+.list { list-style: none; margin: 20px 0; padding: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+.list li { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-top: 1px solid var(--line); }
+.list li:first-child { border-top: 0; }
+.list label { display: flex; gap: 10px; align-items: center; cursor: pointer; }
+.list input { width: 18px; height: 18px; accent-color: var(--pink); }
+.list li.done span { color: var(--dim); text-decoration: line-through; }
+.list .remove { border: 0; background: none; color: var(--dim); font-size: 20px; padding: 0 6px; }
+.list .remove:hover { color: var(--pink); }
+.list .empty { color: var(--dim); justify-content: center; }
+footer { display: flex; gap: 12px; align-items: center; color: var(--dim); font-size: 14px; }
+footer nav { display: flex; gap: 4px; margin-left: auto; }
+footer nav button { padding: 4px 10px; font-size: 14px; }
+footer nav button.on { border-color: var(--gold); color: var(--gold); }
+.saving { min-width: 60px; text-align: right; }

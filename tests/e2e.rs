@@ -737,6 +737,250 @@ fn main() -> void! {
     assert_eq!(left, "bob left");
 }
 
+#[test]
+fn generics_and_traits() {
+    let src = r##"
+trait Show {
+    fn show(self) -> str
+    fn loud(self) -> str { return self.show().upper() + "!" }
+}
+
+struct Point { x: int, y: int }
+impl Show for Point {
+    fn show(self) -> str { return "(${self.x}, ${self.y})" }
+}
+impl Show for int {
+    fn show(self) -> str { return "#${self}" }
+}
+
+struct Box<T> {
+    value: T
+
+    fn get(self) -> T { return self.value }
+    fn map<U>(self, f: fn(T) -> U) -> Box<U> { return Box { value: f(self.value) } }
+}
+
+struct Stack<T> {
+    items: [T] = []
+
+    fn new() -> Stack<T> { return Stack {} }
+    fn push(self, x: T) { self.items.push(x) }
+    fn pop(self) -> T? { return self.items.pop() }
+    fn len(self) -> int { return self.items.len() }
+}
+
+enum Tree<T> {
+    Leaf
+    Node(Tree<T>, T, Tree<T>)
+
+    fn size(self) -> int {
+        return match self {
+            .Leaf => 0,
+            .Node(l, _, r) => l.size() + 1 + r.size()
+        }
+    }
+}
+
+fn insert<T>(t: Tree<T>, x: T, less: fn(T, T) -> bool) -> Tree<T> {
+    return match t {
+        .Leaf => Tree.Node(.Leaf, x, .Leaf),
+        .Node(l, v, r) => if less(x, v) { Tree.Node(insert(l, x, less), v, r) } else { Tree.Node(l, v, insert(r, x, less)) }
+    }
+}
+
+fn walk<T>(t: Tree<T>, out: [T]) {
+    if let .Node(l, v, r) = t {
+        walk(l, out)
+        out.push(v)
+        walk(r, out)
+    }
+}
+
+fn first<T>(xs: [T]) -> T? {
+    if xs.is_empty() { return none }
+    return xs[0]
+}
+
+fn largest<T>(xs: [T]) -> T {
+    var best = xs[0]
+    for x in xs { if x > best { best = x } }
+    return best
+}
+
+fn all_shown<T: Show>(xs: [T]) -> str {
+    return xs.map(x => x.show()).join(" ")
+}
+
+fn pair<A, B>(a: A, b: B) -> Pair<A, B> { return Pair { a, b } }
+struct Pair<A, B> { a: A, b: B }
+
+fn main() {
+    let b = Box { value: 41 }
+    println(b.get() + 1)
+    let s = b.map(x => "n=${x}")
+    println(s.value)
+    let st: Stack<str> = Stack.new()
+    st.push("a")
+    st.push("b")
+    println(st.len())
+    println(st.pop() ?? "?")
+    var t: Tree<int> = .Leaf
+    for x in [5, 2, 8, 1, 9] { t = insert(t, x, (a, b) => a < b) }
+    println(t.size())
+    let out: [int] = []
+    walk(t, out)
+    println(out)
+    println(first(["x", "y"]) ?? "none")
+    println(largest([3.5, 9.25, 1.0]))
+    println(largest(["pear", "apple"]))
+    println(all_shown([Point { x: 1, y: 2 }, Point { x: 3, y: 4 }]))
+    println(all_shown([1, 2]))
+    println(Point { x: 0, y: 0 }.loud())
+    let p = pair(1, "one")
+    println(p)
+    println(b)
+}
+"##;
+    ok("generics", src, "42\nn=41\n2\nb\n5\n[1, 2, 5, 8, 9]\nx\n9.25\npear\n(1, 2) (3, 4)\n#1 #2\n(0, 0)!\nPair { a: 1, b: \"one\" }\nBox { value: 41 }\n");
+    let bad = |src: &str, msg: &str| {
+        let (code, _, err) = run("generics-bad", src);
+        assert_eq!(code, -1);
+        assert!(err.contains(msg), "{err}");
+    };
+    bad("trait Show { fn show(self) -> str }\nfn f<T: Show>(x: T) -> str { return x.show() }\nfn main() { println(f(1.5)) }", "float doesn't implement `Show`");
+    bad("struct Stack<T> { items: [T] = []\n fn new() -> Stack<T> { return Stack {} } }\nfn main() { let s = Stack.new() }", "can't tell what `T` is");
+    bad("struct Box<T> { v: T }\nfn main() { let b: Box = Box { v: 1 } }", "`Box` needs type arguments");
+    bad("fn bad<T>(x: T) -> T { return x.nope() }\nfn main() { bad(1) }", "(in `bad<int>`)");
+    bad("trait Show { fn show(self) -> str }\nstruct P {}\nimpl Show for P { }\nfn main() {}", "missing `fn show`");
+}
+
+#[test]
+fn jsx_server_rendering() {
+    let src = r##"
+struct Todo { id: int, title: str, done: bool = false }
+
+struct CardProps { title: str, footer: str = "the end", children: Node }
+
+fn Card(p: CardProps) -> Node {
+    return <section class="card">
+        <h2>{p.title}</h2>
+        {p.children}
+        <footer>{p.footer}</footer>
+    </section>
+}
+
+fn Badge(n: int, label: str?) -> Node {
+    return <span class="badge" title={label}>{n}</span>
+}
+
+fn TodoList(todos: [Todo]) -> Node {
+    return <ul>
+        for t in todos {
+            <li key={t.id} class={if t.done { "done" } else { "open" }}>
+                <input type="checkbox" checked={t.done} onclick={() => println("x")} />
+                " ${t.title}"
+            </li>
+        }
+        if todos.is_empty() { <li>"nothing to do"</li> }
+    </ul>
+}
+
+fn main() {
+    let todos = [Todo { id: 1, title: "write <jsx>" }, Todo { id: 2, title: "ship it", done: true }]
+    let page = <>
+        <Card title="Todos & more">
+            <TodoList todos={todos} />
+            <Badge n={todos.len()} />
+            <Badge n={7} label="seven" />
+        </Card>
+        {todos.map(t => <i>{t.title}</i>)}
+    </>
+    println(page)
+}
+"##;
+    let want = "<section class=\"card\"><h2>Todos &amp; more</h2><ul><li data-key=\"1\" class=\"open\"><input type=\"checkbox\"> write &lt;jsx&gt;</li><li data-key=\"2\" class=\"done\"><input type=\"checkbox\" checked> ship it</li></ul><span class=\"badge\">2</span><span class=\"badge\" title=\"seven\">7</span><footer>the end</footer></section><i>write &lt;jsx&gt;</i><i>ship it</i>\n";
+    ok("jsx", src, want);
+    let bad = |src: &str, msg: &str| {
+        let (code, _, err) = run("jsx-bad", src);
+        assert_eq!(code, -1);
+        assert!(err.contains(msg), "{err}");
+    };
+    bad("fn main() { let x = <div><p>\"a\"</div> }", "`</div>` doesn't close `<p>`");
+    bad("fn main() { let x = <input>\"a\"</input> }", "<input> can't have children");
+    bad("fn Card(title: str) -> Node { return <b>{title}</b> }\nfn main() { let x = <Card titel=\"a\" /> }", "<Card> has no prop `titel`");
+    bad("fn Card(title: str) -> Node { return <b>{title}</b> }\nfn main() { let x = <Card /> }", "<Card> needs `title`");
+    bad("fn main() { let x = <button onclick={() => 1}>\"a\"</button>\n let y = <b onclick={(a: int) => println(a)} /> }", "an event handler is a fn() or a fn(str)");
+}
+
+#[test]
+fn from_json_decodes_types() {
+    let src = r##"
+import json
+
+enum Shape { Circle(float), Rect { w: float, h: float }, Pair(int, str), Empty }
+enum Color { Red, Green }
+struct Todo { id: int, title: str, done: bool = false, tags: [str] = [], note: str? }
+struct Data { todos: [Todo], counts: {str: int}, byid: {int: str}, shapes: [Shape], color: Color, ids: {int} }
+
+fn main() -> void! {
+    let d = Data {
+        todos: [Todo { id: 1, title: "a", tags: ["x"] }, Todo { id: 2, title: "b \"q\"", done: true, note: "n" }],
+        counts: {"a": 1}, byid: {7: "seven"}, shapes: [Shape.Circle(2.5), Shape.Rect { w: 1.0, h: 2.0 }, Shape.Pair(3, "p"), Shape.Empty],
+        color: .Green, ids: {1, 2}
+    }
+    let text = to_json(d)
+    println(text)
+    let back: Data = from_json(text)?
+    println(to_json(back) == text)
+    let t: Todo = from_json("{\"id\": 5, \"title\": \"partial\"}")?
+    println(t)
+    let xs: [int] = from_json("[1, 2, 3]")?
+    println(xs)
+    let bad: Todo = from_json("{\"id\": 5}") catch (Todo { id: 0, title: "fallback" })
+    println(bad.title)
+    let ys: [int] = from_json("[1, \"x\"]") catch m {
+        println(m)
+        [0]
+    }
+    println(ys)
+    let r: [int]! = from_json("{oops")
+    if let err(m) = r { println(m) }
+}
+"##;
+    let (code, out, err) = run("fromjson", src);
+    assert_eq!(code, 0, "{err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[1], "true");
+    assert_eq!(lines[2], "Todo { id: 5, title: \"partial\", done: false, tags: [], note: none }");
+    assert_eq!(lines[3..].join("\n"), "[1, 2, 3]\nfallback\nfrom_json: expected a number\n[0]\nbad JSON at 1: expected `\"`, found `o`");
+}
+
+/// `--web` builds a WebAssembly module and its loader (when this machine has the WASI libc).
+#[test]
+fn web_build() {
+    let dir = tmpdir("web");
+    let file = dir.join("app.st");
+    fs::write(&file, "import web\n\nfn App() -> Node {\n    let n = signal(0)\n    return <button onclick={() => n.set(n.get() + 1)}>\"clicked ${n.get()}\"</button>\n}\n\nfn main() {\n    web.mount(\"#app\", () => <App />)\n}\n").unwrap();
+    let out = Command::new(BIN).arg("--web").arg(&file).arg("-o").arg(dir.join("dist/app")).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() && err.contains("WASI") {
+        eprintln!("skipping: no WASI libc here");
+        return;
+    }
+    assert!(out.status.success(), "{err}");
+    let wasm = fs::read(dir.join("dist/app.wasm")).unwrap();
+    assert_eq!(&wasm[..4], b"\0asm");
+    assert!(fs::read_to_string(dir.join("dist/app.js")).unwrap().contains("st_dispatch"));
+    assert!(fs::read_to_string(dir.join("dist/app.html")).unwrap().contains("<script src=\"app.js\">"));
+    // the same app natively: mount renders once to stdout (handlers aren't rendered on the server)
+    let (code, html, _) = run("web-native", &fs::read_to_string(&file).unwrap());
+    assert_eq!((code, html.as_str()), (0, "<button>clicked 0</button>\n"));
+    // server-only modules are refused
+    fs::write(&file, "import http\nfn main() {}\n").unwrap();
+    let out = Command::new(BIN).arg("--web").arg(&file).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("`import http` only works on the server"));
+}
+
 /// The editor grammars are generated from the compiler's keyword table; the copies in `editors/`
 /// must match (regenerate with `stellang grammar textmate|vim`).
 #[test]
@@ -784,6 +1028,25 @@ fn language_server() {
     let hover_let = recv();
     send(format!(r#"{{"jsonrpc":"2.0","id":4,"method":"textDocument/semanticTokens/full","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#));
     let tokens = recv();
+    // completion works on code that doesn't parse yet: `.` after a value, and a `.Variant` shorthand
+    let change = |version: u32, text: &str| {
+        let t = text.replace('\n', "\\n").replace('"', "\\\"");
+        format!(r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"{uri}","version":{version}}},"contentChanges":[{{"text":"{t}"}}]}}}}"#)
+    };
+    send(change(2, &src.replace("    println(nope)\n", "    let t: Shape = .\n")));
+    recv(); // diagnostics
+    send(format!(r#"{{"jsonrpc":"2.0","id":6,"method":"textDocument/completion","params":{{"textDocument":{{"uri":"{uri}"}},"position":{{"line":10,"character":20}}}}}}"#));
+    let variants = recv();
+    send(change(3, &src.replace("    println(nope)\n", "    s.\n")));
+    recv();
+    send(format!(r#"{{"jsonrpc":"2.0","id":7,"method":"textDocument/completion","params":{{"textDocument":{{"uri":"{uri}"}},"position":{{"line":10,"character":6}}}}}}"#));
+    let members = recv();
+    // a quick fix for a misspelled name
+    send(change(4, &src.replace("println(nope)", "println(aera(s))")));
+    let tdiags = recv();
+    let diag = tdiags.split(r#""diagnostics":["#).nth(1).unwrap_or("").trim_end_matches("]}}").to_string();
+    send(format!(r#"{{"jsonrpc":"2.0","id":8,"method":"textDocument/codeAction","params":{{"textDocument":{{"uri":"{uri}"}},"range":{{"start":{{"line":10,"character":0}},"end":{{"line":10,"character":0}}}},"context":{{"diagnostics":[{diag}]}}}}}}"#));
+    let fixes = recv();
     send(r#"{"jsonrpc":"2.0","id":5,"method":"shutdown"}"#.into());
     recv();
     send(r#"{"jsonrpc":"2.0","method":"exit"}"#.into());
@@ -793,4 +1056,7 @@ fn language_server() {
     assert!(hover.contains("fn area(s: Shape) -> float") && hover.contains("How big it is."), "{hover}");
     assert!(hover_let.contains("let s: Shape"), "{hover_let}");
     assert!(tokens.contains(r#""data":["#) && tokens.len() > 100, "{tokens}");
+    assert!(variants.contains(r#""label":"Circle""#) && variants.contains(r#""label":"Empty""#) && !variants.contains(r#""label":"area""#), "{variants}");
+    assert!(members.contains(r#""label":"match""#) && members.contains("match s {"), "{members}");
+    assert!(fixes.contains("Change to `area`"), "{fixes}");
 }

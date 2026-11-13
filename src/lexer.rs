@@ -3,7 +3,7 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     // keywords
-    Fn, Struct, Enum, Const, Impl, Extern, Import, Let, Var, If, Else, While, For, In, Return, Break, Continue, Match, Catch,
+    Fn, Struct, Enum, Trait, Const, Impl, Extern, Import, Let, Var, If, Else, While, For, In, Return, Break, Continue, Match, Catch,
     Star, // ⭐ (emoji twin of `{` and `}`; the parser knows which)
     Ident(String), Int(i64), Float(f64), Str(String),
     Interp(Vec<Part>), // a string with `${...}` in it
@@ -38,8 +38,8 @@ pub struct Token {
 
 pub type Error = (Pos, String);
 
-pub const WORDS: [(&str, Tok); 19] = [
-    ("fn", Tok::Fn), ("struct", Tok::Struct), ("enum", Tok::Enum), ("const", Tok::Const), ("impl", Tok::Impl), ("extern", Tok::Extern),
+pub const WORDS: [(&str, Tok); 20] = [
+    ("fn", Tok::Fn), ("struct", Tok::Struct), ("enum", Tok::Enum), ("trait", Tok::Trait), ("const", Tok::Const), ("impl", Tok::Impl), ("extern", Tok::Extern),
     ("import", Tok::Import), ("let", Tok::Let), ("var", Tok::Var), ("if", Tok::If), ("else", Tok::Else),
     ("while", Tok::While), ("for", Tok::For), ("in", Tok::In), ("return", Tok::Return),
     ("break", Tok::Break), ("continue", Tok::Continue), ("match", Tok::Match), ("catch", Tok::Catch),

@@ -13,25 +13,22 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
+mod complete;
+use complete::Model;
+
 const TOKEN_TYPES: &[&str] = &[
     "keyword", "string", "number", "operator", "function", "method", "type", "enum", "enumMember", "struct",
-    "variable", "parameter", "property", "comment", "namespace",
+    "variable", "parameter", "property", "comment", "namespace", "class", "typeParameter", "interface",
 ];
-const TOKEN_MODIFIERS: &[&str] = &["declaration", "defaultLibrary"];
+const TOKEN_MODIFIERS: &[&str] = &["declaration", "defaultLibrary", "readonly", "mutable", "static"];
+
+fn tm(names: &[&str]) -> u32 {
+    names.iter().map(|n| 1 << TOKEN_MODIFIERS.iter().position(|t| t == n).unwrap()).sum()
+}
 
 fn tt(name: &str) -> u32 {
     TOKEN_TYPES.iter().position(|t| *t == name).unwrap() as u32
 }
-
-/// Methods of the builtin types, for completion after `.`.
-const BUILTIN_METHODS: &[(&str, &[&str])] = &[
-    ("str", &["len", "is_empty", "split", "lines", "chars", "find", "count", "slice", "trim", "trim_start", "trim_end", "lower", "upper", "starts_with", "ends_with", "contains", "replace", "repeat", "reverse"]),
-    ("list", &["len", "is_empty", "push", "pop", "insert", "remove", "slice", "contains", "index_of", "sort", "reverse", "map", "filter", "any", "all", "sum", "join", "first", "last", "get", "find"]),
-    ("map", &["len", "is_empty", "get", "contains", "remove", "keys", "values"]),
-    ("set", &["len", "is_empty", "add", "contains", "remove", "to_list"]),
-    ("opt", &["is_some", "is_none", "unwrap"]),
-    ("float", &["floor", "ceil", "round", "sqrt", "abs"]),
-];
 
 #[derive(Default)]
 struct Server {
@@ -39,6 +36,15 @@ struct Server {
     std_dir: String,
     published: HashMap<String, HashSet<String>>, // doc path -> files we put diagnostics on
     last_tokens: HashMap<String, Json>,
+    cache: HashMap<String, Cached>, // the last analysis of each document that parsed
+}
+
+/// What we knew about a document the last time it parsed, for completion while it doesn't.
+struct Cached {
+    decls: Vec<Decl>,
+    model: Model,
+    notes: Vec<Note>,
+    modules: Vec<String>,
 }
 
 /// A declaration, for hover, go to definition, symbols and completion.
@@ -95,6 +101,7 @@ pub fn run() {
             "textDocument/hover" => Some(s.hover(&doc_path(params), position(params))),
             "textDocument/definition" => Some(s.definition(&doc_path(params), position(params))),
             "textDocument/completion" => Some(s.completion(&doc_path(params), position(params))),
+            "textDocument/codeAction" => Some(s.code_actions(&doc_path(params), params)),
             "textDocument/documentSymbol" => Some(s.symbols(&doc_path(params))),
             "textDocument/formatting" => Some(s.format(&doc_path(params))),
             "textDocument/references" => Some(s.references(&doc_path(params), position(params))),
@@ -130,7 +137,8 @@ fn capabilities() -> Json {
                 ("definitionProvider", true.into()),
                 ("documentSymbolProvider", true.into()),
                 ("documentFormattingProvider", true.into()),
-                ("completionProvider", obj([("triggerCharacters", vec!["."].into())])),
+                ("completionProvider", obj([("triggerCharacters", vec![".", ":", ">"].into()), ("resolveProvider", false.into())])),
+                ("codeActionProvider", obj([("codeActionKinds", vec!["quickfix"].into())])),
                 ("referencesProvider", true.into()),
                 ("documentHighlightProvider", true.into()),
                 ("renameProvider", obj([("prepareProvider", true.into())])),
@@ -276,6 +284,7 @@ fn write_std() -> String {
 struct Analysis {
     units: Vec<Unit>,
     notes: Vec<Note>,
+    probes: Vec<Note>, // `@recv T`, `@want T`, `@match T`: what the checker knew at a spot, for completion
     error: Option<(String, Pos, String)>,
 }
 
@@ -294,16 +303,31 @@ impl Server {
         let mut units = vec![];
         let srcs = Sources { std_dir: Some(&self.std_dir), open: &self.docs };
         if let Err(e) = load(&mut units, "", path.to_string(), &text, &srcs) {
-            return Analysis { units, notes: vec![], error: Some(e) };
+            return Analysis { units, notes: vec![], probes: vec![], error: Some(e) };
         }
-        let (r, notes) = codegen::check(&units, false);
-        Analysis { units, notes, error: r.err() }
+        let (r, all) = codegen::check(&units, false);
+        let (probes, notes) = all.into_iter().partition(|n| n.text.starts_with('@'));
+        Analysis { units, notes, probes, error: r.err() }
     }
 
     fn open(&mut self, uri: &str, text: &str) {
         let path = to_path(uri);
         self.docs.insert(path.clone(), text.to_string());
         let a = self.analyze(&path);
+        if !a.units.is_empty() {
+            // notes up to an error are good; past it, keep what the last check said
+            let keep_notes = match &a.error {
+                None => a.notes.clone(),
+                Some((_, at, _)) => {
+                    let mut n = a.notes.clone();
+                    let old = self.cache.get(&path).map(|c| c.notes.clone()).unwrap_or_default();
+                    n.extend(old.into_iter().filter(|x| x.file != path || (x.pos.line, x.pos.col) > (at.line, at.col)));
+                    n
+                }
+            };
+            let c = Cached { decls: self.decls(&a.units), model: Model::of(&a.units), notes: keep_notes, modules: a.units.iter().map(|u| u.name.clone()).collect() };
+            self.cache.insert(path.clone(), c);
+        }
         let mut by_file: HashMap<String, Vec<Json>> = HashMap::from([(path.clone(), vec![])]);
         if let Some((file, p, m)) = &a.error {
             let t = self.text_of(file).unwrap_or_default();
@@ -351,13 +375,31 @@ impl Server {
             for s in &m.structs {
                 add(&s.name, None, s.pos, "struct", block_sig(&lines, s.pos));
                 for f in &s.fields {
-                    add(&f.name, Some(&s.name), s.pos, "field", format!("{}.{}: {}", s.name, f.name, f.ty));
+                    // fields carry no position; find the line that declares it
+                    let at = lines.iter().enumerate().skip(s.pos.line as usize - 1).take(200).find_map(|(i, l)| {
+                        let t = l.trim_start();
+                        let rest = t.strip_prefix(f.name.as_str())?;
+                        rest.trim_start().starts_with(':').then(|| Pos { line: i as u32 + 1, col: (l.len() - t.len()) as u32 + 1 })
+                    });
+                    add(&f.name, Some(&s.name), at.unwrap_or(s.pos), "field", format!("{}.{}: {}", s.name, f.name, f.ty));
                 }
             }
             for e in &m.enums {
                 add(&e.name, None, e.pos, "enum", block_sig(&lines, e.pos));
                 for v in &e.variants {
-                    add(&v.name, Some(&e.name), v.pos, "variant", format!("{}.{}", e.name, line_sig(&lines, v.pos).trim_end_matches(',')));
+                    let fields: Vec<String> = v.fields.iter().map(|f| if f.name.parse::<u32>().is_ok() { f.ty.to_string() } else { format!("{}: {}", f.name, f.ty) }).collect();
+                    let shape = match (fields.is_empty(), v.braces) {
+                        (true, _) => String::new(),
+                        (false, true) => format!(" {{ {} }}", fields.join(", ")),
+                        (false, false) => format!("({})", fields.join(", ")),
+                    };
+                    add(&v.name, Some(&e.name), v.pos, "variant", format!("{}.{}{shape}", e.name, v.name));
+                }
+            }
+            for t in &m.traits {
+                add(&t.name, None, t.pos, "trait", block_sig(&lines, t.pos));
+                for (f, _) in &t.methods {
+                    add(&f.name, Some(&t.name), f.pos, "method", line_sig(&lines, f.pos).replacen(&format!("fn {}", f.name), &format!("fn {}.{}", t.name, f.name), 1));
                 }
             }
             for im in &m.impls {
@@ -378,7 +420,7 @@ impl Server {
         // the name in a declaration itself (`fn find`, `struct Todo`, a variant)
         let here = toks[k].pos;
         let kw = k.checked_sub(1).map(|i| toks[i].pos);
-        let own: Vec<&Decl> = decls.iter().filter(|d| d.name == *name && d.file == path && (d.pos == here || Some(d.pos) == kw) && d.kind != "field").collect();
+        let own: Vec<&Decl> = decls.iter().filter(|d| d.name == *name && d.file == path && (d.pos == here || Some(d.pos) == kw)).collect();
         if !own.is_empty() {
             return own;
         }
@@ -440,7 +482,21 @@ impl Server {
                 }
             }
             (Some(n), None) => parts.push(format!("```stellang\n{}\n```", n.text)),
-            (None, None) => {}
+            (None, None) => {
+                // a method of a builtin type: the checker noted the receiver's type at the `.`
+                if let (Some(p), Tok::Ident(name)) = (prev.filter(|t| t.tok == Tok::Dot), &toks[k].tok) {
+                    let recv = a.probes.iter().rev().find(|n| n.file == path && n.pos == p.pos && n.text.starts_with("@recv ")).map(|n| n.text[6..].to_string());
+                    if let Some(m) = recv.and_then(|t| complete::builtin_methods_for(&t).into_iter().find(|m| m.0 == name)) {
+                        parts.push(format!("```stellang\nfn {}({}) -> {}\n```", m.0, m.1, m.2));
+                        parts.push(m.3.to_string());
+                    }
+                } else if let Tok::Ident(name) = &toks[k].tok {
+                    if let Some(f) = complete::BUILTIN_FNS.iter().find(|f| f.0 == name && toks.get(k + 1).is_some_and(|t| t.tok == Tok::LParen)) {
+                        parts.push(format!("```stellang\nfn {}({}) -> {}\n```", f.0, f.1, f.2));
+                        parts.push(format!("{} *(builtin)*", f.3));
+                    }
+                }
+            }
         }
         if parts.is_empty() {
             return Json::Null;
@@ -618,6 +674,8 @@ impl Server {
             let end = Pos { line: name.pos.line, col: name.pos.col + n.chars().count() as u32 };
             out.push(obj([("position", lsp_pos(text, end)), ("label", format!(": {ty}").into()), ("kind", 1u32.into()), ("paddingLeft", false.into())]));
         }
+        let decls = self.decls(&a.units);
+        out.extend(self.param_hints(path, text, &toks, from, to, &decls, &a));
         Json::Arr(out)
     }
 
@@ -645,9 +703,38 @@ impl Server {
             }
         }
         let Some(open) = open.filter(|o| *o > 0) else { return Json::Null };
-        let a = self.analyze(path);
-        let decls = self.decls(&a.units);
-        let Some(d) = self.resolve(path, &decls, &toks, open - 1, &a.units, &a.notes).into_iter().find(|d| matches!(d.kind, "fn" | "method" | "variant")) else { return Json::Null };
+        // mid-typing, the call isn't closed yet: check it with a `)` where the cursor is
+        let mut a = self.analyze(path);
+        if a.units.is_empty() || a.error.as_ref().is_some_and(|e| e.1.line == cur.line) {
+            let patched: String = text.lines().enumerate().map(|(i, x)| if i == line as usize {
+                let (h, t): (String, String) = (x.chars().take(cur.col as usize - 1).collect(), x.chars().skip(cur.col as usize - 1).collect());
+                format!("{h}){t}\n")
+            } else { format!("{x}\n") }).collect();
+            let b = self.analyze_file(path, &patched);
+            if !b.units.is_empty() {
+                a = b;
+            }
+        }
+        let decls = if a.units.is_empty() { self.cache.get(path).map(|c| c.decls.clone()).unwrap_or_default() } else { self.decls(&a.units) };
+        let found = self.resolve(path, &decls, &toks, open - 1, &a.units, &a.notes).into_iter().find(|d| matches!(d.kind, "fn" | "method" | "variant"));
+        let builtin = |name: &str| -> Option<(String, String)> {
+            if open >= 2 && toks[open - 2].tok == Tok::Dot {
+                let p = toks[open - 2].pos;
+                let t = a.probes.iter().rev().find(|n| n.file == path && n.pos == p && n.text.starts_with("@recv "))?.text[6..].to_string();
+                let m = complete::builtin_methods_for(&t).into_iter().find(|m| m.0 == name)?;
+                return Some((format!("fn {}({}) -> {}", m.0, m.1, m.2), m.3.to_string()));
+            }
+            let f = complete::BUILTIN_FNS.iter().find(|f| f.0 == name)?;
+            Some((format!("fn {}({}) -> {}", f.0, f.1, f.2), f.3.to_string()))
+        };
+        let d = match (found, &toks[open - 1].tok) {
+            (Some(d), _) => d.clone(),
+            (None, Tok::Ident(n)) => match builtin(n) {
+                Some((sig, doc)) => Decl { name: n.clone(), owner: None, module: String::new(), file: String::new(), pos: toks[open - 1].pos, kind: "fn", sig, doc },
+                None => return Json::Null,
+            },
+            _ => return Json::Null,
+        };
         let sig = d.sig.lines().next().unwrap_or("");
         let inside = sig.find('(').and_then(|s| sig.rfind(')').map(|e| &sig[s + 1..e])).unwrap_or("");
         let mut params = split_top(inside);
@@ -711,7 +798,7 @@ impl Server {
                     continue;
                 }
                 let t = self.text_of(&d.file).unwrap_or_default();
-                let kind: u32 = match d.kind { "fn" => 12, "method" => 6, "struct" => 23, "enum" => 10, "variant" => 22, "const" => 14, _ => 13 };
+                let kind: u32 = match d.kind { "fn" => 12, "method" => 6, "struct" => 23, "enum" => 10, "variant" => 22, "const" => 14, "trait" => 11, _ => 13 };
                 out.push(obj([
                     ("name", d.name.as_str().into()),
                     ("kind", kind.into()),
@@ -721,94 +808,6 @@ impl Server {
             }
         }
         Json::Arr(out)
-    }
-
-    fn completion(&self, path: &str, (line, ch): (u32, u32)) -> Json {
-        let Some(text) = self.docs.get(path) else { return Json::Null };
-        let l = text.lines().nth(line as usize).unwrap_or("");
-        let before: String = l.chars().take(char_col(l, ch) as usize - 1).collect();
-        let word_start = before.trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_');
-        let a = self.analyze(path);
-        let decls = self.decls(&a.units);
-        let mut items: Vec<(String, u32, String)> = vec![]; // label, kind, detail
-        let kind_num = |k: &str| match k {
-            "fn" => 3,
-            "method" => 2,
-            "field" => 5,
-            "struct" => 22,
-            "enum" => 13,
-            "variant" => 20,
-            "const" => 21,
-            _ => 6,
-        };
-        if let Some(recv) = word_start.strip_suffix('.') {
-            let q: String = recv.chars().rev().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect::<Vec<_>>().into_iter().rev().collect();
-            let is_module = a.units.iter().any(|u| u.name == q && !q.is_empty());
-            let is_type = decls.iter().any(|d| d.name == q && matches!(d.kind, "struct" | "enum"));
-            for d in &decls {
-                let fits = if is_module {
-                    d.module == q && d.owner.is_none()
-                } else if is_type {
-                    d.owner.as_deref() == Some(q.as_str()) && matches!(d.kind, "variant" | "fn")
-                } else {
-                    // a value: what the type checker said its type is, if it said
-                    let ty = a.notes.iter().rev().find(|n| n.file == path && n.text.starts_with(&format!("{q}: "))).map(|n| n.text[q.len() + 2..].to_string());
-                    match &ty {
-                        Some(t) => d.owner.as_deref().is_some_and(|o| t.trim_end_matches('?') == o || t.ends_with(&format!(".{o}"))) && matches!(d.kind, "method" | "field"),
-                        None => matches!(d.kind, "method" | "field"),
-                    }
-                };
-                if fits {
-                    items.push((d.name.clone(), kind_num(d.kind), d.sig.clone()));
-                }
-            }
-            if !is_module && !is_type {
-                let ty = a.notes.iter().rev().find(|n| n.file == path && n.text.starts_with(&format!("{q}: "))).map(|n| n.text[q.len() + 2..].to_string());
-                let groups: Vec<&str> = match ty.as_deref() {
-                    Some("str") => vec!["str"],
-                    Some("float") => vec!["float"],
-                    Some(t) if t.ends_with('?') => vec!["opt"],
-                    Some(t) if t.starts_with('[') => vec!["list"],
-                    Some(t) if t.starts_with('{') && t.contains(':') => vec!["map"],
-                    Some(t) if t.starts_with('{') => vec!["set"],
-                    Some(_) => vec![],
-                    None => BUILTIN_METHODS.iter().map(|g| g.0).collect(),
-                };
-                for (g, ms) in BUILTIN_METHODS {
-                    if groups.contains(g) {
-                        items.extend(ms.iter().map(|m| (m.to_string(), 2, format!("{g} method"))));
-                    }
-                }
-            }
-        } else {
-            let w = grammar::words();
-            for kw in w.declare.iter().chain(&w.control).chain(&w.constants).filter(|k| k.is_ascii()) {
-                items.push((kw.clone(), 14, "keyword".into()));
-            }
-            for b in w.builtins.iter().chain(&w.types) {
-                items.push((b.clone(), 3, "builtin".into()));
-            }
-            for u in &a.units {
-                if !u.name.is_empty() {
-                    items.push((u.name.clone(), 9, format!("module {}", u.name)));
-                }
-            }
-            for d in decls.iter().filter(|d| d.module.is_empty() && (d.owner.is_none() || d.kind == "variant")) {
-                items.push((d.name.clone(), kind_num(d.kind), d.sig.clone()));
-            }
-            // locals the type checker saw in this file
-            for n in a.notes.iter().filter(|n| n.file == path && n.pos.line <= line + 1) {
-                let t = n.text.trim_start_matches("let ").trim_start_matches("var ");
-                if let Some((name, ty)) = t.split_once(": ") {
-                    if !name.contains(['.', ' ']) {
-                        items.push((name.to_string(), 6, ty.to_string()));
-                    }
-                }
-            }
-        }
-        let mut seen = HashSet::new();
-        items.retain(|i| seen.insert(i.0.clone()));
-        Json::Arr(items.into_iter().map(|(l, k, d)| obj([("label", l.into()), ("kind", k.into()), ("detail", d.into())])).collect())
     }
 
     fn symbols(&self, path: &str) -> Json {
@@ -823,10 +822,12 @@ impl Server {
                 "enum" => 10,
                 "variant" => 22,
                 "const" => 14,
-                _ => 8,
+                "field" => 8,
+                "trait" => 11,
+                _ => 13,
             }
         };
-        let mine: Vec<&Decl> = decls.iter().filter(|d| d.file == path && d.kind != "field").collect();
+        let mine: Vec<&Decl> = decls.iter().filter(|d| d.file == path).collect();
         let sym = |d: &Decl, children: Vec<Json>| {
             let r = range(text, d.pos, Pos { line: d.pos.line, col: d.pos.col + 1 });
             obj([
@@ -871,7 +872,21 @@ impl Server {
         let a = self.analyze(path);
         let decls = self.decls(&a.units);
         let names = |kinds: &[&str]| -> HashSet<String> { decls.iter().filter(|d| kinds.contains(&d.kind)).map(|d| d.name.clone()).collect() };
-        let (types, enums, variants, funcs) = (names(&["struct"]), names(&["enum"]), names(&["variant"]), names(&["fn"]));
+        let (types, enums, variants, funcs, consts) = (names(&["struct"]), names(&["enum"]), names(&["variant"]), names(&["fn"]), names(&["const"]));
+        let traits = names(&["trait"]);
+        // type parameters in scope: the names in `<...>` after fn/struct/enum names
+        let tparams: HashSet<String> = a.units.iter().flat_map(|u| {
+            let m = &u.module;
+            m.funcs.iter().flat_map(|f| f.tparams.iter())
+                .chain(m.structs.iter().flat_map(|s| s.tparams.iter()))
+                .chain(m.enums.iter().flat_map(|e| e.tparams.iter()))
+                .chain(m.impls.iter().flat_map(|i| i.methods.iter().flat_map(|f| f.tparams.iter())))
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+        }).collect();
+        let std_modules: HashSet<&str> = STD.iter().map(|s| s.0).collect();
+        // which braces open a struct/enum declaration (their `name:` lines declare fields)
+        let plain = flatten(&toks);
         let modules: HashSet<&str> = a.units.iter().map(|u| u.name.as_str()).filter(|n| !n.is_empty()).collect();
         let w = grammar::words();
         let builtins: HashSet<&str> = w.builtins.iter().map(String::as_str).collect();
@@ -895,9 +910,21 @@ impl Server {
             }
         };
         let flat = flatten_with_strings(&toks, &cs);
+        let jsx = jsx_marks(&flat);
         for (k, t) in flat.iter().enumerate() {
             let prev = k.checked_sub(1).map(|i| &flat[i].tok);
             let next = flat.get(k + 1).map(|t| &t.tok);
+            match jsx.get(&k) {
+                // tags and attribute names: the grammar colors them
+                Some(Jsx::Punct | Jsx::Tag | Jsx::Attr) => continue,
+                Some(Jsx::Component) => {
+                    if matches!(t.tok, Tok::Ident(_)) {
+                        emit(t.pos, t.start, t.end, "class", 0);
+                    }
+                    continue;
+                }
+                None => {}
+            }
             let (ty, mods) = match &t.tok {
                 Tok::Str(_) | Tok::Interp(_) => ("string", 0),
                 Tok::Int(_) | Tok::Float(_) => ("number", 0),
@@ -907,24 +934,49 @@ impl Server {
                 | Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge | Tok::AndAnd | Tok::OrOr | Tok::Plus | Tok::Minus | Tok::Times
                 | Tok::Slash | Tok::Percent | Tok::Assign | Tok::PlusEq | Tok::MinusEq | Tok::TimesEq | Tok::SlashEq | Tok::DotDot => ("operator", 0),
                 Tok::Ident(n) => {
-                    let decl = matches!(prev, Some(Tok::Fn | Tok::Struct | Tok::Enum | Tok::Const)) as u32;
+                    let decl = matches!(prev, Some(Tok::Fn | Tok::Struct | Tok::Enum | Tok::Const | Tok::Let | Tok::Var)) as u32;
+                    let prev2 = k.checked_sub(2).map(|i| &flat[i].tok);
+                    let label = next == Some(&Tok::Colon) && matches!(prev, Some(Tok::LBrace | Tok::Comma | Tok::Newline | Tok::Star) | None) && flat.get(k + 2).is_some_and(|t| t.tok != Tok::Colon);
                     let call = next == Some(&Tok::LParen);
                     match n.as_str() {
                         "true" | "false" | "none" | "self" => continue,
                         _ if prev == Some(&Tok::Dot) && variants.contains(n) => ("enumMember", 0),
+                        _ if prev == Some(&Tok::Dot) && call && matches!(prev2, Some(Tok::Ident(m)) if std_modules.contains(m.as_str()) && modules.contains(m.as_str())) => ("function", tm(&["defaultLibrary"])),
                         _ if prev == Some(&Tok::Dot) && call => ("method", 0),
                         _ if prev == Some(&Tok::Dot) && (types.contains(n) || enums.contains(n)) => (if enums.contains(n) { "enum" } else { "struct" }, 0),
                         _ if prev == Some(&Tok::Dot) && funcs.contains(n) => ("function", 0),
                         _ if prev == Some(&Tok::Dot) => ("property", 0),
-                        _ if prim.contains(n.as_str()) && !call => ("type", 2),
+                        _ if prim.contains(n.as_str()) && !call => ("type", tm(&["defaultLibrary"])),
+                        _ if label && (decl_body_field(&plain, t.pos) || enclosing(&plain, t.pos) != Some(Tok::LParen)) => ("property", decl_body_field(&plain, t.pos) as u32),
+                        _ if consts.contains(n) => ("variable", tm(&["readonly", "static"]) | decl),
+                        _ if traits.contains(n) => ("interface", decl),
+                        _ if tparams.contains(n) && n.starts_with(|c: char| c.is_ascii_uppercase()) && !types.contains(n) && !enums.contains(n) => ("typeParameter", 0),
                         _ if enums.contains(n) => ("enum", decl),
                         _ if types.contains(n) => ("struct", decl),
                         _ if variants.contains(n) => ("enumMember", 0),
                         _ if modules.contains(n.as_str()) => ("namespace", 0),
-                        _ if call && builtins.contains(n.as_str()) => ("function", 2),
+                        _ if call && builtins.contains(n.as_str()) => ("function", tm(&["defaultLibrary"])),
                         _ if call || prev == Some(&Tok::Fn) => ("function", decl),
                         _ if n.starts_with(|c: char| c.is_ascii_uppercase()) => ("type", 0),
-                        _ => ("variable", 0),
+                        _ => {
+                            // what kind of binding is it?
+                            let at = plain.iter().position(|x| x.pos == t.pos).unwrap_or(0);
+                            match self.local_binding(&plain, at, n).and_then(|p| plain.iter().position(|x| x.pos == p)) {
+                                Some(b) => {
+                                    let before = b.checked_sub(1).map(|i| &plain[i].tok);
+                                    let after = plain.get(b + 1).map(|x| &x.tok);
+                                    let d = if b == at { tm(&["declaration"]) } else { 0 };
+                                    match before {
+                                        Some(Tok::Var) => ("variable", tm(&["mutable"]) | d),
+                                        Some(Tok::Let) => ("variable", tm(&["readonly"]) | d),
+                                        Some(Tok::LParen | Tok::Comma) if matches!(after, Some(Tok::Colon | Tok::Comma | Tok::RParen)) => ("parameter", d),
+                                        _ if after == Some(&Tok::FatArrow) => ("parameter", d),
+                                        _ => ("variable", d),
+                                    }
+                                }
+                                None => ("variable", 0),
+                            }
+                        }
                     }
                 }
                 _ => continue,
@@ -943,6 +995,57 @@ impl Server {
         self.last_tokens.insert(path.to_string(), r.clone());
         r
     }
+}
+
+/// Is the `name:` at `p` a field of a struct/enum declaration (rather than of a literal)?
+fn decl_body_field(toks: &[Token], p: Pos) -> bool {
+    let Some(k) = toks.iter().position(|t| t.pos == p) else { return false };
+    let mut depth = 0;
+    for i in (0..k).rev() {
+        match toks[i].tok {
+            Tok::RBrace | Tok::RParen => depth += 1,
+            Tok::LBrace | Tok::LParen if depth > 0 => depth -= 1,
+            Tok::LBrace | Tok::LParen => {
+                // `struct Name {` / `Variant(`, `Variant {` inside an enum
+                let head = |j: usize| j.checked_sub(2).map(|x| &toks[x].tok);
+                if head(i) == Some(&Tok::Struct) || head(i) == Some(&Tok::Enum) {
+                    return true;
+                }
+                // an enum variant: the enclosing brace belongs to `enum`
+                return i > 0 && matches!(toks[i - 1].tok, Tok::Ident(_)) && decl_body_field_enum(toks, i - 1);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The bracket that `p` is inside of.
+fn enclosing(toks: &[Token], p: Pos) -> Option<Tok> {
+    let k = toks.iter().position(|t| t.pos == p)?;
+    let mut depth = 0;
+    for i in (0..k).rev() {
+        match toks[i].tok {
+            Tok::RBrace | Tok::RParen | Tok::RBrack => depth += 1,
+            Tok::LBrace | Tok::LParen | Tok::LBrack if depth > 0 => depth -= 1,
+            Tok::LBrace | Tok::LParen | Tok::LBrack => return Some(toks[i].tok.clone()),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn decl_body_field_enum(toks: &[Token], k: usize) -> bool {
+    let mut depth = 0;
+    for i in (0..k).rev() {
+        match toks[i].tok {
+            Tok::RBrace => depth += 1,
+            Tok::LBrace if depth > 0 => depth -= 1,
+            Tok::LBrace => return i >= 2 && toks[i - 2].tok == Tok::Enum,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Tokens, with the code inside `${...}` spliced in (strings stay whole tokens).
@@ -1071,7 +1174,31 @@ fn doc_above(lines: &[&str], line: u32) -> String {
 fn line_sig(lines: &[&str], p: Pos) -> String {
     let l = lines.get(p.line as usize - 1).copied().unwrap_or("");
     let s: String = l.chars().skip(p.col as usize - 1).collect();
-    s.trim().trim_end_matches('{').trim_end_matches('⭐').trim().to_string()
+    let s = s.trim();
+    // `fn f(a: int) -> {str: int} { body }`: stop at the body's brace
+    if s.starts_with("fn ") || s.starts_with("🦍") {
+        let mut depth = 0;
+        let mut seen_params = false;
+        let mut in_ret = false;
+        for (i, c) in s.char_indices() {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => {
+                    depth -= 1;
+                    if depth == 0 && !seen_params {
+                        seen_params = true;
+                    }
+                }
+                '>' if seen_params && depth == 0 && s[..i].ends_with('-') => in_ret = true,
+                '{' if seen_params && depth == 0 && in_ret && s[..i].trim_end().ends_with("->") => depth += 1,
+                '{' | '⭐' if seen_params && depth == 0 => return s[..i].trim().to_string(),
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    s.trim_end_matches('{').trim_end_matches('⭐').trim().to_string()
 }
 
 /// A struct or enum: its lines up to the closing brace (methods left out).
@@ -1118,6 +1245,85 @@ fn split_top(s: &str) -> Vec<String> {
     }
     if !cur.trim().is_empty() {
         out.push(cur);
+    }
+    out
+}
+
+/// What a token is inside JSX (tags are colored by the grammar; components like types).
+#[derive(Clone, Copy, PartialEq)]
+enum Jsx {
+    Punct,
+    Tag,
+    Component,
+    Attr,
+}
+
+/// Find JSX tags in a token list: `<` (where a value starts) followed by a name, up to its `>`/`/>`,
+/// and closing tags `</name>`.
+fn jsx_marks(toks: &[Token]) -> HashMap<usize, Jsx> {
+    let mut out = HashMap::new();
+    let mut k = 0;
+    while k < toks.len() {
+        if toks[k].tok != Tok::Lt {
+            k += 1;
+            continue;
+        }
+        let prev = k.checked_sub(1).map(|i| &toks[i].tok);
+        if matches!(prev, Some(Tok::Ident(_) | Tok::RParen | Tok::RBrack | Tok::Int(_) | Tok::Float(_))) {
+            k += 1;
+            continue;
+        }
+        let closing = toks.get(k + 1).map(|t| &t.tok) == Some(&Tok::Slash);
+        let mut i = k + 1 + closing as usize;
+        if !matches!(toks.get(i).map(|t| &t.tok), Some(Tok::Ident(_) | Tok::Gt)) {
+            k += 1;
+            continue;
+        }
+        out.insert(k, Jsx::Punct);
+        if closing {
+            out.insert(k + 1, Jsx::Punct);
+        }
+        // the name: idents glued with `.` / `-`
+        let name_start = i;
+        while let Some(t) = toks.get(i) {
+            match t.tok {
+                Tok::Ident(_) => i += 1,
+                Tok::Dot | Tok::Minus if i > name_start && toks[i - 1].end == t.start => i += 1,
+                _ => break,
+            }
+        }
+        let last = toks[name_start..i].iter().rev().find_map(|t| if let Tok::Ident(n) = &t.tok { Some(n.clone()) } else { None });
+        let component = last.is_some_and(|n| n.starts_with(|c: char| c.is_ascii_uppercase()));
+        for j in name_start..i {
+            let module = matches!(&toks[j].tok, Tok::Ident(_)) && toks.get(j + 1).is_some_and(|t| t.tok == Tok::Dot) && component;
+            out.insert(j, if module { Jsx::Punct } else if component { Jsx::Component } else { Jsx::Tag });
+        }
+        // attributes, up to `>` or `/>` outside braces
+        let mut depth = 0;
+        while let Some(t) = toks.get(i) {
+            match &t.tok {
+                Tok::LBrace => depth += 1,
+                Tok::RBrace => depth -= 1,
+                Tok::Gt if depth == 0 => {
+                    out.insert(i, Jsx::Punct);
+                    break;
+                }
+                Tok::Slash if depth == 0 => {
+                    out.insert(i, Jsx::Punct);
+                }
+                Tok::Ident(_) if depth == 0 => {
+                    out.insert(i, Jsx::Attr);
+                }
+                Tok::Minus if depth == 0 => {
+                    out.insert(i, Jsx::Attr);
+                }
+                Tok::Newline | Tok::Str(_) | Tok::Interp(_) | Tok::Assign => {}
+                _ if depth == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        k = i.max(k + 1);
     }
     out
 }

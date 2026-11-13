@@ -1,8 +1,8 @@
 {
   "name": "stellang",
   "displayName": "stellang",
-  "description": "Everything for stellang: highlighting, errors as you type, hover types, completion, go to definition, rename, inlay hints, formatting, run and build.",
-  "version": "0.2.0",
+  "description": "stellang for VS Code: completion from the type checker (JSX too), quick fixes, star-themed colors, a sidebar for programs, types and HTTP routes, one-click run for servers, browser apps and full-stack apps, project templates.",
+  "version": "0.4.0",
   "publisher": "stellang",
   "license": "MIT",
   "pricing": "Free",
@@ -24,13 +24,16 @@
     "language server",
     "lsp",
     "syntax",
-    "web framework"
+    "theme",
+    "web framework",
+    "websocket"
   ],
   "engines": {
     "vscode": "^1.82.0"
   },
   "categories": [
     "Programming Languages",
+    "Themes",
     "Formatters",
     "Snippets",
     "Linters"
@@ -75,12 +78,6 @@
         }
       }
     ],
-    "snippets": [
-      {
-        "language": "stellang",
-        "path": "./snippets/stellang.json"
-      }
-    ],
     "configuration": {
       "title": "stellang",
       "properties": {
@@ -120,6 +117,34 @@
           ],
           "default": "off",
           "description": "Log the messages between VS Code and the language server (Output → stellang)."
+        },
+        "stellang.run.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Command-line arguments for programs started with Run."
+        },
+        "stellang.run.openBrowser": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "always",
+            "never"
+          ],
+          "enumDescriptions": [
+            "Offer to open it",
+            "Open it in the browser right away",
+            "Don't offer"
+          ],
+          "default": "ask",
+          "description": "When a running program prints a http://localhost address."
+        },
+        "stellang.suggestTheme": {
+          "type": "boolean",
+          "default": true,
+          "description": "Suggest the Stellang Nebula theme once."
         }
       }
     },
@@ -128,7 +153,10 @@
         "editor.tabSize": 4,
         "editor.insertSpaces": true,
         "editor.formatOnSave": true,
-        "editor.semanticHighlighting.enabled": true
+        "editor.semanticHighlighting.enabled": true,
+        "editor.suggest.snippetsPreventQuickSuggestions": false,
+        "editor.inlayHints.enabled": "on",
+        "editor.bracketPairColorization.enabled": true
       }
     },
     "commands": [
@@ -174,13 +202,77 @@
         "title": "New stellang File",
         "category": "stellang",
         "shortTitle": "stellang File"
+      },
+      {
+        "command": "stellang.stop",
+        "title": "Stop Program",
+        "category": "stellang",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "stellang.restartRun",
+        "title": "Restart Program",
+        "category": "stellang",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "stellang.runMenu",
+        "title": "Running Program…",
+        "category": "stellang"
+      },
+      {
+        "command": "stellang.showIr",
+        "title": "Show LLVM IR",
+        "category": "stellang",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "stellang.newProject",
+        "title": "New Project…",
+        "category": "stellang",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "stellang.useTheme",
+        "title": "Choose a Star Theme…",
+        "category": "stellang",
+        "icon": "$(paintcan)"
+      },
+      {
+        "command": "stellang.walkthrough",
+        "title": "Get Started",
+        "category": "stellang",
+        "icon": "$(star-full)"
+      },
+      {
+        "command": "stellang.refreshViews",
+        "title": "Refresh",
+        "category": "stellang",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "stellang.model.toggleFunctions",
+        "title": "Show/Hide Functions",
+        "category": "stellang",
+        "icon": "$(symbol-function)"
+      },
+      {
+        "command": "stellang.openRoute",
+        "title": "Open in Browser",
+        "category": "stellang",
+        "icon": "$(globe)"
       }
     ],
     "menus": {
       "editor/title/run": [
         {
           "command": "stellang.run",
-          "when": "resourceLangId == stellang",
+          "when": "resourceLangId == stellang && !stellang.running",
+          "group": "navigation@0"
+        },
+        {
+          "command": "stellang.restartRun",
+          "when": "resourceLangId == stellang && stellang.running",
           "group": "navigation@0"
         },
         {
@@ -199,6 +291,11 @@
           "command": "stellang.build",
           "when": "editorLangId == stellang",
           "group": "z_stellang@2"
+        },
+        {
+          "command": "stellang.showIr",
+          "when": "editorLangId == stellang",
+          "group": "z_stellang@3"
         }
       ],
       "explorer/context": [
@@ -233,6 +330,90 @@
         {
           "command": "stellang.toPlain",
           "when": "editorLangId == stellang"
+        },
+        {
+          "command": "stellang.stop",
+          "when": "stellang.running"
+        },
+        {
+          "command": "stellang.restartRun",
+          "when": "stellang.running"
+        },
+        {
+          "command": "stellang.runMenu",
+          "when": "stellang.running"
+        },
+        {
+          "command": "stellang.showIr",
+          "when": "editorLangId == stellang"
+        },
+        {
+          "command": "stellang.openRoute",
+          "when": "false"
+        },
+        {
+          "command": "stellang.refreshViews",
+          "when": "false"
+        },
+        {
+          "command": "stellang.model.toggleFunctions",
+          "when": "false"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "stellang.newProject",
+          "when": "view == stellang.programs",
+          "group": "navigation@1"
+        },
+        {
+          "command": "stellang.refreshViews",
+          "when": "view =~ /^stellang\\./",
+          "group": "navigation@9"
+        },
+        {
+          "command": "stellang.model.toggleFunctions",
+          "when": "view == stellang.model",
+          "group": "navigation@1"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "stellang.run",
+          "when": "view == stellang.programs && viewItem == program",
+          "group": "inline@1"
+        },
+        {
+          "command": "stellang.restartRun",
+          "when": "view == stellang.programs && viewItem == program.running",
+          "group": "inline@1"
+        },
+        {
+          "command": "stellang.stop",
+          "when": "view == stellang.programs && viewItem == program.running",
+          "group": "inline@2"
+        },
+        {
+          "command": "stellang.build",
+          "when": "view == stellang.programs",
+          "group": "inline@3"
+        },
+        {
+          "command": "stellang.showIr",
+          "when": "view == stellang.programs",
+          "group": "1_more@1"
+        },
+        {
+          "command": "stellang.openRoute",
+          "when": "view == stellang.routes && viewItem == route.open",
+          "group": "inline@1"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "stellang.stop",
+          "when": "resourceLangId == stellang && stellang.running",
+          "group": "navigation@-1"
         }
       ]
     },
@@ -242,6 +423,11 @@
         "key": "ctrl+f5",
         "mac": "cmd+f5",
         "when": "editorLangId == stellang"
+      },
+      {
+        "command": "stellang.stop",
+        "key": "shift+f5",
+        "when": "stellang.running && !inDebugMode"
       }
     ],
     "taskDefinitions": [
@@ -284,6 +470,173 @@
           "severity": 4,
           "message": 5
         }
+      }
+    ],
+    "themes": [
+      {
+        "label": "Stellang Nebula",
+        "uiTheme": "vs-dark",
+        "path": "./themes/stellang-nebula-color-theme.json"
+      },
+      {
+        "label": "Stellang Daybreak",
+        "uiTheme": "vs",
+        "path": "./themes/stellang-daybreak-color-theme.json"
+      }
+    ],
+    "semanticTokenModifiers": [
+      {
+        "id": "mutable",
+        "description": "A `var`: it can change."
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "language": "stellang",
+        "scopes": {
+          "variable.mutable": [
+            "variable.other.mutable.stellang"
+          ],
+          "variable.readonly": [
+            "variable.other.readonly.stellang"
+          ],
+          "variable.readonly.static": [
+            "variable.other.constant.stellang"
+          ],
+          "property.declaration": [
+            "variable.other.property.declaration.stellang"
+          ],
+          "enumMember": [
+            "variable.other.enummember.stellang"
+          ],
+          "namespace": [
+            "entity.name.namespace.stellang"
+          ],
+          "function.defaultLibrary": [
+            "support.function.stellang"
+          ],
+          "type.defaultLibrary": [
+            "support.type.primitive.stellang"
+          ],
+          "class": [
+            "support.class.component.stellang"
+          ],
+          "interface": [
+            "entity.name.type.trait.stellang"
+          ],
+          "typeParameter": [
+            "entity.name.type.parameter.stellang"
+          ]
+        }
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "stellang",
+          "title": "stellang",
+          "icon": "media/activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "stellang": [
+        {
+          "id": "stellang.programs",
+          "name": "Programs",
+          "icon": "media/activity.svg",
+          "contextualTitle": "stellang"
+        },
+        {
+          "id": "stellang.model",
+          "name": "Types",
+          "icon": "media/activity.svg",
+          "contextualTitle": "stellang"
+        },
+        {
+          "id": "stellang.routes",
+          "name": "HTTP Routes",
+          "icon": "media/activity.svg",
+          "contextualTitle": "stellang"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "stellang.programs",
+        "contents": "No stellang programs here yet.\n[$(new-folder) New Project…](command:stellang.newProject)\n[$(new-file) New File](command:stellang.newFile)\n[$(star-full) Get Started](command:stellang.walkthrough)"
+      },
+      {
+        "view": "stellang.model",
+        "contents": "The structs and enums of your programs show up here."
+      },
+      {
+        "view": "stellang.routes",
+        "contents": "Routes like `app.get(\"/path\", ...)` show up here. Try the web server template:\n[$(server) New Web Server](command:stellang.newProject?%22web%22)"
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "stellang.start",
+        "title": "Get started with stellang",
+        "description": "Set up the compiler, pick a star theme, and run your first program.",
+        "steps": [
+          {
+            "id": "compiler",
+            "title": "Check the compiler",
+            "description": "The compiler is also the language server. See which one is in use, or install it.\n[Check](command:stellang.statusMenu)",
+            "media": {
+              "markdown": "media/walkthrough/compiler.md"
+            },
+            "completionEvents": [
+              "onCommand:stellang.statusMenu"
+            ]
+          },
+          {
+            "id": "theme",
+            "title": "Pick a star theme",
+            "description": "Colors made for stellang's syntax: gold functions, aurora-green enums, underlined `var`s.\n[Choose a Theme](command:stellang.useTheme)",
+            "media": {
+              "markdown": "media/walkthrough/theme.md"
+            },
+            "completionEvents": [
+              "onSettingChanged:workbench.colorTheme"
+            ]
+          },
+          {
+            "id": "project",
+            "title": "Start a project",
+            "description": "Pick a template: hello, web server, JSON API with WebSockets, data modeling, CLI.\n[New Project…](command:stellang.newProject)",
+            "media": {
+              "markdown": "media/walkthrough/project.md"
+            },
+            "completionEvents": [
+              "onCommand:stellang.newProject"
+            ]
+          },
+          {
+            "id": "run",
+            "title": "Run it",
+            "description": "Press ▶ above fn main or Ctrl+F5. Servers get an Open in Browser button.\n[Run the Open File](command:stellang.run)",
+            "media": {
+              "markdown": "media/walkthrough/run.md"
+            },
+            "completionEvents": [
+              "onCommand:stellang.run"
+            ]
+          },
+          {
+            "id": "editing",
+            "title": "Let the type checker help",
+            "description": "Completion, quick fixes, postfix snippets, hints, rename.",
+            "media": {
+              "markdown": "media/walkthrough/editing.md"
+            },
+            "completionEvents": [
+              "onLanguage:stellang"
+            ]
+          }
+        ]
       }
     ]
   },

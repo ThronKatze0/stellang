@@ -6,6 +6,9 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { LanguageClient, State } = require("vscode-languageclient/node");
+const { Runner } = require("./src/runner");
+const views = require("./src/views");
+const { newProject, create, TEMPLATES } = require("./src/projects");
 
 const REPO = "https://github.com/ThronKatze0/stellang";
 const EXE = process.platform === "win32" ? "stellang.exe" : "stellang";
@@ -15,7 +18,8 @@ let client;
 let output;
 let status;
 let compiler; // { path, source, version }
-let runTerminal;
+let runner;
+const config = () => vscode.workspace.getConfiguration("stellang");
 
 // ---- finding the compiler ----
 
@@ -152,6 +156,10 @@ function updateStatusVisibility() {
 async function statusMenu() {
   const items = [
     { label: "$(play) Run File", cmd: "stellang.run" },
+    { label: "$(file-code) Show LLVM IR", cmd: "stellang.showIr" },
+    { label: "$(new-folder) New Project…", cmd: "stellang.newProject" },
+    { label: "$(star-full) Get Started", cmd: "stellang.walkthrough" },
+    { label: "$(paintcan) Star Themes…", cmd: "stellang.useTheme" },
     { label: "$(tools) Build File", cmd: "stellang.build" },
     { label: "$(check) Check File", cmd: "stellang.check" },
     { label: "$(refresh) Restart Language Server", cmd: "stellang.restart" },
@@ -207,18 +215,63 @@ async function run(uri) {
   const doc = await targetDoc(uri);
   if (!doc) return;
   warnIfNoClang();
+  runner.run(doc.uri.fsPath);
+}
+
+/** Stop / restart / open the running program. */
+async function runMenu() {
+  const r = runner.current();
+  if (!r) return;
+  const items = [];
+  if (r.url) items.push({ label: `$(globe) Open ${r.url}`, run: () => vscode.env.openExternal(vscode.Uri.parse(r.url)) });
+  if (r.url) items.push({ label: "$(browser) Open in Editor", run: () => vscode.commands.executeCommand("simpleBrowser.show", r.url) });
+  items.push({ label: "$(debug-restart) Restart", run: () => r.restart() });
+  if (r.child) items.push({ label: "$(debug-stop) Stop", run: () => r.kill() });
+  items.push({ label: "$(terminal) Show Output", run: () => r.terminal.show() });
+  const pick = await vscode.window.showQuickPick(items, { placeHolder: `${r.name}: ${r.state}` });
+  pick?.run();
+}
+
+/** The program's LLVM IR, beside the source. */
+async function showIr(uri) {
+  const doc = await targetDoc(uri);
+  if (!doc) return;
   const file = doc.uri.fsPath;
-  const dir = path.dirname(file);
-  const outDir = path.join(os.tmpdir(), "stellang-run");
-  fs.mkdirSync(outDir, { recursive: true });
-  const out = path.join(outDir, path.basename(file, ".st"));
-  const opt = vscode.workspace.getConfiguration("stellang").get("optimization");
-  const env = vscode.workspace.getConfiguration("stellang").get("run.env") || {};
-  // a fresh terminal each time: stopping the last run frees its port
-  if (runTerminal) runTerminal.dispose();
-  runTerminal = vscode.window.createTerminal({ name: `▶ ${path.basename(file)}`, cwd: dir, env });
-  runTerminal.show(true);
-  runTerminal.sendText(`${q(compiler.path)} ${opt} ${q(file)} -o ${q(out)} && ${q(out)}`);
+  const out = path.join(os.tmpdir(), "stellang-ir", path.basename(file, ".st") + ".ll");
+  fs.mkdirSync(path.dirname(out), { recursive: true });
+  const opt = config().get("optimization");
+  cp.execFile(compiler.path, [opt, file, "--emit-llvm", "-o", out], { cwd: path.dirname(file) }, async (err, _o, stderr) => {
+    if (err) {
+      vscode.window.showErrorMessage(`stellang: ${(stderr || err.message).trim().split("\n")[0]}`);
+      return;
+    }
+    const ir = await vscode.workspace.openTextDocument(out);
+    await vscode.window.showTextDocument(ir, { viewColumn: vscode.ViewColumn.Beside, preview: true, preserveFocus: true });
+  });
+}
+
+const THEMES = [
+  { label: "$(star-full) Stellang Nebula", description: "dark: deep space, gold stars", theme: "Stellang Nebula" },
+  { label: "$(star-empty) Stellang Daybreak", description: "light", theme: "Stellang Daybreak" },
+];
+
+async function useTheme() {
+  const pick = await vscode.window.showQuickPick(THEMES, { placeHolder: "A color theme made for stellang" });
+  if (pick) await vscode.workspace.getConfiguration("workbench").update("colorTheme", pick.theme, vscode.ConfigurationTarget.Global);
+}
+
+/** Once: point out the themes (only if a stellang file is open and another theme is in use). */
+function offerTheme(context) {
+  if (context.globalState.get("themeOffered") || !config().get("suggestTheme")) return;
+  const current = vscode.workspace.getConfiguration("workbench").get("colorTheme") || "";
+  if (current.startsWith("Stellang")) return;
+  context.globalState.update("themeOffered", true);
+  vscode.window
+    .showInformationMessage("stellang comes with a star-themed color theme, made for its syntax.", "Try Stellang Nebula", "Daybreak (light)", "No thanks")
+    .then((pick) => {
+      const theme = pick === "Try Stellang Nebula" ? "Stellang Nebula" : pick === "Daybreak (light)" ? "Stellang Daybreak" : null;
+      if (theme) vscode.workspace.getConfiguration("workbench").update("colorTheme", theme, vscode.ConfigurationTarget.Global);
+    });
 }
 
 function task(kind, file) {
@@ -277,6 +330,9 @@ async function newFile() {
   ed.insertSnippet(new vscode.SnippetString('fn main() {\n\tprintln("hello from stellang ⭐")$0\n}\n'));
 }
 
+/** Arguments a command got from a tree item, a URI, or nothing. */
+const fileArg = (x) => (x?.file ? vscode.Uri.file(x.file) : x?.resourceUri ?? x);
+
 // ---- activation ----
 
 exports.activate = async (context) => {
@@ -286,10 +342,23 @@ exports.activate = async (context) => {
   status.command = "stellang.statusMenu";
   status.name = "stellang";
 
+  runner = new Runner(() => compiler, config);
+  context.subscriptions.push(runner);
+  const trees = views.register(context, runner);
+
   const cmd = (id, f) => context.subscriptions.push(vscode.commands.registerCommand(id, f));
-  cmd("stellang.run", run);
-  cmd("stellang.build", build);
-  cmd("stellang.check", check);
+  cmd("stellang.run", (x) => run(fileArg(x)));
+  cmd("stellang.build", (x) => build(fileArg(x)));
+  cmd("stellang.check", (x) => check(fileArg(x)));
+  cmd("stellang.stop", (x) => runner.stop(x?.file));
+  cmd("stellang.restartRun", (x) => (x?.file ? runner.run(x.file) : runner.current()?.restart()));
+  cmd("stellang.runMenu", runMenu);
+  cmd("stellang.showIr", (x) => showIr(fileArg(x)));
+  cmd("stellang.newProject", (id) => newProject(context, typeof id === "string" ? id : undefined));
+  cmd("stellang.useTheme", useTheme);
+  cmd("stellang.walkthrough", () =>
+    vscode.commands.executeCommand("workbench.action.openWalkthrough", "stellang.stellang#stellang.start", false)
+  );
   cmd("stellang.toEmoji", () => convert("--emoji"));
   cmd("stellang.toPlain", () => convert("--plain"));
   cmd("stellang.restart", restart);
@@ -301,9 +370,6 @@ exports.activate = async (context) => {
     output,
     status,
     vscode.window.onDidChangeActiveTextEditor(updateStatusVisibility),
-    vscode.window.onDidCloseTerminal((t) => {
-      if (t === runTerminal) runTerminal = undefined;
-    }),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("stellang.path")) restart();
       if (e.affectsConfiguration("stellang.codeLens") && client) restart();
@@ -326,7 +392,19 @@ exports.activate = async (context) => {
     })
   );
   setStatus("starting");
+  if (vscode.window.activeTextEditor?.document.languageId === "stellang") offerTheme(context);
+  else {
+    const once = vscode.window.onDidChangeActiveTextEditor((ed) => {
+      if (ed?.document.languageId === "stellang") {
+        once.dispose();
+        offerTheme(context);
+      }
+    });
+    context.subscriptions.push(once);
+  }
   await startClient();
+  // for tests and other extensions
+  return { runner, trees, createProject: (id, dir, name) => create(context, id, dir, name), templates: TEMPLATES.map((t) => t.id) };
 };
 
 exports.deactivate = () => client?.stop();

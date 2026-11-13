@@ -9,25 +9,75 @@ compiler, with nothing to update by hand.
 
 ## Features
 
-- **Errors as you type**: the compiler's own messages, underlined where they happen.
-- **Hover**: the type of any variable, field or call, with the doc comment above declarations.
-- **Inlay hints**: `let user = find(id)` shows `: User?` after the name.
-- **Completion**: keywords, builtins, your functions, types and variants. After a `.` it suggests
-  the members of that value's actual type, a module's items, or an enum's variants.
-- **Signature help** while you type the arguments of a call.
-- **Go to definition** (also into the standard library), **find all references**, **rename**,
-  **highlight occurrences**.
-- **Outline / breadcrumbs / Go to Symbol** in the file and across the workspace.
-- **Format** on save (`stellang fmt`), **folding**, bracket colorizing, comment toggling.
-- **Semantic highlighting** that knows types, enum variants, functions, methods and modules, plus a
-  TextMate grammar generated from the compiler's keyword table (it also highlights stellang code blocks in Markdown).
-- **Run** with `Ctrl+F5` / `Cmd+F5`, the ▶ button in the editor title, or the `▶ Run | Build`
-  lens above `fn main`. Each run gets a fresh terminal, so a restarted server gets its port back.
-- **Build** and **Check** as tasks. Compiler errors and runtime panics show up in the Problems panel
-  through the `$stellang` problem matcher.
-- **Snippets**: `main`, `fn`, `struct`, `enum`, `match`, `matchopt`, `iflet`, `letelse`, `server`,
-  `get`, `ws`, `use`, …
-- **File icon** for `.st` files and a status bar item showing which compiler is in use.
+### Completion that asks the type checker
+
+While you type, the language server swaps the word under the cursor for a placeholder and runs the
+real type checker, so it knows exactly what's in front of the `.`, even in code that doesn't compile yet.
+
+- `x.` lists `x`'s fields and methods, with their types and docs. That includes the builtin ones
+  (`xs.filter(…)`, `s.split(…)`, `m.get(…)`), with `T`, `K`, `V` filled in from the real type.
+- Functions insert their parameters as tab stops. Callbacks get a lambda head, so `app.get(` writes
+  `"…", (req, res) => …`.
+- `.` where an enum is expected (`let s: Shape = .`, `area(.`) lists that enum's variants and their fields.
+- Inside `Todo { … }`, completion lists only the fields not written yet, or **all required fields** at once.
+- Inside a `match`, it offers a pattern for every case, or **all cases** at once.
+- **Postfix completions**: `expr.match` (with one arm per case), `.if`, `.for`, `.let`, `.var`,
+  `.println`, `.iflet`, `.else`, `.or`, `.catch`, `.try`, `.return`.
+- `http.` or `json.` imports the module for you if it isn't imported yet.
+- On an optional, `x.field` offers to reach through with `?.`.
+
+### JSX
+
+- After `<`: your components (with their required props filled in as tab stops) and HTML elements.
+- Inside a tag: a component's props (or the fields of its props struct) and their types; for HTML
+  elements the usual attributes and the events (`onclick={() => …}`, `oninput={v => …}`, …).
+- After `</`: the tag that's still open.
+- Tags, components, attributes and event attributes each get their own color.
+
+### Quick fixes
+
+- **Add the missing match arms** when a `match` doesn't handle every case.
+- **Import `http`** (or any std module) when you use one without importing it.
+- **Change to `…`** for misspelled names, fields and methods.
+
+### Looks
+
+- **Two star themes**: *Stellang Nebula* (dark: deep space, gold functions, cyan types, aurora-green
+  enums) and *Stellang Daybreak* (light).
+- **Semantic highlighting** that tells structs from enums from variants, fields from methods, and
+  parameters from `let`s and `var`s (underlined, because they can change). The error-flow marks `?` `!` `??` `?.`
+  stand out, and so do the `⭐` braces.
+- A TextMate grammar generated from the compiler's own keyword table, with a separate scope for
+  everything (also used for stellang code blocks in Markdown).
+
+### The stellang sidebar
+
+- **Programs**: every file with a `fn main`. Run, stop, restart and build from there.
+- **Types**: every struct and enum in the workspace, with fields, variants and methods.
+- **HTTP Routes**: every `app.get/post/put/patch/delete/ws/static/use_at`. While the server runs, open a GET route in the browser.
+
+### Running
+
+- `Ctrl+F5` / `Cmd+F5`, ▶ in the editor title, `▶ Run | Build` above `fn main`, or the sidebar.
+- Programs run in a ⭐ terminal the extension owns. You can type input into it; Ctrl+C or `Shift+F5`
+  stops the program, and any key runs it again after it exits.
+- When a program prints a `http://localhost:…` address, the extension offers to open it in the
+  browser or inside VS Code. The status bar shows the port; click it to restart or stop.
+- **Full-stack apps** (a folder with `server.st` and `client.st`) run under `stellang dev`: the client is
+  built for WebAssembly, the server runs, and both are rebuilt on every save.
+- **Browser apps** (`import web` + `web.mount`) are built with `stellang --web` and served on a local port.
+- **Show LLVM IR** opens the code the compiler generates.
+- **Build** and **Check** are tasks. Compiler errors and runtime panics show up in the Problems
+  panel through the `$stellang` problem matcher.
+
+### And
+
+- **New Project…** with templates (hello, web server, JSON API + WebSockets, data modeling, CLI,
+  full-stack app, browser app) and
+  a **Get Started** walkthrough.
+- Hover types and docs, inlay type and parameter-name hints, signature help (builtin methods too),
+  go to definition (into the standard library), references, rename, highlights, outline, workspace symbols,
+  folding, format on save.
 - The emoji keywords: **stellang: Convert Keywords to Emoji 🦍** (and back).
 
 ## Setup
@@ -53,10 +103,13 @@ To *build and run* programs you also need clang and the Boehm GC library
 | `stellang.path` | (search) | The compiler to use. |
 | `stellang.optimization` | `-O2` | Optimization level for Run and Build. |
 | `stellang.run.env` | `{}` | Environment variables for Run, e.g. `{"PORT": "3000"}`. |
+| `stellang.run.args` | `[]` | Command-line arguments for Run. |
+| `stellang.run.openBrowser` | `ask` | When a program prints a localhost address: `ask`, `always`, `never`. |
+| `stellang.suggestTheme` | `true` | Suggest the Stellang Nebula theme once. |
 | `stellang.codeLens` | `true` | `▶ Run \| Build` above `fn main`. |
 | `stellang.trace.server` | `off` | Log language server traffic to *Output → stellang*. |
 
-The extension also sets `[stellang]` defaults: 4-space indent, format on save, semantic highlighting.
+The extension also sets `[stellang]` defaults: 4-space indent, format on save, semantic highlighting, inlay hints, bracket colors.
 
 ## Tasks
 

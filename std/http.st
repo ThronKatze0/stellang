@@ -109,6 +109,11 @@ struct Response {
         self.type("text/html; charset=utf-8").send(body)
     }
 
+    // Send a whole page: a Node from JSX like `<html>...</html>` (gets the <!doctype>).
+    fn page(self, doc: Node) {
+        self.html("<!doctype html>\n" + str(doc))
+    }
+
     // Send JSON text, e.g. `res.json(to_json(user))`.
     fn json(self, body: str) {
         self.type("application/json").send(body)
