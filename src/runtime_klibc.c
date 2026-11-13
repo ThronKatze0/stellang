@@ -140,6 +140,12 @@ int tolower(int c) { return isupper(c) ? c + 32 : c; }
 #define isinf(x) __builtin_isinf(x)
 #define fabs(x) __builtin_fabs(x)
 
+double sqrt(double x) {
+    double r;
+    __asm__("fsqrt.d %0, %1" : "=f"(r) : "f"(x));
+    return r;
+}
+
 double floor(double x) {
     if (!(fabs(x) < 4503599627370496.0)) return x; // 2^52: already whole (or nan/inf)
     double t = (double)(int64_t)x;

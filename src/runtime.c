@@ -143,7 +143,7 @@ char *st_html_escape(const char *s) {
     return r;
 }
 
-#ifndef ST_WASM
+#if !defined(ST_WASM) && !defined(ST_KERNEL)
 // On the server event handlers aren't rendered and state isn't kept between renders.
 int64_t st_on(void *f, int64_t arity) { (void)f; (void)arity; return 0; }
 void **st_hook(void) { return alloc(1, sizeof(void *), 0); }
@@ -323,7 +323,12 @@ char *st_repeat(const char *s, int64_t n) {
 
 Vec *st_chars(const char *s) {
     Vec *v = st_vec_new(0, sizeof(char *), 0);
-    for (; *s; s++) st_vec_push_str(v, mkstr(s, 1));
+    while (*s) { // one character each: a UTF-8 lead byte and its continuation bytes
+        size_t n = 1;
+        while (s[n] && ((unsigned char)s[n] & 0xc0) == 0x80) n++;
+        st_vec_push_str(v, mkstr(s, n));
+        s += n;
+    }
     return v;
 }
 
@@ -987,6 +992,16 @@ char *st_chr(int64_t c) {
     else if (c < 0x10000) b[0] = (char)(0xE0 | c >> 12), b[1] = (char)(0x80 | (c >> 6 & 63)), b[2] = (char)(0x80 | (c & 63));
     else b[0] = (char)(0xF0 | c >> 18), b[1] = (char)(0x80 | (c >> 12 & 63)), b[2] = (char)(0x80 | (c >> 6 & 63)), b[3] = (char)(0x80 | (c & 63));
     return mkstr(b, strlen(b));
+}
+
+// the code point of the first character of `s` (0 for "")
+int64_t st_ord(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    int64_t c = *p++;
+    int more = c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : c >= 0xc0 ? 1 : 0;
+    if (more) c &= 0x3f >> more;
+    while (more-- && (*p & 0xc0) == 0x80) c = (c << 6) | (*p++ & 0x3f);
+    return c;
 }
 
 // ---- HTTP(S) client on libcurl, for http.fetch / http.request (not in the browser: `import http` is server-only) ----

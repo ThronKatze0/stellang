@@ -41,6 +41,7 @@ extern fn st_k_kernel_size() -> int
 extern fn st_k_gc_runs() -> int
 extern fn st_k_gc()
 extern fn st_k_alloc_pages(n: int) -> int
+extern fn st_k_alloc(bytes: int) -> int
 extern fn st_k_pages_out() -> int
 extern fn st_k_copy(dst: int, src: int, n: int)
 extern fn st_k_fill32(dst: int, count: int, value: int)
@@ -276,7 +277,7 @@ fn gc() {
     st_k_gc()
 }
 
-// Timer interrupts so far (100 a second).
+// Timer interrupts so far (1000 a second).
 fn ticks() -> int {
     return st_k_ticks()
 }
@@ -296,6 +297,10 @@ fn poke64(addr: int, v: int) { st_k_poke(addr, 8, v) }
 // queues, DMA, a framebuffer): `n` zeroed 4 KiB pages at a fixed physical address, never freed.
 fn alloc_pages(n: int) -> int { return st_k_alloc_pages(n) }
 
+// Memory from the garbage-collected heap (zeroed), for buffers of bytes: freed once no int holds
+// its address any more (the collector also treats ints that look like addresses as references).
+fn alloc(bytes: int) -> int { return st_k_alloc(bytes) }
+
 // Bulk memory: copy bytes, fill with a 32-bit value (pixels), and strings to and from memory.
 fn copy(dst: int, src: int, n: int) { st_k_copy(dst, src, n) }
 fn fill32(dst: int, count: int, value: int) { st_k_fill32(dst, count, value) }
@@ -310,4 +315,49 @@ fn irq_enable(irq: int) {
 
 fn irq_count(irq: int) -> int {
     return st_k_irq_count(irq)
+}
+
+// ---- the real time ----
+
+// Milliseconds since 1970-01-01, from the machine's real-time clock (QEMU's: UTC, or local time when
+// booted with `-rtc base=localtime`, as `stellang boot` does).
+fn time_ms() -> int {
+    let lo = st_k_peek(0x10_1000, 4)       // reading the low half latches the high half
+    let hi = st_k_peek(0x10_1004, 4)
+    return ((hi << 32) | lo) / 1_000_000
+}
+
+struct Date {
+    year: int,
+    month: int,       // 1..12
+    day: int,         // 1..31
+    hour: int,
+    minute: int,
+    second: int,
+    weekday: int,     // 0 = Monday .. 6 = Sunday
+}
+
+// The calendar date and time of `ms` since 1970.
+fn date(ms: int) -> Date {
+    let secs = ms / 1000
+    let days = secs / 86400
+    let rem = secs % 86400
+    // days -> civil date (Howard Hinnant's algorithm)
+    let z = days + 719468
+    let era = z / 146097
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 }
+    return Date { year: y, month: m, day: d, hour: rem / 3600, minute: rem % 3600 / 60, second: rem % 60, weekday: (days + 3) % 7 }
+}
+
+const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+fn two(n: int) -> str {
+    return if n < 10 { "0${n}" } else { "${n}" }
 }

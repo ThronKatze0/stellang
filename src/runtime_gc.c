@@ -53,10 +53,17 @@ static void gc_track(Page *p, uint32_t npages) {
 static void *gc_alloc_large(size_t n, int atomic) {
     uint32_t np = (uint32_t)((n + HDR + PAGE - 1) / PAGE);
     Page *p = NULL;
-    for (Page **q = &free_spans; *q; q = &(*q)->next) {
-        if ((*q)->npages == np) {
+    for (Page **q = &free_spans; *q; q = &(*q)->next) { // first fit; the rest of a bigger span stays free
+        if ((*q)->npages >= np) {
             p = *q;
             *q = p->next;
+            if (p->npages > np) {
+                Page *rest = (Page *)((char *)p + (size_t)np * PAGE);
+                rest->npages = p->npages - np;
+                rest->next = free_spans;
+                free_spans = rest;
+                p->npages = np;
+            }
             break;
         }
     }

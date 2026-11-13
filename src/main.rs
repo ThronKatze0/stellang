@@ -18,6 +18,7 @@ const RUNTIME_WEB: &str = include_str!("runtime_web.c");
 const RUNTIME_GC: &str = include_str!("runtime_gc.c");
 const RUNTIME_KLIBC: &str = include_str!("runtime_klibc.c");
 const RUNTIME_KERNEL: &str = include_str!("runtime_kernel.c");
+const RUNTIME_FONT: &str = include_str!("runtime_font.c");
 const KERNEL_LD: &str = include_str!("kernel.ld");
 const LOADER: &str = include_str!("loader.js");
 
@@ -29,13 +30,15 @@ pub const STD: &[(&str, &str)] = &[
     ("json", include_str!("../std/json.st")),
     ("web", include_str!("../std/web.st")),
     ("kernel", include_str!("../std/kernel.st")),
+    ("gfx", include_str!("../std/gfx.st")),
 ];
 
 const USAGE: &str = "usage:
   stellang <file.st> [-o <out>] [-O0|-O1|-O2|-O3|-Os] [--emit-llvm]   compile
   stellang --web <app.st> [-o <out>]                                   compile for the browser (out.wasm + out.js)
   stellang --kernel <os.st> [-o <out>]                                 compile an operating system kernel (RISC-V 64, out.elf)
-  stellang boot [--gui] <os.st|os.elf> [qemu args]                      build it and boot it in QEMU (--gui: with a display)
+  stellang boot [--gui] [--disk f.img] <os.st|os.elf> [qemu args]      build it and boot it in QEMU (--gui: with a display,
+                                                                        keyboard and mouse; a disk image keeps files)
   stellang dev [dir]                                                    full-stack dev loop: client.st -> public/, server.st; rebuild on change
   stellang check <file.st>                                             type-check only
   stellang fmt [--emoji|--plain] <file.st>                              re-indent in place
@@ -246,7 +249,7 @@ fn build_kernel(input: &str, out: Option<String>, opt: &str, emit: bool) -> Stri
     let units = load_or_exit(input);
     for u in &units {
         for (imp, pos) in &u.module.imports {
-            if ["net", "http", "fs", "web"].contains(&imp.as_str()) {
+            if ["net", "http", "fs"].contains(&imp.as_str()) {
                 eprintln!("{}:{}:{}: error: `import {imp}` needs a host operating system; a --kernel program has `import kernel`", u.file, pos.line, pos.col);
                 exit(1)
             }
@@ -269,7 +272,7 @@ fn build_kernel(input: &str, out: Option<String>, opt: &str, emit: bool) -> Stri
     fs::create_dir_all(&tmp).unwrap_or_else(|e| die(e));
     let rt = tmp.join("runtime.c");
     let ld = tmp.join("kernel.ld");
-    fs::write(&rt, format!("{RUNTIME_KLIBC}\n{RUNTIME}\n{RUNTIME_GC}\n{RUNTIME_KERNEL}")).unwrap_or_else(|e| die(e));
+    fs::write(&rt, format!("{RUNTIME_KLIBC}\n{RUNTIME}\n{RUNTIME_GC}\n{RUNTIME_FONT}\n{RUNTIME_KERNEL}")).unwrap_or_else(|e| die(e));
     fs::write(&ld, KERNEL_LD).unwrap_or_else(|e| die(e));
     let elf = format!("{base}.elf");
     let mut cmd = Command::new("clang");
@@ -291,8 +294,23 @@ fn build_kernel(input: &str, out: Option<String>, opt: &str, emit: bool) -> Stri
 /// `stellang boot os.st` (or os.elf): build the kernel if needed and boot it in QEMU, the console on
 /// this terminal. QEMU's exit code is the kernel's (main's return value, 101 for a panic).
 fn boot(args: &[String]) {
-    let gui = args.first().is_some_and(|a| a == "--gui");
-    let args = if gui { &args[1..] } else { args };
+    let mut gui = false;
+    let mut disk: Option<String> = None;
+    let mut no_disk = false;
+    let mut i = 0;
+    while i < args.len() && args[i].starts_with("--") {
+        match args[i].as_str() {
+            "--gui" => gui = true,
+            "--no-disk" => no_disk = true,
+            "--disk" if i + 1 < args.len() => {
+                i += 1;
+                disk = Some(args[i].clone());
+            }
+            other => die(format!("boot: unknown option {other}\n{USAGE}")),
+        }
+        i += 1;
+    }
+    let args = &args[i..];
     let Some(input) = args.first() else { die(USAGE) };
     let elf = if input.ends_with(".elf") {
         input.clone()
@@ -300,12 +318,42 @@ fn boot(args: &[String]) {
         let out = env::temp_dir().join(format!("stellang-boot-{}", std::process::id())).display().to_string();
         build_kernel(input, Some(out), "-O2", false)
     };
+    // the disk: a file that keeps what the kernel writes, from one boot to the next
+    let disk = if no_disk {
+        None
+    } else {
+        let path = disk.map(std::path::PathBuf::from).unwrap_or_else(|| {
+            let cache = env::var_os("XDG_CACHE_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))
+                .unwrap_or_else(env::temp_dir);
+            let stem = Path::new(input).file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            cache.join("stellang").join(format!("{stem}.img"))
+        });
+        if !path.exists() {
+            if let Some(dir) = path.parent() {
+                fs::create_dir_all(dir).unwrap_or_else(|e| die(format!("{}: {e}", dir.display())));
+            }
+            let f = fs::File::create(&path).unwrap_or_else(|e| die(format!("{}: {e}", path.display())));
+            f.set_len(16 << 20).unwrap_or_else(|e| die(format!("{}: {e}", path.display())));
+        }
+        eprintln!("disk: {} (`--no-disk` to boot without one)", path.display());
+        Some(path)
+    };
     let qemu = env::var("STELLANG_QEMU").unwrap_or_else(|_| "qemu-system-riscv64".into());
     let mut cmd = Command::new(&qemu);
-    cmd.args(["-machine", "virt", "-m", "256M", "-bios", "default", "-kernel", &elf]);
+    cmd.args(["-machine", "virt", "-m", "512M", "-bios", "default", "-kernel", &elf, "-rtc", "base=localtime"]);
+    cmd.args(["-global", "virtio-mmio.force-legacy=false"]); // virtio 1.x devices (what the drivers speak)
+    if let Some(d) = &disk {
+        cmd.arg("-drive").arg(format!("file={},if=none,format=raw,id=disk0", d.display()));
+        cmd.args(["-device", "virtio-blk-device,drive=disk0"]);
+    }
     if gui {
-        // a window with the display (a ramfb framebuffer); the console stays on this terminal
-        cmd.args(["-device", "ramfb", "-serial", "mon:stdio"]);
+        // a window with the display (a ramfb framebuffer), a keyboard and a mouse (virtio-input; the
+        // tablet reports absolute positions, so the pointer follows the host's); the console stays
+        // on this terminal
+        cmd.args(["-device", "ramfb", "-device", "virtio-keyboard-device", "-device", "virtio-tablet-device"]);
+        cmd.args(["-serial", "mon:stdio"]);
     } else {
         cmd.arg("-nographic");
     }

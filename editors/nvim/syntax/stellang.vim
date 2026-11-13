@@ -24,6 +24,7 @@ syn match stellangFunction "\<[a-z_][A-Za-z0-9_]*\ze\s*("
 syn region stellangInterp matchgroup=stellangInterpDelim start="\${" end="}" contained contains=TOP
 syn match stellangEscape "\\[nrt\\\"$]" contained
 syn region stellangString start=+"+ skip=+\\\\\|\\"+ end=+"+ contains=stellangEscape,stellangInterp
+syn region stellangString start=+"""+ end=+"""+ contains=stellangEscape,stellangInterp
 syn match stellangComment "//.*$" contains=@Spell
 syn match stellangTag "\(\w\)\@<!</\=\zs[a-z][a-z0-9-]*\ze[ \t/>]"
 syn match stellangComponent "\(\w\)\@<!</\=\zs\([a-z_]\w*\.\)*[A-Z]\w*\ze[ \t/>]"

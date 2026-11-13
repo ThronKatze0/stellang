@@ -144,9 +144,9 @@ pub fn textmate() -> String {
     ]);
     let string = obj([
         ("name", "string.quoted.double.stellang".into()),
-        ("begin", "\"".into()),
+        ("begin", "(\"\"\"|\")".into()), // """ over several lines """, or "one line"
         ("beginCaptures", obj([("0", obj([("name", "punctuation.definition.string.begin.stellang".into())]))])),
-        ("end", "\"".into()),
+        ("end", "\\1".into()), // the same quotes it began with
         ("endCaptures", obj([("0", obj([("name", "punctuation.definition.string.end.stellang".into())]))])),
         (
             "patterns",
@@ -245,6 +245,7 @@ pub fn vim() -> String {
     s += "syn region stellangInterp matchgroup=stellangInterpDelim start=\"\\${\" end=\"}\" contained contains=TOP\n";
     s += "syn match stellangEscape \"\\\\[nrt\\\\\\\"$]\" contained\n";
     s += "syn region stellangString start=+\"+ skip=+\\\\\\\\\\|\\\\\"+ end=+\"+ contains=stellangEscape,stellangInterp\n";
+    s += "syn region stellangString start=+\"\"\"+ end=+\"\"\"+ contains=stellangEscape,stellangInterp\n";
     s += "syn match stellangComment \"//.*$\" contains=@Spell\n";
     s += "syn match stellangTag \"\\(\\w\\)\\@<!</\\=\\zs[a-z][a-z0-9-]*\\ze[ \\t/>]\"\n";
     s += "syn match stellangComponent \"\\(\\w\\)\\@<!</\\=\\zs\\([a-z_]\\w*\\.\\)*[A-Z]\\w*\\ze[ \\t/>]\"\n";

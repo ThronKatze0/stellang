@@ -211,12 +211,26 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
             let s: String = cs[start..i].iter().collect();
             WORDS.iter().find(|w| w.0 == s).map_or(Tok::Ident(s), |w| w.1.clone())
         } else if c == '"' {
-            i += 1;
+            // """ ... """: a string over several lines (the line break right after the opening quotes isn't part of it)
+            let triple = cs.get(i + 1) == Some(&'"') && cs.get(i + 2) == Some(&'"');
+            i += if triple { 3 } else { 1 };
+            if triple && cs.get(i) == Some(&'\n') {
+                i += 1;
+            }
             let mut s = String::new();
             let mut parts = vec![];
             loop {
                 match cs.get(i) {
-                    None | Some('\n') => return Err((pos, "unterminated string".into())),
+                    None => return Err((pos, "unterminated string".into())),
+                    Some('\n') if !triple => return Err((pos, "unterminated string (for several lines, use \"\"\"...\"\"\")".into())),
+                    Some('"') if triple => {
+                        if cs.get(i + 1) == Some(&'"') && cs.get(i + 2) == Some(&'"') {
+                            i += 3;
+                            break;
+                        }
+                        s.push('"');
+                        i += 1;
+                    }
                     Some('"') => { i += 1; break }
                     Some('$') if cs.get(i + 1) == Some(&'{') => {
                         let from = i + 2;

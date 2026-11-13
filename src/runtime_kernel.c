@@ -123,7 +123,15 @@ static void uart_putc(char c) {
     REG8(UART) = (uint8_t)c;
 }
 
+// A copy of the console output for a terminal window (st_k_console_take), when one is open.
+static char con_buf[1 << 16];
+static uint32_t con_len;
+static bool con_capture;
+
 void kputs(const char *s, size_t n) {
+    if (con_capture) {
+        for (size_t i = 0; i < n && con_len < sizeof con_buf; i++) con_buf[con_len++] = s[i];
+    }
     for (size_t i = 0; i < n; i++) {
         if (s[i] == '\n') uart_putc('\r');
         uart_putc(s[i]);
@@ -262,7 +270,7 @@ void st_k_gc(void) { gc_collect(); }
 // ---- time ----
 
 static volatile uint64_t ticks;
-#define TICK_HZ 100
+#define TICK_HZ 1000
 
 static void timer_arm(void) { sbi(0x54494D45, 0, (long)(rdtime() + timebase / TICK_HZ), 0); }
 
@@ -294,6 +302,10 @@ void st_trap(uint64_t cause, uint64_t epc, uint64_t tval, uint64_t *frame) {
         } else if (code == 9) { // supervisor external: ask the PLIC which device
             uint32_t irq = REG32(PLIC + 0x201004);
             if (irq == UART_IRQ) uart_drain();
+            if (irq >= 1 && irq <= 8) { // virtio-mmio: acknowledge it at the device, or it fires again
+                uintptr_t dev = 0x10001000ul + (irq - 1) * 0x1000ul;
+                REG32(dev + 0x64) = REG32(dev + 0x60);
+            }
             if (irq && irq < 128) plic_counts[irq]++;
             if (irq) REG32(PLIC + 0x201004) = irq;
         }
@@ -415,6 +427,345 @@ void st_k_irq_enable(int64_t irq) {
 }
 
 int64_t st_k_irq_count(int64_t irq) { return irq > 0 && irq < 128 ? (int64_t)plic_counts[irq] : 0; }
+
+// ---- 2D drawing (std/gfx.st) ----
+//
+// Everything draws into the current target (a surface: 32-bit 0x00RRGGBB pixels, row after row),
+// clipped to its clip rectangle. Colors are 0xRRGGBB; `alpha` is 0 (invisible) .. 255 (opaque).
+// Text uses the anti-aliased faces in runtime_font.c.
+
+static uint32_t *g_px;
+static int64_t g_w, g_h, g_cx0, g_cy0, g_cx1, g_cy1;
+
+// Memory for a surface (or any buffer of plain bytes) from the garbage-collected heap: zeroed,
+// and freed once no value holds its address any more.
+int64_t st_k_alloc(int64_t bytes) { return (int64_t)(uintptr_t)GC_malloc_atomic(bytes > 0 ? (size_t)bytes : 1); }
+
+void st_g_target(int64_t base, int64_t w, int64_t h) {
+    g_px = (uint32_t *)(uintptr_t)base;
+    g_w = w, g_h = h;
+    g_cx0 = g_cy0 = 0, g_cx1 = w, g_cy1 = h;
+}
+
+// Clip to a rectangle (inside the surface); further drawing stays in it.
+void st_g_clip(int64_t x, int64_t y, int64_t w, int64_t h) {
+    g_cx0 = x < 0 ? 0 : x, g_cy0 = y < 0 ? 0 : y;
+    g_cx1 = x + w > g_w ? g_w : x + w, g_cy1 = y + h > g_h ? g_h : y + h;
+}
+
+static inline uint32_t mixpx(uint32_t d, uint32_t s, uint32_t a) { // a: 0..256
+    uint32_t rb = ((s & 0xff00ff) * a + (d & 0xff00ff) * (256 - a)) >> 8;
+    uint32_t g = ((s & 0x00ff00) * a + (d & 0x00ff00) * (256 - a)) >> 8;
+    return (rb & 0xff00ff) | (g & 0x00ff00);
+}
+
+// clip a rectangle; false if nothing is left
+static bool g_clipr(int64_t *x, int64_t *y, int64_t *w, int64_t *h) {
+    int64_t x0 = *x < g_cx0 ? g_cx0 : *x, y0 = *y < g_cy0 ? g_cy0 : *y;
+    int64_t x1 = *x + *w > g_cx1 ? g_cx1 : *x + *w, y1 = *y + *h > g_cy1 ? g_cy1 : *y + *h;
+    if (!g_px || x1 <= x0 || y1 <= y0) return false;
+    *x = x0, *y = y0, *w = x1 - x0, *h = y1 - y0;
+    return true;
+}
+
+void st_g_fill(int64_t x, int64_t y, int64_t w, int64_t h, int64_t color) {
+    if (!g_clipr(&x, &y, &w, &h)) return;
+    uint32_t c = (uint32_t)color & 0xffffff;
+    for (int64_t r = 0; r < h; r++) {
+        uint32_t *p = g_px + (y + r) * g_w + x;
+        for (int64_t i = 0; i < w; i++) p[i] = c;
+    }
+}
+
+void st_g_blend(int64_t x, int64_t y, int64_t w, int64_t h, int64_t color, int64_t alpha) {
+    if (alpha >= 255) { st_g_fill(x, y, w, h, color); return; }
+    if (alpha <= 0 || !g_clipr(&x, &y, &w, &h)) return;
+    uint32_t c = (uint32_t)color, a = (uint32_t)alpha + 1;
+    for (int64_t r = 0; r < h; r++) {
+        uint32_t *p = g_px + (y + r) * g_w + x;
+        for (int64_t i = 0; i < w; i++) p[i] = mixpx(p[i], c, a);
+    }
+}
+
+static inline void g_plot(int64_t x, int64_t y, uint32_t c, uint32_t a) { // a: 0..256
+    if (x < g_cx0 || y < g_cy0 || x >= g_cx1 || y >= g_cy1 || !a) return;
+    uint32_t *p = g_px + y * g_w + x;
+    *p = a >= 256 ? c : mixpx(*p, c, a);
+}
+
+void st_g_pixel(int64_t x, int64_t y, int64_t color) { if (g_px) g_plot(x, y, (uint32_t)color & 0xffffff, 256); }
+
+int64_t st_g_get(int64_t x, int64_t y) {
+    if (!g_px || x < 0 || y < 0 || x >= g_w || y >= g_h) return 0;
+    return g_px[y * g_w + x];
+}
+
+// A rectangle with rounded corners (radius r), its edges anti-aliased.
+void st_g_round(int64_t x, int64_t y, int64_t w, int64_t h, int64_t r, int64_t color, int64_t alpha) {
+    if (w <= 0 || h <= 0 || alpha <= 0) return;
+    if (r * 2 > w) r = w / 2;
+    if (r * 2 > h) r = h / 2;
+    if (r <= 0) { st_g_blend(x, y, w, h, color, alpha); return; }
+    st_g_blend(x, y + r, w, h - 2 * r, color, alpha);
+    uint32_t c = (uint32_t)color & 0xffffff;
+    for (int64_t j = 0; j < r; j++) {
+        // rows of the top and bottom bands: full in the middle, coverage at the corners
+        st_g_blend(x + r, y + j, w - 2 * r, 1, color, alpha);
+        st_g_blend(x + r, y + h - 1 - j, w - 2 * r, 1, color, alpha);
+        for (int64_t i = 0; i < r; i++) {
+            double dx = r - i - 0.5, dy = r - j - 0.5;
+            double cov = (double)r - sqrt(dx * dx + dy * dy) + 0.5;
+            if (cov <= 0) continue;
+            if (cov > 1) cov = 1;
+            uint32_t a = (uint32_t)(cov * (double)(alpha + 1));
+            g_plot(x + i, y + j, c, a);
+            g_plot(x + w - 1 - i, y + j, c, a);
+            g_plot(x + i, y + h - 1 - j, c, a);
+            g_plot(x + w - 1 - i, y + h - 1 - j, c, a);
+        }
+    }
+}
+
+// A filled circle, anti-aliased.
+void st_g_circle(int64_t cx, int64_t cy, int64_t r, int64_t color, int64_t alpha) {
+    if (r <= 0 || alpha <= 0 || !g_px) return;
+    uint32_t c = (uint32_t)color & 0xffffff;
+    for (int64_t y = -r; y < r; y++) {
+        for (int64_t x = -r; x < r; x++) {
+            double dx = x + 0.5, dy = y + 0.5;
+            double cov = (double)r - sqrt(dx * dx + dy * dy) + 0.5;
+            if (cov <= 0) continue;
+            if (cov > 1) cov = 1;
+            g_plot(cx + x, cy + y, c, (uint32_t)(cov * (double)(alpha + 1)));
+        }
+    }
+}
+
+// A line `width` pixels wide (Bresenham, with square pens).
+void st_g_line(int64_t x0, int64_t y0, int64_t x1, int64_t y1, int64_t width, int64_t color) {
+    if (!g_px) return;
+    int64_t dx = x1 > x0 ? x1 - x0 : x0 - x1, dy = y1 > y0 ? y0 - y1 : y1 - y0;
+    int64_t sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, e = dx + dy, k = width > 1 ? width : 1;
+    for (int n = 0; n < 1 << 20; n++) {
+        if (k == 1) g_plot(x0, y0, (uint32_t)color & 0xffffff, 256);
+        else st_g_fill(x0 - k / 2, y0 - k / 2, k, k, color);
+        if (x0 == x1 && y0 == y1) break;
+        int64_t e2 = 2 * e;
+        if (e2 >= dy) e += dy, x0 += sx;
+        if (e2 <= dx) e += dx, y0 += sy;
+    }
+}
+
+// Copy a w x h block from surface `src` (sw x sh) at (sx, sy) to (dx, dy). mode 0: copy;
+// mode 1: blend by the source's top byte (0 = see-through, 255 = solid); mode 2: skip the pixels
+// equal to `key` (sprites). Scaled by `scale` (whole pixels: pixel art stays sharp).
+void st_g_blit(int64_t src, int64_t sw, int64_t sh, int64_t sx, int64_t sy, int64_t w, int64_t h, int64_t dx,
+               int64_t dy, int64_t mode, int64_t key, int64_t scale) {
+    if (!g_px || !src) return;
+    if (scale < 1) scale = 1;
+    if (sx < 0) w += sx, dx -= sx * scale, sx = 0;
+    if (sy < 0) h += sy, dy -= sy * scale, sy = 0;
+    if (sx + w > sw) w = sw - sx;
+    if (sy + h > sh) h = sh - sy;
+    if (w <= 0 || h <= 0) return;
+    int64_t x = dx, y = dy, cw = w * scale, ch = h * scale;
+    if (!g_clipr(&x, &y, &cw, &ch)) return;
+    const uint32_t *s = (const uint32_t *)(uintptr_t)src;
+    for (int64_t r = 0; r < ch; r++) {
+        const uint32_t *row = s + (sy + (y - dy + r) / scale) * sw + sx;
+        uint32_t *p = g_px + (y + r) * g_w + x;
+        if (mode == 0 && scale == 1) {
+            memcpy(p, row + (x - dx), (size_t)cw * 4);
+            continue;
+        }
+        for (int64_t i = 0; i < cw; i++) {
+            uint32_t v = row[(x - dx + i) / scale];
+            if (mode == 0) p[i] = v;
+            else if (mode == 2) { if ((v & 0xffffff) != ((uint32_t)key & 0xffffff)) p[i] = v & 0xffffff; }
+            else {
+                uint32_t a = v >> 24;
+                if (a) p[i] = a == 255 ? v & 0xffffff : mixpx(p[i], v, a + 1);
+            }
+        }
+    }
+}
+
+#define NFACE_OK(f) ((f) >= 0 && (f) < NFACES)
+
+static const Glyph *g_glyph(const Face *f, uint32_t cp) {
+    int lo = 0, hi = f->n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (f->g[mid].cp == cp) return &f->g[mid];
+        if (f->g[mid].cp < cp) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return cp == '?' ? NULL : g_glyph(f, '?');
+}
+
+static uint32_t utf8_next(const unsigned char **s) {
+    const unsigned char *p = *s;
+    uint32_t c = *p++;
+    int more = c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : c >= 0xc0 ? 1 : 0;
+    if (more) c &= 0x3f >> more;
+    while (more-- && (*p & 0xc0) == 0x80) c = (c << 6) | (*p++ & 0x3f);
+    *s = p;
+    return c;
+}
+
+// Text in face `face`, its line's top at y. Returns the width it took.
+int64_t st_g_text(int64_t x, int64_t y, const char *s, int64_t color, int64_t face) {
+    if (!NFACE_OK(face)) face = 0;
+    const Face *f = &faces[face];
+    uint32_t c = (uint32_t)color & 0xffffff;
+    int64_t x0 = x, base = y + f->ascent;
+    for (const unsigned char *p = (const unsigned char *)s; *p;) {
+        const Glyph *g = g_glyph(f, utf8_next(&p));
+        if (!g) continue;
+        if (g_px && g->w) {
+            int64_t gx = x + g->x, gy = base + g->y;
+            if (gx < g_cx1 && gy < g_cy1 && gx + g->w > g_cx0 && gy + g->h > g_cy0) {
+                const uint8_t *a = f->a + g->off;
+                for (int r = 0; r < g->h; r++)
+                    for (int i = 0; i < g->w; i++) {
+                        uint8_t v = a[r * g->w + i];
+                        if (v) g_plot(gx + i, gy + r, c, v + 1u);
+                    }
+            }
+        }
+        x += g->adv;
+    }
+    return x - x0;
+}
+
+int64_t st_g_text_width(const char *s, int64_t face) {
+    if (!NFACE_OK(face)) face = 0;
+    int64_t w = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p;) {
+        const Glyph *g = g_glyph(&faces[face], utf8_next(&p));
+        if (g) w += g->adv;
+    }
+    return w;
+}
+
+// What: 0 ascent, 1 descent, 2 line height.
+int64_t st_g_font(int64_t face, int64_t what) {
+    if (!NFACE_OK(face)) face = 0;
+    const Face *f = &faces[face];
+    return what == 0 ? f->ascent : what == 1 ? f->descent : f->ascent + f->descent;
+}
+
+// ---- the console for a terminal window ----
+
+// Keep a copy of what's printed (on), and hand it over (take).
+void st_k_console_capture(bool on) { con_capture = on; }
+char *st_k_console_take(void) {
+    char *r = GC_malloc_atomic(con_len + 1);
+    memcpy(r, con_buf, con_len);
+    con_len = 0;
+    return r;
+}
+
+// Type a byte, as if it came over the serial line.
+void st_k_inject(int64_t b) {
+    uint32_t next = (rx_head + 1) % sizeof rx;
+    if (next != rx_tail) rx[rx_head] = (uint8_t)b, rx_head = next;
+}
+
+// ---- `import web` on bare metal: JSX apps in windows ----
+//
+// The window system (in stellang) renders each app in its own context: the state cells of its
+// signals and the event handlers of its last render. Handlers come back by number, as in the browser.
+
+typedef struct {
+    Vec *hooks, *handlers, *arities;
+    int64_t hook_i;
+} UiCtx;
+
+static UiCtx *ui_cur;
+static bool ui_dirty;
+
+#define AT(t, i) (((void **)(t)->data)[i])
+static int64_t table_add(Vec **t, void *x) {
+    if (!*t) *t = st_vec_new(0, sizeof(void *), 0);
+    if ((*t)->len == (*t)->cap) st_vec_grow(*t, sizeof(void *));
+    AT(*t, (*t)->len) = x;
+    return (*t)->len++;
+}
+
+int64_t st_k_ui_new(void) { return (int64_t)(uintptr_t)GC_malloc(sizeof(UiCtx)); }
+
+// Render `app` in context `ctx`: its HTML.
+char *st_k_ui_render(int64_t ctx, Closure app) {
+    UiCtx *c = (UiCtx *)(uintptr_t)ctx, *was = ui_cur;
+    if (c->handlers) c->handlers->len = c->arities->len = 0;
+    c->hook_i = 0;
+    ui_cur = c;
+    char *html = ((char *(*)(Closure))FN(app))(app);
+    ui_cur = was;
+    return html;
+}
+
+// Call handler `id` of the context's last render, with `value` if it takes one.
+void st_k_ui_dispatch(int64_t ctx, int64_t id, const char *value) {
+    UiCtx *c = (UiCtx *)(uintptr_t)ctx;
+    if (!c || !c->handlers || id < 0 || id >= (int64_t)c->handlers->len) return;
+    Closure f = AT(c->handlers, id);
+    if ((intptr_t)AT(c->arities, id) == 1) ((void (*)(Closure, const char *))FN(f))(f, value);
+    else ((void (*)(Closure))FN(f))(f);
+}
+
+// Whether some signal changed since the last call.
+bool st_k_ui_dirty(void) {
+    bool d = ui_dirty;
+    ui_dirty = false;
+    return d;
+}
+
+void **st_hook(void) {
+    UiCtx *c = ui_cur;
+    if (!c) return GC_malloc(sizeof(void *));
+    if (!c->hooks || c->hook_i == (int64_t)c->hooks->len) table_add(&c->hooks, GC_malloc(sizeof(void *)));
+    return AT(c->hooks, c->hook_i++);
+}
+
+int64_t st_on(Closure f, int64_t arity) {
+    if (!ui_cur) return -1;
+    table_add(&ui_cur->arities, (void *)(intptr_t)arity);
+    return table_add(&ui_cur->handlers, f);
+}
+
+void st_invalidate(void) { ui_dirty = true; }
+
+void st_mount(const char *selector, Closure app) {
+    (void)selector, (void)app;
+    st_panic("panic: web.mount: on StellaOS an app opens in a window (see examples/stellaos/wm.st)\n");
+}
+int64_t st_timer(Closure f, int64_t ms, int64_t repeat) { return st_k_timer(f, ms, repeat); }
+void st_clear_timer(int64_t id) { st_k_cancel(id); }
+void st_fetch(const char *m, const char *u, const char *b, Closure done) {
+    (void)m, (void)u, (void)b;
+    ((void (*)(Closure, int64_t, const char *))FN(done))(done, 0, "no network yet");
+}
+
+// web.save/load: kept in memory until the machine stops
+static Vec *store_keys, *store_vals;
+char *st_storage_get(const char *key) {
+    for (size_t i = 0; store_keys && i < store_keys->len; i++)
+        if (!strcmp(AT(store_keys, i), key)) return AT(store_vals, i);
+    return "";
+}
+void st_storage_set(const char *key, const char *value) {
+    for (size_t i = 0; store_keys && i < store_keys->len; i++)
+        if (!strcmp(AT(store_keys, i), key)) { AT(store_vals, i) = (void *)value; return; }
+    table_add(&store_keys, (void *)key);
+    table_add(&store_vals, (void *)value);
+}
+char *st_location(void) { return "/"; }
+void st_navigate(const char *path) { (void)path; }
+void st_set_title(const char *t) { (void)t; }
+const char *st_raw(const char *html) { return html; }
+char *st_element_text(const char *id) { (void)id; return ""; }
 
 // ---- start ----
 

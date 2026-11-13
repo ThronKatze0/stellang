@@ -1,17 +1,30 @@
-// StellaOS: an operating system written in stellang. A shell on the serial console, a RAM
-// filesystem, background jobs on timers, and a calculator, all running on bare metal.
+// StellaOS: an operating system written in stellang. A desktop with windows, apps and games, a
+// shell, a RAM file system and background jobs, all running on bare metal.
 //
-//     stellang boot examples/stellaos/os.st          (QEMU, RISC-V 64; Ctrl-A X force-quits)
+//     stellang boot --gui examples/stellaos/os.st    (the desktop in a window, the shell here too)
+//     stellang boot examples/stellaos/os.st          (just the shell; Ctrl-A X force-quits)
 //
-// The C underneath (src/runtime_kernel.c) only boots the machine, fields interrupts and hands out
-// memory; everything you see is the stellang below.
+// The C underneath (src/runtime_kernel.c) only boots the machine, fields interrupts, hands out
+// memory and draws pixels fast; everything else is stellang: the drivers (display.st, input.st,
+// virtio.st), the window manager (wm.st), the UI toolkit that runs JSX apps (ui.st), the apps.
 
 import kernel
 import ramfs
 import calc
-import desktop
+import wm
+import input
+import term
+import files
+import notes
+import calculator
+import monitor
+import snake
+import breakout
+import mines
+import paint
+import disk
 
-const VERSION = "0.1"
+const VERSION = "0.2"
 
 struct Job {
     id: int,
@@ -26,6 +39,10 @@ struct Shell {
     jobs: [Job] = [],
     next_job: int = 1,
     running: bool = true,
+    gui: wm.Desktop? = none,
+    disk: disk.Disk? = none,
+    saved: int = 0,           // fs.changes when it was last saved
+    terminal: int = 0,        // the terminal window's id
 
     fn prompt(self) -> str {
         let e = kernel.ESC
@@ -112,24 +129,64 @@ struct Shell {
                 println("${calc.hex(addr)}: ${calc.hex(v)}")
             },
             "shutdown" | "exit" | "poweroff" => {
+                self.sync()
                 println("bye!")
                 self.running = false
             },
-            "desktop" => {
-                let m = kernel.memory()
-                let info = [
-                    "RAM      ${size(m.ram)}",
-                    "Heap     ${size(m.heap)}",
-                    "Free     ${size(m.free)}",
-                    "Files    ${self.fs.files.len()}, ${size(self.fs.used())}",
-                    "Jobs     ${self.jobs.len()}",
-                    "Up       ${seconds(kernel.uptime())}",
-                ]
-                let files = self.fs.files.keys()
-                desktop.show(info, files)?
-                println("the desktop is on the display (the shell keeps running here)")
+            "sync" => {
+                if self.disk == none { return err("no disk (files live in RAM only)") }
+                self.sync()
+                println("saved to disk")
             },
-            "reboot" => kernel.reboot(),
+            "df" => {
+                if let d = self.disk {
+                    println("disk     ${size(d.size())}, ${size(self.fs.used())} in ${self.fs.files.len()} files")
+                } else {
+                    println("no disk: files live in RAM only (`stellang boot` attaches one)")
+                }
+            },
+            "windows" => {
+                let d = self.desktop()?
+                for w in d.windows {
+                    println("${w.id}  ${w.title}  ${w.w}x${w.h} at ${w.x},${w.y}${if w.id == d.focus { "  (focused)" } else { "" }}")
+                }
+            },
+            "desktop" => {
+                if let d = self.gui {
+                    println("the desktop is already on the display")
+                } else {
+                    self.start_desktop()?
+                    println("the desktop is on the display (the shell keeps running here)")
+                }
+            },
+            "open" => {
+                let name = need(args, 0, "open <app>  (see `apps`)")?
+                let d = self.desktop()?
+                if let l = d.launchers.find(l => l.name.lower() == name.lower()) {
+                    l.open()
+                } else {
+                    return err("no app called ${name} (see `apps`)")
+                }
+            },
+            "apps" => {
+                let d = self.desktop()?
+                println(d.launchers.map(l => l.name.lower()).join("  "))
+            },
+            "date" => {
+                let t = kernel.date(kernel.time_ms())
+                println("${kernel.WEEKDAYS[t.weekday]} ${t.day} ${kernel.MONTHS[t.month - 1]} ${t.year}, ${kernel.two(t.hour)}:${kernel.two(t.minute)}:${kernel.two(t.second)}")
+            },
+            "keyboard" => {
+                let d = self.desktop()?
+                let layout = need(args, 0, "keyboard us|de")?
+                if layout != "us" && layout != "de" { return err("layouts: us, de") }
+                d.inp.layout = layout
+                println("keyboard layout: ${layout}")
+            },
+            "reboot" => {
+                self.sync()
+                kernel.reboot()
+            },
             "panic" => panic("you asked for it"),
             _ => return err("unknown command: ${cmd} (try `help`)"),
         }
@@ -148,6 +205,58 @@ struct Shell {
         })
         self.jobs.push(Job { id, timer, what: "every ${ms} ms: ${cmd}" })
         println("[${id}] started (stop it with `kill ${id}`)")
+    }
+
+    fn desktop(self) -> wm.Desktop! {
+        if let d = self.gui { return d }
+        return err("no desktop (boot with `stellang boot --gui`)")
+    }
+
+    // Save the files if something changed since last time.
+    fn sync(self) {
+        if let d = self.disk {
+            if self.fs.changes == self.saved { return }
+            self.fs.save(d) catch e {
+                println("disk: ${e}")
+                return
+            }
+            self.saved = self.fs.changes
+        }
+    }
+
+    // Take over the display, keyboard and mouse, and put the apps on the desktop.
+    fn start_desktop(self) -> void! {
+        let d = wm.start(1024, 768)?
+        self.gui = some(d)
+        let fs = self.fs
+        let edit = (path: str) => notes.open(d, fs, path)
+        d.launchers = [
+            wm.Launcher { name: "Terminal", icon: ">_", color: 0x2d3436, open: () => self.open_terminal(d) },
+            wm.Launcher { name: "Files", icon: "▤", color: 0x0984e3, open: () => files.open(d, fs, edit) },
+            wm.Launcher { name: "Notes", icon: "✎", color: 0xf0932b, open: () => notes.open(d, fs, "") },
+            wm.Launcher { name: "Calculator", icon: "=", color: 0x6c5ce7, open: () => calculator.open(d) },
+            wm.Launcher { name: "Monitor", icon: "◉", color: 0x00b894, open: () => monitor.open(d) },
+            wm.Launcher { name: "Snake", icon: "S", color: 0x10ac84, open: () => snake.open(d) },
+            wm.Launcher { name: "Bricks", icon: "B", color: 0xff9f43, open: () => breakout.open(d) },
+            wm.Launcher { name: "Mines", icon: "✹", color: 0x576574, open: () => mines.open(d) },
+            wm.Launcher { name: "Paint", icon: "✎", color: 0xe84393, open: () => paint.open(d) },
+        ]
+        d.on_shutdown = () => {
+            self.sync()
+            println("bye!")
+            kernel.shutdown(0)
+        }
+        d.hurt_all()
+        kernel.every(16, () => d.frame())
+    }
+
+    fn open_terminal(self, d: wm.Desktop) {
+        if let w = d.find(self.terminal) {
+            d.focus_window(w.id)
+            return
+        }
+        let w = d.open("Terminal", ">_", 0x2d3436, 660, 400, term.app())
+        self.terminal = w.id
     }
 
     // a tiny line editor: shows the file, then appends what you type until a line with just "."
@@ -175,9 +284,10 @@ fn need(args: [str], i: int, usage: str) -> str! {
 fn help() {
     println("files     ls [dir]  cd <dir>  pwd  mkdir <dir>  cat <file>  rm <path>  wc <file>")
     println("          write <file> <text>  append <file> <text>  edit <file>")
-    println("system    mem  gc  uptime  uname  history  clear  shutdown  reboot")
+    println("system    mem  gc  df  sync  uptime  uname  history  clear  shutdown  reboot")
     println("jobs      every <ms> <command>  jobs  kill <job>  sleep <ms>")
-    println("tools     echo <text>  calc <expr>  peek <address>  desktop  panic")
+    println("tools     echo <text>  calc <expr>  peek <address>  date  panic")
+    println("desktop   desktop  apps  open <app>  windows  keyboard us|de")
     println("keys      arrows edit and recall history, Ctrl-U clears the line, Ctrl-D exits")
 }
 
@@ -216,16 +326,37 @@ fn banner() {
 fn setup(sh: Shell) -> void! {
     sh.fs.mkdir("/home")?
     sh.fs.mkdir("/etc")?
-    sh.fs.write("/etc/motd", "Welcome to StellaOS. Everything here lives in RAM, so nothing survives a reboot.\n")?
+    sh.fs.write("/etc/motd", "Welcome to StellaOS. Your files are kept on the disk (when there is one: `df`).\n")?
     sh.fs.write("/home/hello.st", "fn main() {\n    println(\"hello from StellaOS\")\n}\n")?
+    sh.fs.write("/home/todo.txt", "- try the games (Snake, Bricks, Mines)\n- paint something\n- write a note and save it\n")?
+    sh.fs.mkdir("/home/pictures")?
 }
 
 fn main() {
     let sh = Shell {}
-    setup(sh) catch e { println("setup: ${e}") }
+    // the files: from the disk if it has them, else a fresh set
+    sh.disk = disk.open()
+    var loaded = false
+    if let d = sh.disk {
+        loaded = sh.fs.load(d) catch e {
+            println("disk: ${e}")
+            false
+        }
+    }
+    if !loaded { setup(sh) catch e { println("setup: ${e}") } }
+    sh.saved = if loaded { sh.fs.changes } else { -1 }
+    sh.sync()
+    // save a moment after changes
+    kernel.every(2000, () => sh.sync())
     sh.cwd = "/home"
     banner()
     print(sh.fs.read("/etc/motd") catch "")
+    // a display: the desktop comes up by itself, with a terminal on it
+    sh.start_desktop() catch e { println("${kernel.ESC}[2m(no display: just this shell. `stellang boot --gui` for the desktop)${kernel.ESC}[0m") }
+    if let d = sh.gui {
+        sh.open_terminal(d)
+        println("${kernel.ESC}[2mthe desktop is up on the display; this shell is also in its Terminal${kernel.ESC}[0m")
+    }
     while sh.running {
         let line = sh.ed.read(sh.prompt())
         sh.run(line) catch e { println("${kernel.ESC}[31merror:${kernel.ESC}[0m ${e}") }

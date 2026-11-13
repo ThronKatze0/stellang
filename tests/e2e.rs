@@ -1407,6 +1407,13 @@ fn main() {
     }
 }
 
+/// `chars()` splits by character (UTF-8 aware), and """strings""" span lines.
+#[test]
+fn chars_and_long_strings() {
+    let src = "const CSS = \"\"\"\n  a { color: \"red\" }\n  b ${1 + 1}\n\"\"\"\nfn main() {\n    let cs = \"aß€✦\".chars()\n    println(\"${cs.len()} ${cs[1]} ${cs[3]}\")\n    print(CSS)\n}\n";
+    assert_eq!(run("chars_long", src), (0, "4 ß ✦\n  a { color: \"red\" }\n  b 2\n".into(), "".into()));
+}
+
 #[test]
 fn bitwise_and_hex() {
     let src = r#"
@@ -1462,7 +1469,7 @@ fn kernel_boots_stellaos() {
     let out = q.wait_with_output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
     assert_eq!(out.status.code(), Some(0), "{text}");
-    for want in ["StellaOS 0.1", "hi there\n", "1039  (0x40f)", "a.txt  (9 B)", "hello.st", "RAM      128.0 MiB", "unknown command: nope", "bye!"] {
+    for want in ["StellaOS 0.2", "hi there\n", "1039  (0x40f)", "a.txt  (9 B)", "hello.st", "RAM      128.0 MiB", "unknown command: nope", "bye!"] {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
 
@@ -1484,6 +1491,125 @@ fn kernel_boots_stellaos() {
     fs::write(&file, "import http\nfn main() {}\n").unwrap();
     let c = Command::new(BIN).arg("--kernel").arg(&file).output().unwrap();
     assert!(String::from_utf8_lossy(&c.stderr).contains("needs a host operating system"));
+}
+
+/// StellaOS's desktop, driven like a person would: keys typed on the (virtio) keyboard go to the
+/// focused Terminal window and from there to the shell; a double click on a desktop icon opens an
+/// app; files written in one boot are on the disk in the next.
+#[test]
+fn stellaos_desktop() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+    use std::time::Duration;
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-riscv64");
+        return;
+    }
+    let dir = tmpdir("desktop");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let elf = dir.join("os.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(root.join("examples/stellaos/os.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let disk = dir.join("disk.img");
+    fs::File::create(&disk).unwrap().set_len(4 << 20).unwrap();
+
+    let boot = |steps: &dyn Fn(&mut dyn FnMut(&str), &mut dyn FnMut(&str)), tag: &str| -> String {
+        let sock = dir.join(format!("qmp-{tag}"));
+        let mut q = Command::new("qemu-system-riscv64")
+            .args(["-machine", "virt", "-m", "256M", "-bios", "default", "-display", "none", "-serial", "stdio"])
+            .args(["-global", "virtio-mmio.force-legacy=false", "-device", "ramfb"])
+            .args(["-device", "virtio-keyboard-device", "-device", "virtio-tablet-device"])
+            .arg("-drive")
+            .arg(format!("file={},if=none,format=raw,id=d0", disk.display()))
+            .args(["-device", "virtio-blk-device,drive=d0", "-qmp"])
+            .arg(format!("unix:{},server,nowait", sock.display()))
+            .arg("-kernel")
+            .arg(&elf)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = q.stdin.take().unwrap();
+        // a watchdog: if something goes wrong, QEMU mustn't outlive the test
+        let pid = q.id();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(90));
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        });
+        std::thread::sleep(Duration::from_millis(3000));
+        let qmp = UnixStream::connect(&sock).unwrap();
+        let mut reader = BufReader::new(qmp.try_clone().unwrap());
+        let mut w = qmp;
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap(); // the greeting
+        let mut cmd = move |json: String| {
+            w.write_all(json.as_bytes()).unwrap();
+            w.write_all(b"\n").unwrap();
+            loop {
+                let mut l = String::new();
+                reader.read_line(&mut l).unwrap();
+                if l.contains("\"return\"") || l.contains("\"error\"") {
+                    assert!(!l.contains("error"), "QMP: {l}");
+                    break;
+                }
+            }
+        };
+        cmd(r#"{"execute": "qmp_capabilities"}"#.into());
+        // keys: by QEMU's key names
+        let mut keys = |text: &str| {
+            for ch in text.chars() {
+                let k = match ch {
+                    ' ' => "spc".to_string(),
+                    '-' => "minus".to_string(),
+                    '.' => "dot".to_string(),
+                    '/' => "slash".to_string(),
+                    '\n' => "ret".to_string(),
+                    c => c.to_string(),
+                };
+                for down in [true, false] {
+                    cmd(format!(r#"{{"execute": "input-send-event", "arguments": {{"events": [{{"type": "key", "data": {{"down": {down}, "key": {{"type": "qcode", "data": "{k}"}}}}}}]}}}}"#));
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        };
+        let mut serial = |text: &str| {
+            stdin.write_all(text.as_bytes()).unwrap();
+            stdin.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        steps(&mut keys, &mut serial);
+        let out = q.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+        assert_eq!(out.status.code(), Some(0), "{text}");
+        text
+    };
+
+    let text = boot(
+        &|keys, serial| {
+            serial("windows\r");
+            // typed into the Terminal window (focused at boot), run by the shell
+            keys("echo typed on the desktop\n");
+            std::thread::sleep(Duration::from_millis(400));
+            keys("write kept.txt from the first boot\n");
+            std::thread::sleep(Duration::from_millis(400));
+            serial("open snake\r");
+            serial("windows\r");
+            serial("shutdown\r");
+        },
+        "a",
+    );
+    for want in ["1  Terminal", "(focused)", "\ntyped on the desktop\n", "Snake  432x364", "bye!"] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    let text = boot(
+        &|_keys, serial| {
+            serial("cat kept.txt\r");
+            serial("shutdown\r");
+        },
+        "b",
+    );
+    assert!(text.contains("\nfrom the first boot\n"), "the file didn't survive the reboot:\n{text}");
 }
 
 /// A field default that builds another struct with defaults (from another module) makes that

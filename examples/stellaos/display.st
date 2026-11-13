@@ -1,12 +1,12 @@
-// Graphics: a framebuffer driver for QEMU's `ramfb` display, and drawing on it. Written entirely in
-// stellang on top of `kernel` (peek/poke for registers, alloc_pages for memory the display reads).
+// The display: a driver for QEMU's `ramfb`, written in stellang on top of `kernel` (peek/poke for
+// registers, alloc_pages for memory the display reads). Drawing on it is std/gfx.st.
 //
 // ramfb is configured through QEMU's fw_cfg device: find the file "etc/ramfb" in fw_cfg's
 // directory, then DMA a small config into it (where the pixels are, their format and size).
 // After that, whatever is in that memory is on screen.
 
 import kernel
-import font
+import gfx
 
 const FW_CFG = 0x1010_0000        // fw_cfg on QEMU virt (riscv64)
 const FW_DATA = FW_CFG
@@ -79,74 +79,8 @@ fn fw_read_be32(addr: int) -> int {
     return v
 }
 
-struct Screen {
-    width: int,
-    height: int,
-    base: int,                    // the pixels: width * height * 4 bytes, row by row
-
-    fn pixel(self, x: int, y: int, color: int) {
-        if x >= 0 && y >= 0 && x < self.width && y < self.height {
-            kernel.poke32(self.base + (y * self.width + x) * 4, color)
-        }
-    }
-
-    fn rect(self, x: int, y: int, w: int, h: int, color: int) {
-        let x0 = max(x, 0)
-        let x1 = min(x + w, self.width)
-        if x1 <= x0 { return }
-        for row in max(y, 0)..min(y + h, self.height) {
-            kernel.fill32(self.base + (row * self.width + x0) * 4, x1 - x0, color)
-        }
-    }
-
-    fn frame(self, x: int, y: int, w: int, h: int, color: int) {
-        self.rect(x, y, w, 1, color)
-        self.rect(x, y + h - 1, w, 1, color)
-        self.rect(x, y, 1, h, color)
-        self.rect(x + w - 1, y, 1, h, color)
-    }
-
-    // text in the 5x7 font, each font pixel `scale` screen pixels; returns the width drawn
-    fn text(self, x: int, y: int, s: str, color: int, scale: int) -> int {
-        var cx = x
-        for ch in s.upper().chars() {
-            let i = font.GLYPHS.find(ch)
-            if i >= 0 {
-                let bits = font.FONT[i]
-                for row in 0..7 {
-                    for col in 0..5 {
-                        if (bits >> (34 - row * 5 - col)) & 1 == 1 {
-                            self.rect(cx + col * scale, y + row * scale, scale, scale, color)
-                        }
-                    }
-                }
-            }
-            cx += 6 * scale
-        }
-        return cx - x
-    }
-
-    // a vertical gradient between two colors
-    fn gradient(self, top: int, bottom: int) {
-        for row in 0..self.height {
-            self.rect(0, row, self.width, 1, mix(top, bottom, row, self.height))
-        }
-    }
-}
-
-// color a + (b - a) * k / n, per channel
-fn mix(a: int, b: int, k: int, n: int) -> int {
-    var out = 0
-    for shift in [16, 8, 0] {
-        let ca = a >> shift & 0xff
-        let cb = b >> shift & 0xff
-        out = out | ((ca + (cb - ca) * k / n) << shift)
-    }
-    return out
-}
-
 // Turn the display on at `width` x `height`. Fails if QEMU has no ramfb (`stellang boot --gui`).
-fn open(width: int, height: int) -> Screen! {
+fn open(width: int, height: int) -> gfx.Surface! {
     let sel = fw_file("etc/ramfb") ?? 0
     if sel == 0 { return err("no display (start QEMU with a ramfb: `stellang boot --gui os.st`)") }
     let base = kernel.alloc_pages((width * height * 4 + 4095) / 4096)
@@ -158,5 +92,5 @@ fn open(width: int, height: int) -> Screen! {
     put_be(cfg + 20, 4, height)
     put_be(cfg + 24, 4, width * 4)
     if !fw_dma_write(sel, cfg, 28) { return err("the display didn't accept its configuration") }
-    return Screen { width, height, base }
+    return gfx.wrap(base, width, height)
 }
