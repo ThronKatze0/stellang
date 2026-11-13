@@ -291,9 +291,13 @@ impl Gen {
                     return err(el.pos, format!("<{}> has no prop `{n}` (it takes {})", el.tag, sig.names.join(", ")));
                 }
             }
-            for (n, t) in sig.names.iter().zip(&sig.params) {
+            for (i, (n, t)) in sig.names.iter().zip(&sig.params).enumerate() {
                 let v = match given.iter().find(|g| g.0 == *n) {
                     Some((_, e)) => self.typed(e, t)?,
+                    None if sig.defaults.get(i).is_some_and(Option::is_some) => {
+                        let e = sig.defaults[i].clone().unwrap();
+                        self.call_default(&default_sym(&sig.sym, i), &e, &sig.module, t)?
+                    }
                     None if matches!(t, Type::Opt(_)) => val("zeroinitializer", t.clone()),
                     None if n == "children" && *t == Type::Node => val(self.str_const(""), Type::Node),
                     None => return err(el.pos, format!("<{}> needs `{n}` ({t})", el.tag)),

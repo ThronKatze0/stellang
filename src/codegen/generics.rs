@@ -375,8 +375,11 @@ impl Gen {
         let skip = recv.is_some() as usize;
         let pats: Vec<Type> = g.func.params[skip..].iter().map(|p| p.1.clone().unwrap_or_default()).collect();
         let shown = short_name(gkey).replace("::", ".");
-        if args.len() != pats.len() {
-            return err(pos, format!("`{shown}` takes {} argument(s), got {}", pats.len(), args.len()));
+        // trailing parameters with a default may be left out; the types come from the arguments given
+        let need = g.func.defaults[skip..].iter().take_while(|d| d.is_none()).count();
+        if args.len() < need || args.len() > pats.len() {
+            let n = if need == pats.len() { need.to_string() } else { format!("{need} to {}", pats.len()) };
+            return err(pos, format!("`{shown}` takes {n} argument(s), got {}", args.len()));
         }
         let given: Vec<(Type, &Expr)> = pats.into_iter().zip(args.iter()).collect();
         let what = format!("`{shown}`");
@@ -388,7 +391,7 @@ impl Gen {
         if let Some(r) = recv {
             argl.push(format!("{} {}", ll(&r.ty), r.v));
         }
-        argl.extend(self.args(&sig.params[skip..], args, pos, &shown)?);
+        argl.extend(self.sig_args(&sig, skip, args, pos, &shown)?);
         Ok(self.emit_call(&sig.ret, &sig.sym, &argl))
     }
 

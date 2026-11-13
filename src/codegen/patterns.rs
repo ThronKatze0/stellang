@@ -98,19 +98,12 @@ impl Gen {
         Ok(vals)
     }
 
-    /// Evaluate a field's declared default, in the module that declared it (and without local names).
+    /// A field's declared default: a call to the function compiled for it up front.
     pub(super) fn default_of(&mut self, dkey: &str, f: &str, ft: &Type) -> R<Option<Val>> {
         let Some((m, defs)) = self.defaults.get(dkey) else { return Ok(None) };
         let Some((_, e)) = defs.iter().find(|d| d.0 == f) else { return Ok(None) };
         let (m, e) = (m.clone(), e.clone());
-        let module = mem::replace(&mut self.module, m);
-        let scopes = mem::replace(&mut self.f.scopes, vec![HashMap::new()]);
-        let loops = mem::take(&mut self.f.loops);
-        let r = self.typed(&e, ft);
-        self.module = module;
-        self.f.scopes = scopes;
-        self.f.loops = loops;
-        r.map(Some)
+        self.call_default(&field_default_sym(dkey, f), &e, &m, ft).map(Some)
     }
 
     pub(super) fn variant_index(&self, k: &str, name: &str, pos: Pos) -> R<usize> {

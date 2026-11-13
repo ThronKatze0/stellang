@@ -1,5 +1,6 @@
-// stellang runtime: GC heap, strings, list growth, printing, and POSIX sockets for `import net`.
-// Compiled by clang alongside every program; memory is managed by Boehm GC (-lgc).
+// stellang runtime: GC heap, strings, list growth, printing, POSIX sockets for `import net`,
+// and an HTTP(S) client on libcurl for `http.fetch`.
+// Compiled by clang alongside every program; memory is managed by Boehm GC (-lgc), HTTPS comes from -lcurl.
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <errno.h>
@@ -24,6 +25,9 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#ifndef ST_WASM
+#include <curl/curl.h>
+#endif
 
 // Boehm GC natively; in the browser the collector in runtime_web.c
 void GC_init(void);
@@ -847,6 +851,25 @@ char *st_url_decode(const char *s) {
     return r;
 }
 
+// "a b/ä" -> "a%20b%2F%C3%A4", like JavaScript's encodeURIComponent: every UTF-8 byte except A-Z a-z 0-9 - _ . ~
+char *st_url_encode(const char *s) {
+    static const char hex[] = "0123456789ABCDEF";
+    char *r = alloc((int64_t)strlen(s) * 3 + 1, 1, 1), *o = r;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (isalnum(*p) || *p == '-' || *p == '_' || *p == '.' || *p == '~') *o++ = (char)*p;
+        else *o++ = '%', *o++ = hex[*p >> 4], *o++ = hex[*p & 15];
+    }
+    *o = 0;
+    return r;
+}
+
+// the builtin `sleep(ms)`: block this thread
+void st_sleep(int64_t ms) {
+    if (ms <= 0) return;
+    struct timespec t = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000};
+    while (nanosleep(&t, &t) < 0 && errno == EINTR) {}
+}
+
 // ---- files, for std/fs.st and res.send_file ----
 
 // size in bytes of a regular file, or -1
@@ -954,3 +977,158 @@ char *st_chr(int64_t c) {
     else b[0] = (char)(0xF0 | c >> 18), b[1] = (char)(0x80 | (c >> 12 & 63)), b[2] = (char)(0x80 | (c >> 6 & 63)), b[3] = (char)(0x80 | (c & 63));
     return mkstr(b, strlen(b));
 }
+
+// ---- HTTP(S) client on libcurl, for http.fetch / http.request (not in the browser: `import http` is server-only) ----
+#ifndef ST_WASM
+
+typedef struct { char *p; size_t len, cap; } Bytes;
+
+static void bytes_add(Bytes *b, const char *p, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 1024;
+        while (b->len + n + 1 > cap) cap *= 2;
+        char *d = b->p ? GC_realloc(b->p, cap) : alloc((int64_t)cap, 1, 1);
+        if (!d) st_panic("panic: out of memory\n");
+        b->p = d, b->cap = cap;
+    }
+    memcpy(b->p + b->len, p, n);
+    b->len += n;
+    b->p[b->len] = 0;
+}
+
+// the same cap as a request body on the server side
+#define FETCH_MAX_BODY (64u << 20)
+
+typedef struct { Bytes b; bool too_large; } Body;
+
+static size_t on_body(char *p, size_t size, size_t n, void *ud) {
+    Body *body = ud;
+    if (body->b.len + size * n > FETCH_MAX_BODY) {
+        body->too_large = true;
+        return 0; // makes curl stop with CURLE_WRITE_ERROR
+    }
+    bytes_add(&body->b, p, size * n);
+    return size * n;
+}
+
+// What kind of trouble a failed transfer was, as the error's prefix: whether a retry can help shows in it.
+static const char *fetch_kind(CURLcode rc) {
+    switch (rc) {
+    case CURLE_OPERATION_TIMEDOUT: return "timeout";
+    case CURLE_COULDNT_RESOLVE_HOST:
+    case CURLE_COULDNT_RESOLVE_PROXY: return "dns";
+    case CURLE_COULDNT_CONNECT:
+    case CURLE_SEND_ERROR:
+    case CURLE_RECV_ERROR:
+    case CURLE_GOT_NOTHING:
+    case CURLE_PARTIAL_FILE: return "connect";
+    case CURLE_SSL_CONNECT_ERROR:
+    case CURLE_PEER_FAILED_VERIFICATION:
+    case CURLE_SSL_CERTPROBLEM:
+    case CURLE_SSL_CIPHER:
+    case CURLE_SSL_CACERT_BADFILE:
+    case CURLE_SSL_ENGINE_NOTFOUND:
+    case CURLE_SSL_ENGINE_SETFAILED:
+    case CURLE_SSL_ENGINE_INITFAILED:
+    case CURLE_SSL_SHUTDOWN_FAILED:
+    case CURLE_SSL_CRL_BADFILE:
+    case CURLE_SSL_ISSUER_ERROR:
+    case CURLE_SSL_PINNEDPUBKEYNOTMATCH:
+    case CURLE_SSL_INVALIDCERTSTATUS: return "tls";
+    default: return "other";
+    }
+}
+
+// one header line; a new status line (a redirect, `100 Continue`) starts the list over
+static size_t on_header(char *p, size_t size, size_t n, void *ud) {
+    Vec *hs = ud;
+    size_t len = size * n;
+    if (len >= 5 && strncmp(p, "HTTP/", 5) == 0) {
+        hs->len = 0;
+        return len;
+    }
+    char *colon = memchr(p, ':', len);
+    if (!colon || colon == p) return len;
+    char *name = mkstr(p, (size_t)(colon - p));
+    for (char *c = name; *c; c++) *c = (char)tolower((unsigned char)*c);
+    const char *v = colon + 1, *end = p + len;
+    while (v < end && (*v == ' ' || *v == '\t')) v++;
+    while (end > v && (end[-1] == '\r' || end[-1] == '\n' || end[-1] == ' ' || end[-1] == '\t')) end--;
+    st_vec_push_str(hs, name);
+    st_vec_push_str(hs, mkstr(v, (size_t)(end - v)));
+    return len;
+}
+
+// [status, body, name, value, name, value, ...] (names lowercase), or ["", error message].
+// Any HTTP status is an answer; only DNS, connect, TLS, timeout and the like are errors. Those start with
+// their kind: `timeout:`, `dns:`, `connect:`, `tls:`, `too_large:` or `other:`.
+Vec *st_http_fetch(const char *method, const char *url, Vec *headers, const char *body, int64_t timeout_ms) {
+    // one handle for the whole program: curl_easy_reset clears the options but keeps its connection cache,
+    // so the next fetch to the same host skips the TCP and TLS handshakes
+    static CURL *c;
+    Vec *out = st_vec_new(0, sizeof(char *), 0);
+    if (!c) {
+        if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK || !(c = curl_easy_init())) {
+            st_vec_push_str(out, "");
+            st_vec_push_str(out, "other: fetch: cannot initialize libcurl");
+            return out;
+        }
+    } else curl_easy_reset(c);
+    Body got = {0};
+    bytes_add(&got.b, "", 0);
+    Vec *hs = st_vec_new(0, sizeof(char *), 0);
+    char errbuf[CURL_ERROR_SIZE] = {0};
+    struct curl_slist *list = NULL;
+    for (int64_t i = 0; i + 1 < headers->len; i += 2) {
+        const char *k = ((char **)headers->data)[i], *v = ((char **)headers->data)[i + 1];
+        // "Name;" is how curl sends a header with an empty value
+        list = curl_slist_append(list, *v ? st_concat(st_concat(k, ": "), v) : st_concat(k, ";"));
+    }
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, list);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "stellang");
+    curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, ""); // gzip etc., decoded for us
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    if (timeout_ms > 0) {
+        curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, (long)timeout_ms);
+        curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, (long)timeout_ms);
+    }
+    // libcurl ignores these (the curl tool doesn't); networks with TLS inspection need them
+    const char *ca = getenv("CURL_CA_BUNDLE");
+    if (!ca || !*ca) ca = getenv("SSL_CERT_FILE");
+    if (ca && *ca) curl_easy_setopt(c, CURLOPT_CAINFO, ca);
+    curl_easy_setopt(c, CURLOPT_ERRORBUFFER, errbuf);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, on_body);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &got);
+    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, on_header);
+    curl_easy_setopt(c, CURLOPT_HEADERDATA, hs);
+    if (strcmp(method, "HEAD") == 0) curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
+    else if (*body || strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0 || strcmp(method, "PATCH") == 0) {
+        curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
+        curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
+    }
+    if (strcmp(method, "POST") != 0 && strcmp(method, "HEAD") != 0 && (strcmp(method, "GET") != 0 || *body))
+        curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, method);
+    CURLcode rc = curl_easy_perform(c);
+    long status = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+    // the handle outlives this call: don't leave it pointing at our stack or the freed header list
+    curl_easy_setopt(c, CURLOPT_ERRORBUFFER, NULL);
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, NULL);
+    curl_slist_free_all(list);
+    if (rc != CURLE_OK) {
+        const char *kind = got.too_large ? "too_large" : fetch_kind(rc);
+        const char *why = got.too_large ? "the response body is over 64 MB" : *errbuf ? errbuf : curl_easy_strerror(rc);
+        char *what = st_concat(st_concat(st_concat(st_concat(kind, ": "), method), " "), url);
+        st_vec_push_str(out, "");
+        st_vec_push_str(out, st_concat(st_concat(what, ": "), why));
+        return out;
+    }
+    st_vec_push_str(out, st_itoa(status));
+    st_vec_push_str(out, got.b.p); // shortcut: str is NUL-terminated, so binary bodies get cut; add a byte type if one is ever needed
+    for (int64_t i = 0; i < hs->len; i++) st_vec_push_str(out, ((char **)hs->data)[i]);
+    return out;
+}
+#endif // HTTP(S) client

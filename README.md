@@ -15,13 +15,13 @@
 
 ---
 
-Rust frontend, LLVM backend (via clang), garbage collected (Boehm GC natively, its own collector in WebAssembly).
-No crates.
+Rust frontend, LLVM backend (via clang), garbage collected (Boehm GC natively, its own collector in WebAssembly),
+HTTPS client on libcurl. No crates.
 
 ## Quick start
 
 ```sh
-cargo install --path .              # puts `stellang` on your PATH (needs clang + libgc)
+cargo install --path .              # puts `stellang` on your PATH (needs clang, libgc and libcurl)
 stellang examples/server.st         # like cc: -o out, -O0..-O3 (default -O2), --emit-llvm
 ./server                            # http://localhost:8080
 stellang examples/todos.st && ./todos   # a JSON API + WebSocket feed + static page, modeled with enums
@@ -152,6 +152,28 @@ is the way around that. Events: `onclick={() => ...}`, `oninput={value => ...}`,
 place, so focus, selection and what's typed survive a re-render; a panic shows up on the page.
 `print` goes to the browser console. A typical app is 30–60 KB of WebAssembly.
 
+## Calling an API
+
+```rust
+import http
+
+fn main() -> void! {
+    let key = env("RIOT_API_KEY")
+    let id = "${url_encode("Hide on bush")}/${url_encode("KR1")}"      // -> Hide%20on%20bush/KR1
+    let url = "https://asia.api.riotgames.com/riot/account/v1/accounts/by-riot-id/${id}"
+    var r = http.fetch(url, {"X-Riot-Token": key})?                  // only network trouble is an error
+    if r.status == 429 {                                               // rate limited: wait and try once more
+        sleep((int(r.header("retry-after") ?? "1") catch 1) * 1000)
+        r = http.fetch(url, {"X-Riot-Token": key}, 5000)?              // timeout in ms (default 8000)
+    }
+    if r.status == 404 {
+        return err("no such player")
+    }
+    let acc = r.json()?
+    println(acc.get("puuid")?.as_str() ?? "?")
+}
+```
+
 ## The language in one screen
 
 ```rust
@@ -166,6 +188,10 @@ impl Point {                            // methods, Rust-style
     fn dist2(self) -> int {
         return self.x * self.x + self.y * self.y
     }
+}
+
+fn greet(name: str, greeting: str = "hi") -> str {   // trailing parameters can have defaults
+    return "${greeting} ${name}"        // greet("ada"), greet("ada", "hello")
 }
 
 fn parse_port(s: str) -> int! {         // `int!` = an int or an error message
@@ -358,9 +384,16 @@ let area = 3.14 * r * r                     // int and float mix; int(2.9) == 2,
 println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"pt": Point { x: 1.0, y: 2.0 }}
 ```
 
-- Functions: `print println str int float min max abs env panic some to_json from_json`.
+- Functions: `print println str int float min max abs env panic some to_json from_json sleep now_ms url_encode
+  url_decode`.
   `from_json(text)` decodes into the type the code expects (`let t: Todo = from_json(body)?`): structs (missing
   fields take their defaults), enums, lists, maps, sets and optionals, the reverse of `to_json`.
+  - `sleep(ms)` blocks; `now_ms() -> int` reads a monotonic clock (for timing, TTL caches, uptime).
+  - `url_encode(s) -> str` percent-encodes UTF-8 bytes for a URL path segment or query value; only
+    `A-Z a-z 0-9 - _ . ~` stay as they are (a bit stricter than JavaScript's `encodeURIComponent`,
+    which also leaves `! * ' ( )`; servers decode both the same).
+  - `url_decode(s) -> str` undoes `%XX` escapes. Like form data and query strings, it also turns `+` into a
+    space, so a literal `+` must arrive as `%2B` (which `url_encode` does).
 - `str`: `len is_empty split lines chars find count slice trim trim_start trim_end lower upper starts_with
   ends_with contains replace repeat reverse`, `s[i]`, `<` `>` compare.
 - `float`: `floor ceil round sqrt abs`.
@@ -384,6 +417,23 @@ println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"p
     `req.header(name) -> str?`, `req.cookie(name) -> str?`, `req.json() -> json.Json!`.
   - `res.status(code)`, `res.set(name, value)`, `res.type(ct)` (all chainable), `res.send/html/json(body)`,
     `res.redirect(url)`, `res.cookie(name, value)`, `res.send_file(path)`, `res.end()`.
+- Client (HTTP and HTTPS, libcurl underneath):
+  - `http.fetch(url, headers = {}, timeout_ms = 8000) -> FetchResponse!` sends a GET;
+    `http.request(method, url, headers = {}, body = "", timeout_ms = 8000) -> FetchResponse!` any method.
+  - `FetchResponse { status, headers, body }` with `r.header(name) -> str?` (case-insensitive; `headers` has
+    lowercase names) and `r.json() -> json.Json!`. Redirects are followed and gzip is decoded.
+  - A header sent more than once is joined with `, ` in `headers`. That breaks `set-cookie`, so
+    `r.header_all("set-cookie") -> [str]` gives each value on its own (like JavaScript's `getSetCookie()`).
+  - `http.query({"start": "0", "count": "20"})` -> `start=0&count=20`, names and values `url_encode`-d, in the
+    map's order.
+  - Every HTTP status, `404` and `429` included, is a normal response: check `r.status`. Only DNS, connection,
+    TLS and timeout problems come back as `err(...)`. The error starts with its kind, so you can tell whether a
+    retry makes sense: `timeout:`, `dns:`, `connect:` (refused, reset or cut off), `tls:`, `too_large:` (the
+    body is over 64 MB) or `other:`, e.g. `if e.starts_with("timeout:") { ... }`.
+  - Connections are kept open and reused: the next fetch to the same host skips the TCP and TLS handshakes.
+  - `CURL_CA_BUNDLE` or `SSL_CERT_FILE` point it at a different CA bundle; `https_proxy`/`no_proxy` are honored.
+  - It blocks until the answer is there. Inside a server handler that holds up the whole event loop (up to
+    `timeout_ms`), so keep timeouts short and cache answers.
 - WebSockets, like express-ws:
 
   ```rust
@@ -439,9 +489,6 @@ fails if the copies in `editors/` go stale.
 No null (use `T?`), no pointers, no manual free, no uninitialized values. Out-of-bounds indexing, bad slices,
 a missing map key with `m[k]`, integer division by zero, `pop()` on an empty list and `panic()` stop the program with exit code 101 and a
 `file:line:col` message. An error returned from `main` prints `error: ...` and exits with 1.
-
-The emoji keywords from the beginning still work as a joke: `stellang fmt --emoji file.st` turns
-`fn struct if else while let var return break { } ;` into `🦍 🦧 🦅 🐒 🐭 🦦 🦁 🐺 🦭 ⭐ ❤️` (and `--plain` back).
 
 ## License
 
