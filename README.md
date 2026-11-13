@@ -11,6 +11,7 @@
   <img src="https://img.shields.io/badge/backend-LLVM-262D3A?logo=llvm" alt="LLVM">
   <img src="https://img.shields.io/badge/memory-Boehm%20GC-7b5cff" alt="GC">
   <img src="https://img.shields.io/badge/deps-zero%20crates-success" alt="zero deps">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
 ---
@@ -295,3 +296,8 @@ a missing map key with `m[k]`, integer division by zero, `pop()` on an empty lis
 
 The emoji keywords from the beginning still work as a joke: `stellang fmt --emoji file.st` turns
 `fn struct if else while let var return break { } ;` into `🦍 🦧 🦅 🐒 🐭 🦦 🦁 🐺 🦭 ⭐ ❤️` (and `--plain` back).
+
+## License
+
+MIT, see [LICENSE](LICENSE). Contributions welcome: `./setup.sh` installs the toolchain, `cargo test` runs
+the compiler tests, and `cd editors/vscode && npm test` checks the extension inside a real VS Code.

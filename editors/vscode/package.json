@@ -4,6 +4,8 @@
   "description": "Everything for stellang: highlighting, errors as you type, hover types, completion, go to definition, rename, inlay hints, formatting, run and build.",
   "version": "0.2.0",
   "publisher": "stellang",
+  "license": "MIT",
+  "pricing": "Free",
   "icon": "media/icon.png",
   "galleryBanner": {
     "color": "#1a1430",
@@ -287,8 +289,8 @@
   },
   "scripts": {
     "bundle": "node scripts/bundle.js",
-    "package": "node scripts/bundle.js && vsce package --skip-license",
-    "package:nobin": "vsce package --skip-license --out stellang-universal.vsix",
+    "package": "node scripts/bundle.js && vsce package",
+    "package:nobin": "vsce package --out stellang-universal.vsix",
     "test": "node test/run.js"
   },
   "dependencies": {

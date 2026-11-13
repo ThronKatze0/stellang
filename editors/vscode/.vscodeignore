@@ -7,3 +7,4 @@ node_modules/.bin/**
 test/**
 node_modules/@vscode/test-electron/**
 .vscode-test/**
+PUBLISHING.md
