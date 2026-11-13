@@ -123,6 +123,7 @@ struct El {
     avail_h: int = -1,        // its content height when that's decided from outside (for height: N%)
     words: [Word] = [],       // inline content
     pref: int = -1,           // max-content width, cached during a layout
+    uid: int = 0,             // an identity for scripts (jsdom.st), given when first needed
 
     fn attr(self, name: str) -> str { return self.attrs.get(name) ?? "" }
     fn has(self, name: str) -> bool { return self.attrs.contains(name) }
@@ -273,6 +274,7 @@ struct Ui {
     slots: {str: El} = {},
     page_sheet: Sheet = Sheet {},
     links: [fn(El)] = [],
+    page_hooks: [fn(El, str, str) -> bool] = [],   // events on page elements, for the page's scripts
     forms: [fn(El, str)] = [],
 
     fn tick(self, t: wm.Tick) -> bool {
@@ -383,6 +385,10 @@ struct Ui {
 
     // Call the nearest handler for `event` from `e` up. Returns whether there was one.
     fn fire(self, e: El, event: str, value: str) -> bool {
+        // a page's own scripts first (they may cancel the default action)
+        for h in self.page_hooks {
+            if h(e, event, value) { return true }
+        }
         var cur: El? = some(e)
         while true {
             if let c = cur {
@@ -1228,6 +1234,15 @@ fn style_tree(e: El, parent: Style, u: Ui, page: bool) {
     e.pref = -1
     let inside = page || e.has("data-slot")
     for k in e.kids { style_tree(k, st, u, inside) }
+    // an inline element with blocks inside acts as a block (what browsers do, roughly, by splitting it)
+    if st.inline() && e.tag != "" {
+        for k in e.kids {
+            if k.tag != "" && k.st.display != "none" && !k.st.inline() && !k.st.atomic() && k.tag != "br" {
+                st.display = "block"
+                break
+            }
+        }
+    }
 }
 
 // var(--name) and var(--name, fallback), from the custom properties in effect

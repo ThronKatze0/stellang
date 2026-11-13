@@ -490,14 +490,31 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
 - **Games** draw directly (`gfx`: fast rectangles, anti-aliased circles and rounded shapes, lines, sprites and
   scaled pixel art, text in Inter and DejaVu Sans Mono) and get every frame and key: Snake, Bricks, Paint.
 - **Browser** (`browser.st`, `html.st`): real websites over HTTPS (Wikipedia, Hacker News, Bing and DuckDuckGo
-  searches, ...). An address bar that also searches (Bing), back/forward, links, GET and POST forms, tables laid
-  out by their content, a reader view for pages that mark their main part, Latin, Greek and Cyrillic text.
-  Pages come without scripts or images, and with only the hiding rules of their linked stylesheets, so they
-  read like reader mode. Safe by design: it never runs code from a page (scripts, `on*` handlers and
-  `javascript:` links are stripped, and the status bar says what was removed); pages can't reach the browser's
-  controls or the machine's files; search result links skip the engines' click-tracking redirects; https pages
-  never redirect down to http; pages are capped at 4 MiB, 20,000 elements and 40 levels deep. Sites that need
-  JavaScript (Google search, for one) don't work.
+  searches, ...). An address bar that also searches (Bing), back/forward, links, GET and POST forms, a reader
+  view for pages that mark their main part, Latin, Greek and Cyrillic text. Search result links skip the
+  engines' click-tracking redirects; https pages never redirect down to http; pages are capped at 4 MiB,
+  20,000 elements and 40 levels deep. No images yet.
+  - **CSS** (in `ui.st`): pages' own stylesheets, `<style>` and linked: selectors with `>`, `+`, `~`,
+    attributes, `:first-child`/`:last-child`/`:nth-child()`/`:not()`, the cascade (specificity, order,
+    `!important`), custom properties and `var()`, `@media` (print dropped), flexbox, grid, tables laid out by
+    their content, colors (`rgb`, `hsl`, names), units (`px em rem pt % vw vh`). Not yet: floats,
+    positioning, `:hover`, transforms, web fonts.
+  - **JavaScript** (`jsparse.st`, `js.st`, `jsstd.st`, `jsre.st`, `jsdom.st`): an engine written in stellang
+    (a parser and a tree-walking interpreter) with most of the modern language (let/const, arrow functions,
+    classes with `extends`/`super`/getters, destructuring, spread/rest, template literals, `?.` and `??`,
+    regular expressions, `async`/`await`, labels, exceptions) and the standard library (Object, Array, String,
+    Number, Math, JSON, RegExp, Date, Map, Set, Promise, errors). Scripts get the DOM: `document`,
+    `querySelector(All)`, creating and changing elements (`innerHTML`, `textContent`, `classList`, `style`,
+    `dataset`, attributes), events (click, input, change, submit, keys; `addEventListener`, inline `onclick`,
+    `preventDefault`), `setTimeout`/`setInterval`, `localStorage` (in memory, per site), `location`. Small and
+    medium scripts work (menus, tabs, counters, todo lists, form checks); big app frameworks are another
+    matter.
+  - **Safe by design**: scripts are sandboxed. They see their own page and nothing else: no network (`fetch`
+    and `XMLHttpRequest` refuse), no files, no `eval`, no access to the browser's controls (the toolkit's own
+    attributes can't be set by a page). Every run has a step budget (a runaway loop is stopped after about a
+    second, a page's scripts in total after 15 million steps), recursion is capped, regular expressions give
+    up on catastrophic backtracking, and script navigation is limited. The **JS** button turns scripts off.
+    `stellaos_js` tests the language, the DOM and these limits.
 <p align="center"><img src=".github/stellaos-browser.png" alt="the StellaOS browser showing a page, the Terminal behind it after ping, host and firewall" width="720"></p>
 
 - **Terminal**: the shell in a window (an ANSI terminal: colors, line editing, scrollback).

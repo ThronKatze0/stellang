@@ -2,10 +2,11 @@
 // toolkit's element tree, made safe on the way in.
 //
 // Safe means:
-// - no scripts, ever: <script> is dropped, so are on* attributes and javascript: links; nothing on a
-//   page runs code
-// - a page can't reach the browser's own buttons: only a short list of harmless attributes survives,
-//   so a page can't plant the toolkit's event attributes (data-on-click=...) on its elements
+// - scripts never run here: <script> code is set aside for the script engine (jsdom.st, which runs
+//   it in a sandbox, or not at all with JavaScript off), inline handlers (onclick=...) are kept apart
+//   as js-on* attributes that only the engine reads, and javascript: links are dropped
+// - a page can't reach the browser's own buttons: the toolkit's event attributes (data-on-*) and its
+//   other own attributes can't come from a page
 // - embedded content (iframes, objects, embeds, SVG) is dropped; images show their alt text
 // - limits: 20,000 elements, nesting 40 deep (deeper content is flattened, so a hostile page can't
 //   exhaust the kernel's stack), 1 MiB of CSS; inline styles can't load anything (url() is dropped)
@@ -72,6 +73,7 @@ struct Doc {
     truncated: bool = false,
     main: ui.El? = none,
     sheets: [str] = [],           // linked stylesheets
+    scripts: [Script] = [],       // in page order
     extra_css: str = "",          // their CSS, once fetched
     extra_hide: str = "",         // just their rules that hide things          // the page's main content (<main>, role="main"), if marked
     removed: {str: int} = {},     // what was dropped: "script" -> 3, "on* attributes" -> 12, ...
@@ -274,7 +276,19 @@ struct Parser {
                 let end = self.raw_end(name, i)
                 let content = src.cut(i, end)
                 if name == "script" {
-                    self.doc.drop("scripts")
+                    // kept for the script engine (if it's on): inline code, or a src to fetch
+                    let ty = (attrs.get("type") ?? "").lower()
+                    if ty == "" || ty.contains("javascript") || ty == "text/ecmascript" {
+                        if self.doc.scripts.len() < 64 {
+                            if let src = attrs.get("src") {
+                                self.doc.scripts.push(Script { src })
+                            } else {
+                                self.doc.scripts.push(Script { code: content })
+                            }
+                        }
+                    } else if ty == "module" {
+                        self.doc.drop("module scripts")
+                    }
                 } else if name == "style" {
                     if self.doc.css.len() + content.len() <= MAX_CSS {
                         self.doc.css = self.doc.css + "\n" + content
@@ -360,13 +374,16 @@ fn make(tag: str, attrs: {str: str}, doc: Doc) -> ui.El {
     for k in attrs.keys() {
         let v = attrs.get(k) ?? ""
         if k.starts_with("on") {
-            doc.drop("on* attributes (scripts)")
+            // an inline event handler: kept apart (js-onclick), and run only by the script engine
+            if k.len() > 2 && k.len() < 30 { el.attrs["js-" + k] = v }
             continue
         }
-        if !ATTRS.contains(k) {
-            if k.starts_with("data-") { doc.drop("data-* attributes") }
+        if k.starts_with("data-") {
+            // the page's own data-* (scripts read them); never the toolkit's own attributes
+            if !reserved(k) { el.attrs[k] = v }
             continue
         }
+        if !ATTRS.contains(k) { continue }
         if k == "style" {
             let low = v.lower()
             if low.contains("url(") || low.contains("expression") || low.contains("@import") {
@@ -525,6 +542,17 @@ fn hiding_rules(css: str) -> str {
         if out.len() >= 2000 { break }
     }
     return out.join("\n")
+}
+
+// attributes the UI toolkit itself uses: a page (or its scripts) must never set them
+fn reserved(name: str) -> bool {
+    let k = name.lower()
+    return k.starts_with("data-on") || k == "data-tag" || k == "data-slot" || k == "data-key" || k == "data-anon" || k.starts_with("js-")
+}
+
+struct Script {
+    code: str = "",
+    src: str = "",
 }
 
 fn find_main(e: ui.El) -> ui.El? {

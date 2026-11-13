@@ -1,19 +1,22 @@
-// The web browser: an address bar, back/forward/reload, links and (GET) forms, pages laid out by the
-// UI toolkit. The browser's own controls are a JSX app; the page goes into its `data-slot` area.
+// The web browser: an address bar that also searches, back/forward/reload, links and forms, pages
+// laid out by the UI toolkit with their CSS, and their JavaScript run by js.st. The browser's own
+// controls are a JSX app; the page goes into its `data-slot` area.
 //
-// Safe by design: pages never run code (there is no script engine, and html.st strips scripts,
-// event handlers and javascript: links), can't touch the browser's controls or the files on this
-// machine, and can only load http: pages. The status bar says what was blocked. Plain http isn't
-// private (anyone on the path can read and change it), and the address bar says so.
+// Safe by design: a page's scripts run in a sandbox (jsdom.st: their own page only, no network, no
+// files, a step budget), can't touch the browser's controls (the toolkit's own attributes are off
+// limits to pages), and javascript: links never run. https pages never redirect down to http, and
+// plain http is marked Not secure.
 
 import web
 import ui
 import wm
+import kernel
 import inet
 import tcp
 import www
 import html
 import x509
+import jsdom
 
 const CSS = """
     .browser { display: flex; flex-direction: column; height: 100%; background: #f6f5fa }
@@ -46,13 +49,13 @@ const HOME = """
 <h3>Safe by design</h3>
 <ul>
 <li>HTTPS is TLS 1.3 written in stellang: certificates are checked against Mozilla's root list, signature by signature, and must name the site. If anything doesn't check out, the page doesn't load.</li>
-<li>No scripts run, ever: they're removed before a page is shown, with event handlers and javascript: links.</li>
+<li>Scripts run in a sandbox (a JavaScript engine written in stellang): they see only their own page, get no network access, no files, no eval, and are stopped if they run too long. The <b>JS</b> button turns them off.</li>
 <li>Pages can't reach this browser's controls, your files or anything else on this machine.</li>
 <li>Plain http pages are marked <b>Not secure</b>, and https pages never redirect down to http.</li>
 <li>Search result links go straight to the site, not through the search engine's click tracking.</li>
 <li>Pages are limited to 4 MiB, 20,000 elements and 20 seconds.</li>
 </ul>
-<p style="color: #8a879a">Pages show without their external stylesheets, images and scripts: think reader mode.</p>
+<p style="color: #8a879a">Images aren't shown yet; Reader keeps just a page's main part.</p>
 </div>
 """
 
@@ -78,6 +81,12 @@ struct Browser {
     doc_url: str = "",
     doc_title: str = "",
     tick: fn() = () => {},
+    scripts: bool = true,         // run pages' JavaScript
+    dom: jsdom.Dom? = none,       // the page's script world
+    page_root: ui.El? = none,     // what's in the page slot
+    storages: {str: {str: str}} = {},   // localStorage, per site (memory only)
+    dom_dirty: bool = false,
+    notice: str = "",
 
     fn changed(self) {
         self.version += 1
@@ -101,6 +110,8 @@ struct Browser {
 
     // load a page; with `form`, by POSTing it
     fn load_form(self, target: str, form: str) {
+        self.stop_scripts()
+        self.notice = ""
         if let r = self.loading { r.cancel() }
         self.loading = none
         let url = target.trim()
@@ -136,10 +147,12 @@ struct Browser {
         self.base = r.url
         let kind = r.header("content-type").lower()
         var blocked = ""
+        var run_page: html.Doc? = none
         if kind == "" || kind.contains("html") {
             let doc = html.parse(r.body)
             self.show_doc(doc, where, if doc.title != "" { doc.title } else { r.url.host })
             self.load_sheets(doc, r.url)
+            run_page = some(doc)
             var parts: [str] = []
             for k in doc.removed.keys() { parts.push("${doc.removed.get(k) ?? 0} ${k}") }
             if !parts.is_empty() { blocked = " · blocked: " + parts.join(", ") }
@@ -155,6 +168,7 @@ struct Browser {
         let how = if r.secure != "" { r.secure + " · " } else { "" }
         self.status = "${how}HTTP ${r.status} · ${size(r.bytes)} in ${r.ms} ms${blocked}"
         self.changed()
+        if let doc = run_page { if self.scripts { self.start_scripts(doc, r.url) } }
     }
 
     fn show_html(self, page: str, url: str, title: str) {
@@ -209,7 +223,9 @@ struct Browser {
             sheet.add_css(if self.reader && self.has_main { doc.extra_hide } else { doc.extra_css }, 20000)
             u.page_sheet = sheet
             u.scrolls = {}
-            u.set_slot("page", normalize(root))
+            let shown = normalize(root)
+            self.page_root = some(shown)
+            u.set_slot("page", shown)
         }
         if let w = self.win {
             w.title = "${title.slice(0, min(title.len(), 60))} — Browser"
@@ -262,6 +278,145 @@ struct Browser {
         self.go(to.text())
     }
 
+    // ---- scripts ----
+
+    fn stop_scripts(self) {
+        if let d = self.dom { d.shutdown() }
+        self.dom = none
+    }
+
+    // Give the page its script world, fetch its external scripts, then run them all in page order.
+    fn start_scripts(self, doc: html.Doc, base: www.Url) {
+        let origin = "${base.scheme}://${base.host}:${base.port}"
+        if !self.storages.contains(origin) { self.storages[origin] = {} }
+        let d = jsdom.open(doc.root, base.text(), self.doc_title, self.storages.get(origin) ?? {}, self.client.stack.net.rand.u32())
+        self.dom = some(d)
+        let gen = self.page_gen
+        d.changed = () => self.dom_changed()
+        d.navigate = (to: str) => {
+            let u = www.resolve(self.base, to) catch e { return }
+            if gen == self.page_gen { self.go(u.text()) }
+        }
+        d.notice = (text: str) => {
+            self.notice = text.slice(0, min(text.len(), 200))
+            self.changed()
+        }
+        d.retitle = (t: str) => {
+            if let w = self.win {
+                w.title = "${t.slice(0, min(t.len(), 60))} — Browser"
+                if let dk = self.desk {
+                    dk.hurt_window(w.id)
+                    dk.hurt_taskbar()
+                }
+            }
+        }
+        d.field_get = (e: ui.El) => self.field_value(e)
+        d.field_set = (e: ui.El, v: str) => self.set_field_value(e, v)
+        // the code: inline now, external when it arrives (at most 12, run in page order)
+        var codes: [str] = []
+        var names: [str] = []
+        var waiting = [0]
+        for i, sc in doc.scripts {
+            codes.push(sc.code)
+            names.push(if sc.src != "" { sc.src } else { "inline script ${i + 1}" })
+            if sc.src != "" && waiting[0] < 12 {
+                let u = www.resolve(base, sc.src) catch e { continue }
+                waiting[0] = waiting[0] + 1
+                let idx = i
+                www.get(self.client, u, (r: www.Response) => {
+                    if r.error == "" && r.status == 200 { codes[idx] = r.body }
+                    waiting[0] = waiting[0] - 1
+                    if waiting[0] == 0 && gen == self.page_gen { self.run_scripts(d, codes, names) }
+                })
+            }
+        }
+        if waiting[0] == 0 { self.run_scripts(d, codes, names) }
+    }
+
+    fn run_scripts(self, d: jsdom.Dom, codes: [str], names: [str]) {
+        for i, code in codes {
+            if code.trim() != "" { d.run_script(code, names[i]) }
+        }
+        d.dispatch(d.root, "DOMContentLoaded", "")
+        d.dispatch(d.root, "load", "")
+        self.flush_dom()
+        self.update_script_status()
+    }
+
+    fn update_script_status(self) {
+        if let d = self.dom {
+            var s = self.status
+            let mark = s.find(" · scripts:")
+            if mark >= 0 { s = s.slice(0, mark) }
+            var info = " · scripts: ${d.ran} ran"
+            if d.errors > 0 { info = info + ", ${d.errors} with errors (${d.last_error.slice(0, min(d.last_error.len(), 80))})" }
+            self.status = s + info
+            self.changed()
+        }
+    }
+
+    // the page changed its tree: lay it out again, once, a moment later
+    fn dom_changed(self) {
+        if self.dom_dirty { return }
+        self.dom_dirty = true
+        kernel.after(1, () => self.flush_dom())
+    }
+
+    fn flush_dom(self) {
+        self.dom_dirty = false
+        if let r = self.page_root {
+            normalize(r)
+            ui.repath(r, r.path)
+        }
+        if let u = self.u {
+            u.restyle = true
+            u.relayout = true
+            u.repaint = true
+        }
+    }
+
+    fn field_value(self, e: ui.El) -> str {
+        if let u = self.u {
+            if let f = u.fields.get(e.path) { return f.text }
+        }
+        if e.tag == "textarea" { return e.kids.map(k => k.text).join("") }
+        return e.attr("value")
+    }
+
+    fn set_field_value(self, e: ui.El, v: str) {
+        e.attrs["value"] = v
+        if let u = self.u {
+            if let f = u.fields.get(e.path) {
+                f.text = v
+                f.seen = v
+                f.caret = min(f.caret, v.chars().len())
+            }
+        }
+    }
+
+    // an event on a page element: to the page's scripts. true if they cancelled it.
+    fn page_event(self, e: ui.El, event: str, value: str) -> bool {
+        if let d = self.dom {
+            if !d.inside(e) { return false }
+            var prevented = false
+            if event == "pointerdown" {
+                d.dispatch(e, "mousedown", "")
+            } else if event == "pointerup" {
+                d.dispatch(e, "mouseup", "")
+            } else {
+                prevented = d.dispatch(e, event, if event == "keydown" || event == "keyup" { value } else { "" })
+            }
+            self.update_script_status()
+            return prevented
+        }
+        return false
+    }
+
+    fn toggle_scripts(self) {
+        self.scripts = !self.scripts
+        self.load(self.shown)
+    }
+
     fn toggle_reader(self) {
         self.reader = !self.reader
         if let d = self.doc { self.show_doc(d, self.doc_url, self.doc_title) }
@@ -292,11 +447,12 @@ fn Chrome(b: Browser) -> Node {
             <button onclick={() => b.load(b.shown)}>"↻"</button>
             <span class={if local { "badge local" } else if b.secure { "badge secure" } else { "badge" }}>{if local { "StellaOS" } else if b.secure { "✓ Secure" } else { "Not secure" }}</span>
             <input value={b.address} oninput={v => { b.typed = v }} onkeydown={k => if k == "Enter" { b.go(b.typed) }} />
+            <button class={if b.scripts { "on" } else { "" }} onclick={() => b.toggle_scripts()}>{if b.scripts { "JS on" } else { "JS off" }}</button>
             <button class={if b.reader && b.has_main { "on" } else { "" }} onclick={() => b.toggle_reader()} disabled={!b.has_main}>"≡ Reader"</button>
             <button onclick={() => b.go("about:home")}>"⌂"</button>
         </div>
         <div class="page" data-slot="page"></div>
-        <div class="status">{if b.loading.is_some() { "Loading…  ${b.status}" } else { b.status }}</div>
+        <div class="status">{if b.loading.is_some() { "Loading…  ${b.status}" } else if b.notice != "" { "⚠ ${b.notice}" } else { b.status }}</div>
     </div>
 }
 
@@ -338,6 +494,7 @@ fn normalize(e: ui.El) -> ui.El {
 
 fn wrap(parent: ui.El, run: [ui.El]) -> ui.El {
     let d = ui.El { tag: "div", parent: some(parent) }
+    d.attrs["data-anon"] = "1"        // not the page's: scripts see through it
     var any = false
     for k in run {
         if k.tag != "" || k.text.trim() != "" { any = true }
@@ -416,6 +573,7 @@ fn open(d: wm.Desktop, client: www.Client, url: str) -> Browser {
     b.u = some(u)
     u.links.push((a: ui.El) => b.link(a))
     u.forms.push((f: ui.El, q: str) => b.submit(f, q))
+    u.page_hooks.push((e: ui.El, ev: str, v: str) => b.page_event(e, ev, v))
     let w = d.open("Browser", "◎", 0x0984e3, 720, 520, ui.window_app(u))
     b.win = some(w)
     if url == "" || url == "about:home" { b.load("about:home") } else { b.go(url) }

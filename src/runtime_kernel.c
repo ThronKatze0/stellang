@@ -282,6 +282,12 @@ int64_t st_k_find_at(const char *s, const char *sub, int64_t from) {
     return p ? p - s : -1;
 }
 char *st_k_substr(const char *s, int64_t from, int64_t to) { return mkstr(s + from, (size_t)(to - from)); }
+// characters in a UTF-8 string (not bytes)
+int64_t st_k_utf8_len(const char *s) {
+    int64_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) n += (*p & 0xc0) != 0x80;
+    return n;
+}
 // The clock in its finest steps (for timing jitter as a little entropy).
 int64_t st_k_cycles(void) { return (int64_t)rdtime(); }
 int64_t st_k_pages_out(void) { return (int64_t)pages_out; }

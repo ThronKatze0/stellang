@@ -1989,6 +1989,35 @@ fn stellaos_crypto() {
     assert!(text.contains("ok ecdsa p-384\n") && text.contains("\ndone") && !text.contains("FAIL"), "{text}");
 }
 
+/// StellaOS's JavaScript engine and DOM (tests/stellaos_js.st): the language, the DOM and events,
+/// and the sandbox (runaway loops stopped, deep recursion and catastrophic regexes contained, no
+/// network, no eval, the toolkit's own attributes off limits), inside QEMU.
+#[test]
+fn stellaos_js() {
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-riscv64");
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tmpdir("jsengine");
+    for e in fs::read_dir(root.join("examples/stellaos")).unwrap() {
+        let p = e.unwrap().path();
+        fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+    }
+    fs::copy(root.join("tests/stellaos_js.st"), dir.join("js_test.st")).unwrap();
+    let elf = dir.join("t.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(dir.join("js_test.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let out = Command::new("qemu-system-riscv64")
+        .args(["-machine", "virt", "-m", "256M", "-nographic", "-bios", "default", "-kernel"])
+        .arg(&elf)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert!(text.contains("passed 21/21") && !text.contains("FAIL"), "{text}");
+}
+
 /// HTTPS in StellaOS against real TLS 1.3 servers (openssl s_server on the host, reached through
 /// QEMU's user network): an unknown root is refused, so is a certificate for another name; with the
 /// root added to /etc/ca, the page loads (one server picks AES-128-GCM, the other ChaCha20).
