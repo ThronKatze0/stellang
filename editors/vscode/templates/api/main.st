@@ -117,7 +117,7 @@ fn main() -> void! {
             res.status(409).send("already done at ${at}")
             return
         }
-        t.status = .Done { at: http.now_ms() }
+        t.status = .Done { at: now_ms() }
         publish(.Completed(t.id))
         res.json(to_json(t))
     })

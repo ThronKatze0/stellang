@@ -2,6 +2,7 @@
 // and an HTTP(S) client on libcurl for `http.fetch`.
 // Compiled by clang alongside every program; memory is managed by Boehm GC (-lgc), HTTPS comes from -lcurl.
 #define _GNU_SOURCE
+#ifndef ST_KERNEL // (bare metal: runtime_klibc.c comes first instead)
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
@@ -27,6 +28,7 @@
 #include <unistd.h>
 #ifndef ST_WASM
 #include <curl/curl.h>
+#endif
 #endif
 
 // Boehm GC natively; in the browser the collector in runtime_web.c
@@ -68,8 +70,10 @@ void *st_alloc(int64_t size) { return alloc(size, 1, 0); } // objects, closures,
 
 void st_init(void) {
     GC_init();
+#ifndef ST_KERNEL
     setvbuf(stdout, NULL, _IOLBF, 0);
-#ifndef ST_WASM
+#endif
+#if !defined(ST_WASM) && !defined(ST_KERNEL)
     signal(SIGPIPE, SIG_IGN); // a client hanging up must not kill a server
 #endif
 }
@@ -513,7 +517,7 @@ static const char *last_error = "";
 static void failed(void) { last_error = mkstr(strerror(errno), strlen(strerror(errno))); }
 const char *st_error(void) { return last_error; }
 
-#ifndef ST_WASM
+#if !defined(ST_WASM) && !defined(ST_KERNEL)
 // ---- sockets, used by std/net.st through `extern fn` ----
 
 int64_t st_listen(int64_t port) {
@@ -776,11 +780,13 @@ void st_drop(int64_t fd) {
 
 #endif // sockets
 
+#ifndef ST_KERNEL
 int64_t st_now_ms(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
+#endif
 
 // ---- SHA-1 + base64, for the WebSocket handshake ----
 
@@ -863,13 +869,16 @@ char *st_url_encode(const char *s) {
     return r;
 }
 
+#ifndef ST_KERNEL // (bare metal: runtime_kernel.c's, which runs timers while it waits)
 // the builtin `sleep(ms)`: block this thread
 void st_sleep(int64_t ms) {
     if (ms <= 0) return;
     struct timespec t = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000};
     while (nanosleep(&t, &t) < 0 && errno == EINTR) {}
 }
+#endif
 
+#ifndef ST_KERNEL
 // ---- files, for std/fs.st and res.send_file ----
 
 // size in bytes of a regular file, or -1
@@ -968,6 +977,8 @@ Vec *st_list_dir(const char *path) {
     return v;
 }
 
+#endif // files
+
 // UTF-8 encoding of code point `c`
 char *st_chr(int64_t c) {
     char b[5] = {0};
@@ -979,7 +990,7 @@ char *st_chr(int64_t c) {
 }
 
 // ---- HTTP(S) client on libcurl, for http.fetch / http.request (not in the browser: `import http` is server-only) ----
-#ifndef ST_WASM
+#if !defined(ST_WASM) && !defined(ST_KERNEL)
 
 typedef struct { char *p; size_t len, cap; } Bytes;
 

@@ -9,6 +9,7 @@ pub enum Tok {
     Interp(Vec<Part>), // a string with `${...}` in it
     LParen, RParen, LBrace, RBrace, LBrack, RBrack, Comma, Colon, Semi, Dot, DotDot,
     Arrow, FatArrow, Question, QuestionQuestion, Bang, Pipe,
+    Amp, Caret, Tilde, Shl, Shr, // bitwise (`>>` is two `>` the parser joins, so `Box<Box<int>>` still closes)
     Assign, PlusEq, MinusEq, TimesEq, SlashEq,
     Plus, Minus, Times, Slash, Percent, Eq, Ne, Lt, Le, Gt, Ge, AndAnd, OrOr,
     Newline,
@@ -81,6 +82,7 @@ impl fmt::Display for Tok {
             Tok::Plus => "+", Tok::Minus => "-", Tok::Times => "*", Tok::Slash => "/", Tok::Percent => "%",
             Tok::Eq => "==", Tok::Ne => "!=", Tok::Lt => "<", Tok::Le => "<=", Tok::Gt => ">", Tok::Ge => ">=",
             Tok::AndAnd => "&&", Tok::OrOr => "||",
+            Tok::Amp => "&", Tok::Caret => "^", Tok::Tilde => "~", Tok::Shl => "<<", Tok::Shr => ">>",
             _ => unreachable!("keywords handled above"),
         };
         write!(f, "`{s}`")
@@ -94,7 +96,7 @@ fn continues_after(t: &Tok) -> bool {
         t,
         Plus | Minus | Times | Slash | Percent | Eq | Ne | Lt | Le | Gt | Ge | AndAnd | OrOr | Bang | Comma
             | LParen | LBrack | Dot | DotDot | Colon | Arrow | FatArrow | Assign | PlusEq | MinusEq | TimesEq
-            | SlashEq | Catch | Pipe | QuestionQuestion
+            | SlashEq | Catch | Pipe | QuestionQuestion | Amp | Caret | Shl
     )
 }
 
@@ -165,6 +167,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
             i += 1;
             if cs.get(i) == Some(&'\u{FE0F}') { i += 1 } // ❤️ = ❤ + variation selector
             t
+        } else if c == '0' && matches!(next, 'x' | 'X' | 'b' | 'B' | 'o' | 'O') {
+            // 0xFF, 0b1010, 0o755 (with `_` anywhere); up to 64 bits, so 0xFFFF_FFFF_FFFF_FFFF is -1
+            let radix = match next { 'x' | 'X' => 16, 'b' | 'B' => 2, _ => 8 };
+            i += 2;
+            let from = i;
+            while i < cs.len() && (cs[i].is_ascii_alphanumeric() || cs[i] == '_') { i += 1 }
+            let s: String = cs[from..i].iter().filter(|&&c| c != '_').collect();
+            match u64::from_str_radix(&s, radix) {
+                Ok(n) => Tok::Int(n as i64),
+                Err(_) if s.is_empty() => return Err((pos, "expected digits after the number prefix".into())),
+                Err(_) => {
+                    let all: String = cs[start..i].iter().collect();
+                    let bad = s.chars().any(|c| !c.is_digit(radix));
+                    return Err((pos, if bad { format!("{all} is not a valid base-{radix} number") } else { format!("number {all} is too large (64 bits at most)") }));
+                }
+            }
         } else if c.is_ascii_digit() {
             let digits = |i: &mut usize| while *i < cs.len() && (cs[*i].is_ascii_digit() || cs[*i] == '_') { *i += 1 };
             digits(&mut i);
@@ -242,7 +260,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 ('=', '=') => Some(Tok::Eq), ('!', '=') => Some(Tok::Ne), ('<', '=') => Some(Tok::Le),
                 ('>', '=') => Some(Tok::Ge), ('&', '&') => Some(Tok::AndAnd), ('|', '|') => Some(Tok::OrOr),
                 ('+', '=') => Some(Tok::PlusEq), ('-', '=') => Some(Tok::MinusEq),
-                ('*', '=') => Some(Tok::TimesEq), ('/', '=') => Some(Tok::SlashEq), ('?', '?') => Some(Tok::QuestionQuestion),
+                ('*', '=') => Some(Tok::TimesEq), ('/', '=') => Some(Tok::SlashEq), ('?', '?') => Some(Tok::QuestionQuestion), ('<', '<') => Some(Tok::Shl),
                 _ => None,
             };
             if let Some(t) = two {
@@ -256,6 +274,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                     '(' => Tok::LParen, ')' => Tok::RParen, '{' => Tok::LBrace, '}' => Tok::RBrace,
                     '[' => Tok::LBrack, ']' => Tok::RBrack, ',' => Tok::Comma, ':' => Tok::Colon,
                     ';' => Tok::Semi, '.' => Tok::Dot, '?' => Tok::Question, '|' => Tok::Pipe,
+                    '&' => Tok::Amp, '^' => Tok::Caret, '~' => Tok::Tilde,
                     _ => return Err((pos, format!("unexpected character '{c}'"))),
                 }
             }

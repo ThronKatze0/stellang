@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>A small compiled language that reads like Rust, Swift and TypeScript had a baby.</b><br>
-  Structs and enums with methods · generics and traits · pattern matching · <code>T?</code> options and <code>T!</code> results · JSX in the language · full stack: native servers and WebAssembly browser apps from the same code · a language server for any editor.
+  Structs and enums with methods · generics and traits · pattern matching · <code>T?</code> options and <code>T!</code> results · JSX in the language · full stack: native servers and WebAssembly browser apps from the same code · bare-metal kernels (StellaOS) · a language server for any editor.
 </p>
 
 <p align="center">
@@ -15,8 +15,8 @@
 
 ---
 
-Rust frontend, LLVM backend (via clang), garbage collected (Boehm GC natively, its own collector in WebAssembly),
-HTTPS client on libcurl. No crates.
+Rust frontend, LLVM backend (via clang), garbage collected (Boehm GC natively, its own collector in WebAssembly
+and on bare metal), HTTPS client on libcurl. No crates.
 
 ## Quick start
 
@@ -27,10 +27,12 @@ stellang examples/server.st         # like cc: -o out, -O0..-O3 (default -O2), -
 stellang examples/todos.st && ./todos   # a JSON API + WebSocket feed + static page, modeled with enums
 stellang dev examples/fullstack     # server rendering + a WebAssembly client, rebuilt on every save
 stellang --web app.st               # a browser app: app.wasm + app.js (+ app.html to open)
+stellang boot examples/stellaos/os.st   # an operating system, on QEMU (RISC-V 64); --gui for its desktop
 ```
 
 Browser builds also need the WASI C library and clang's wasm32 runtime
-(Debian/Ubuntu: `apt install wasi-libc libclang-rt-18-dev-wasm32`; `./setup.sh` installs everything).
+(Debian/Ubuntu: `apt install wasi-libc libclang-rt-18-dev-wasm32`), kernels need lld and QEMU
+(`apt install lld qemu-system-misc`); `./setup.sh` installs everything.
 
 ## A web server
 
@@ -452,8 +454,56 @@ println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"p
 - `fs`: `read write append remove mkdir list -> T!`, `exists is_dir`, `size -> int?`.
 - `web`: browser apps (see *Full stack* above). On the server the same components render to HTML: `mount` prints
   the page once, and `signal`, timers and requests are inert. `res.page(<html>...</html>)` sends a whole page.
+- `kernel`: bare metal (see *An operating system* above).
 - `net`: `net.listen(port) -> Listener!`, `listener.accept() -> Conn!`, `conn.read() -> str!`,
   `conn.write(s) -> void!`, `conn.close()`. Wraps POSIX sockets from the C runtime.
+
+## An operating system: StellaOS
+
+`stellang --kernel os.st` compiles a program into a kernel (`os.elf`, RISC-V 64, for QEMU's `virt` machine);
+`stellang boot os.st` builds it and boots it with the console on your terminal. It is the same language with
+the same garbage collector, minus the host OS: `import kernel` instead of `http`, `net` and `fs`.
+
+[`examples/stellaos`](examples/stellaos) is an operating system written that way: a shell with line editing and
+history, a RAM filesystem (`ls cd mkdir cat write edit rm wc`), background jobs on timers (`every 500 uptime`,
+`jobs`, `kill`), a calculator, memory stats, and a desktop drawn by a framebuffer driver written in stellang:
+
+<p align="center"><img src=".github/stellaos.png" alt="the StellaOS desktop" width="640"></p>
+
+```sh
+stellang boot examples/stellaos/os.st          # the shell, in this terminal (Ctrl-A X force-quits QEMU)
+stellang boot --gui examples/stellaos/os.st    # with a display: type `desktop`
+```
+
+```rust
+import kernel
+
+fn main() {
+    println("hello from bare metal")             // the serial console
+    kernel.every(1000, () => println("tick"))    // timers run whenever the program waits
+    let ed = kernel.LineEditor {}
+    while true {
+        let line = ed.read("> ")                 // arrows, history, Ctrl-U, ...
+        if line == "exit" { return }             // returning from main powers off (QEMU exits with main's code)
+        println(line.upper())
+    }
+}
+```
+
+- `kernel`: `key read_line LineEditor clear_screen ESC`, `uptime after every cancel idle run ticks` (plus the builtins `sleep`, `now_ms`),
+  `memory gc shutdown reboot`, and for drivers `peek8..peek64 poke8..poke64` (device registers),
+  `alloc_pages` (fixed memory a device can read and write: DMA, virtio queues, framebuffers),
+  `copy fill32 read_str write_str`, `irq_enable irq_count`.
+- Ints have the bit operations drivers need: `& | ^ ~ << >>` and `0xFF`, `0b1010`, `0o755` literals (with `_`).
+- Underneath are about 450 lines of C (`src/runtime_kernel.c`): boot, the trap handler (timer ticks through
+  OpenSBI, the UART through the PLIC; a CPU exception prints a panic with its address), the console, the
+  device tree, and the GC's pages. Interrupts never run stellang code: they queue and count, and the program
+  picks them up from its loop, so the collector only ever runs in ordinary code. The C library is
+  `src/runtime_klibc.c`; nothing else is linked.
+- Built on top, in stellang: a ramfb display driver (`examples/stellaos/gfx.st`: fw_cfg DMA, then pixels) and the
+  desktop. The same pieces (registers, interrupts, DMA memory) are what the next drivers need: virtio-blk for
+  a disk that survives reboots, virtio-net for a network stack, virtio-input for a mouse and keyboard on the
+  desktop. Page tables and user mode (processes, syscalls) are the step after, along with more harts.
 
 ## Editor support
 
