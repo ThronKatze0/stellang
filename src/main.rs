@@ -38,7 +38,8 @@ const USAGE: &str = "usage:
   stellang --web <app.st> [-o <out>]                                   compile for the browser (out.wasm + out.js)
   stellang --kernel <os.st> [-o <out>]                                 compile an operating system kernel (RISC-V 64, out.elf)
   stellang boot [--gui] [--disk f.img] <os.st|os.elf> [qemu args]      build it and boot it in QEMU (--gui: with a display,
-                                                                        keyboard and mouse; a disk image keeps files)
+                                                                        keyboard and mouse; a disk image keeps files;
+                                                                        a network card unless --no-net)
   stellang dev [dir]                                                    full-stack dev loop: client.st -> public/, server.st; rebuild on change
   stellang check <file.st>                                             type-check only
   stellang fmt [--emoji|--plain] <file.st>                              re-indent in place
@@ -297,11 +298,13 @@ fn boot(args: &[String]) {
     let mut gui = false;
     let mut disk: Option<String> = None;
     let mut no_disk = false;
+    let mut net = true;
     let mut i = 0;
     while i < args.len() && args[i].starts_with("--") {
         match args[i].as_str() {
             "--gui" => gui = true,
             "--no-disk" => no_disk = true,
+            "--no-net" => net = false,
             "--disk" if i + 1 < args.len() => {
                 i += 1;
                 disk = Some(args[i].clone());
@@ -347,6 +350,14 @@ fn boot(args: &[String]) {
     if let Some(d) = &disk {
         cmd.arg("-drive").arg(format!("file={},if=none,format=raw,id=disk0", d.display()));
         cmd.args(["-device", "virtio-blk-device,drive=disk0"]);
+    }
+    // a source of random numbers (virtio-rng, fed from the host's /dev/urandom)
+    cmd.args(["-device", "virtio-rng-device"]);
+    if net {
+        // a network card on QEMU's user-mode network: the kernel sees a 10.0.2.0/24 LAN (gateway
+        // 10.0.2.2, DNS 10.0.2.3) and reaches the outside through the host; nothing outside can
+        // connect in (no ports are forwarded)
+        cmd.args(["-netdev", "user,id=net0", "-device", "virtio-net-device,netdev=net0"]);
     }
     if gui {
         // a window with the display (a ramfb framebuffer), a keyboard and a mouse (virtio-input; the

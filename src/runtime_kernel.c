@@ -257,6 +257,25 @@ char *st_k_read_str(int64_t src, int64_t n) {
     if (n > 0) memcpy(r, (const void *)src, (size_t)n);
     return r;
 }
+// Bytes as text, for data from outside (the network): NUL bytes become spaces so they can't cut a
+// string short.
+char *st_k_read_text(int64_t src, int64_t n) {
+    char *r = st_k_read_str(src, n);
+    for (int64_t i = 0; i < n; i++) if (!r[i]) r[i] = ' ';
+    return r;
+}
+// The Internet checksum's ones'-complement sum of `n` bytes (big-endian 16-bit words), added to `sum`
+// and folded to 16 bits. The callers check the range first.
+int64_t st_k_csum(int64_t addr, int64_t n, int64_t sum) {
+    const uint8_t *p = (const uint8_t *)addr;
+    uint64_t s = (uint64_t)sum;
+    for (int64_t i = 0; i + 1 < n; i += 2) s += (uint64_t)p[i] << 8 | p[i + 1];
+    if (n & 1) s += (uint64_t)p[n - 1] << 8;
+    while (s >> 16) s = (s & 0xffff) + (s >> 16);
+    return (int64_t)s;
+}
+// The clock in its finest steps (for timing jitter as a little entropy).
+int64_t st_k_cycles(void) { return (int64_t)rdtime(); }
 int64_t st_k_pages_out(void) { return (int64_t)pages_out; }
 
 int64_t st_k_heap_live(void) { return (int64_t)live_bytes; }   // bytes in use after the last collection

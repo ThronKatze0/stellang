@@ -23,8 +23,12 @@ import breakout
 import mines
 import paint
 import disk
+import rng
+import inet
+import netcmd
+import tcp
 
-const VERSION = "0.2"
+const VERSION = "0.3"
 
 struct Job {
     id: int,
@@ -43,6 +47,8 @@ struct Shell {
     disk: disk.Disk? = none,
     saved: int = 0,           // fs.changes when it was last saved
     terminal: int = 0,        // the terminal window's id
+    net: inet.Net? = none,
+    tcp: tcp.Tcp? = none,
 
     fn prompt(self) -> str {
         let e = kernel.ESC
@@ -187,6 +193,14 @@ struct Shell {
                 self.sync()
                 kernel.reboot()
             },
+            "ifconfig" | "ip" => netcmd.ifconfig(self.network()?, argv)?,
+            "ping" => netcmd.ping(self.network()?, argv)?,
+            "host" | "nslookup" => netcmd.host(self.network()?, argv)?,
+            "arp" => netcmd.arp(self.network()?),
+            "firewall" => netcmd.firewall(self.network()?, argv)?,
+            "dns" => netcmd.dns(self.network()?, argv)?,
+            "netstat" => netcmd.netstat(self.sockets()?),
+            "fetch" | "curl" | "wget" => netcmd.fetch(self.sockets()?, self.fs, self.cwd, argv)?,
             "panic" => panic("you asked for it"),
             _ => return err("unknown command: ${cmd} (try `help`)"),
         }
@@ -205,6 +219,16 @@ struct Shell {
         })
         self.jobs.push(Job { id, timer, what: "every ${ms} ms: ${cmd}" })
         println("[${id}] started (stop it with `kill ${id}`)")
+    }
+
+    fn network(self) -> inet.Net! {
+        if let n = self.net { return n }
+        return err("no network card (`stellang boot` adds one unless --no-net)")
+    }
+
+    fn sockets(self) -> tcp.Tcp! {
+        if let t = self.tcp { return t }
+        return err("no network card (`stellang boot` adds one unless --no-net)")
     }
 
     fn desktop(self) -> wm.Desktop! {
@@ -287,6 +311,8 @@ fn help() {
     println("system    mem  gc  df  sync  uptime  uname  history  clear  shutdown  reboot")
     println("jobs      every <ms> <command>  jobs  kill <job>  sleep <ms>")
     println("tools     echo <text>  calc <expr>  peek <address>  date  panic")
+    println("network   ifconfig [set <ip>/<bits> [gw] | dhcp]  ping [-c n] <host>  host <name>  arp  firewall [ping on|off|log]")
+    println("          fetch [-i] <url> [-o file]  netstat  dns [server]")
     println("desktop   desktop  apps  open <app>  windows  keyboard us|de")
     println("keys      arrows edit and recall history, Ctrl-U clears the line, Ctrl-D exits")
 }
@@ -349,6 +375,8 @@ fn main() {
     // save a moment after changes
     kernel.every(2000, () => sh.sync())
     sh.cwd = "/home"
+    sh.net = inet.open(rng.open())
+    if let n = sh.net { sh.tcp = some(tcp.start(n)) }
     banner()
     print(sh.fs.read("/etc/motd") catch "")
     // a display: the desktop comes up by itself, with a terminal on it
