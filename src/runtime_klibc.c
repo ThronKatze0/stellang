@@ -142,7 +142,11 @@ int tolower(int c) { return isupper(c) ? c + 32 : c; }
 
 double sqrt(double x) {
     double r;
+#ifdef __x86_64__
+    __asm__("sqrtsd %1, %0" : "=x"(r) : "x"(x));
+#else
     __asm__("fsqrt.d %0, %1" : "=f"(r) : "f"(x));
+#endif
     return r;
 }
 

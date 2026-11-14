@@ -53,7 +53,7 @@ static volatile uint32_t rx_head, rx_tail;
 
 // ---- memory: GC pages from the RAM after the kernel ----
 
-static uintptr_t heap_next, heap_end;
+static uintptr_t heap_start, heap_next, heap_end;
 static uint64_t gc_runs;
 static size_t pages_out; // bytes handed out by st_k_alloc_pages
 
@@ -137,7 +137,7 @@ int64_t st_k_cycles(void) { return (int64_t)rdtime(); }
 int64_t st_k_pages_out(void) { return (int64_t)pages_out; }
 
 int64_t st_k_heap_live(void) { return (int64_t)live_bytes; }   // bytes in use after the last collection
-int64_t st_k_heap_mapped(void) { return (int64_t)(heap_next - (uintptr_t)&__kernel_end - pages_out); } // GC pages taken
+int64_t st_k_heap_mapped(void) { return (int64_t)(heap_next - heap_start - pages_out); } // GC pages taken
 int64_t st_k_heap_free(void) { return (int64_t)(heap_end - heap_next); } // RAM not yet handed to the GC
 int64_t st_k_ram_size(void) { return (int64_t)ram_size; }
 int64_t st_k_gc_runs(void) { return (int64_t)gc_runs; }

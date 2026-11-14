@@ -19,6 +19,9 @@ const RUNTIME_GC: &str = include_str!("runtime_gc.c");
 const RUNTIME_KLIBC: &str = include_str!("runtime_klibc.c");
 const RUNTIME_KERNEL: &str = include_str!("runtime_kernel.c");
 const RUNTIME_KERNEL_RV: &str = include_str!("runtime_kernel_rv.c");
+const RUNTIME_KERNEL_X86: &str = include_str!("runtime_kernel_x86.c");
+const BOOT_UEFI: &str = include_str!("boot_uefi.c");
+const KERNEL_X86_LD: &str = include_str!("kernel_x86.ld");
 const RUNTIME_FONT: &str = include_str!("runtime_font.c");
 const KERNEL_LD: &str = include_str!("kernel.ld");
 const LOADER: &str = include_str!("loader.js");
@@ -37,8 +40,10 @@ pub const STD: &[(&str, &str)] = &[
 const USAGE: &str = "usage:
   stellang <file.st> [-o <out>] [-O0|-O1|-O2|-O3|-Os] [--emit-llvm]   compile
   stellang --web <app.st> [-o <out>]                                   compile for the browser (out.wasm + out.js)
-  stellang --kernel <os.st> [-o <out>]                                 compile an operating system kernel (RISC-V 64, out.elf)
-  stellang boot [--gui] [--disk f.img] <os.st|os.elf> [qemu args]      build it and boot it in QEMU (--gui: with a display,
+  stellang --kernel [--arch x86_64] <os.st> [-o <out>]                 compile an operating system kernel (RISC-V 64, out.elf;
+                                                                        x86_64: out.efi, a UEFI app for real PCs)
+  stellang boot [--arch x86_64] [--gui] [--disk f.img] <os.st|os.elf|os.efi> [qemu args]
+                                                                        build it and boot it in QEMU (--gui: with a display,
                                                                         keyboard and mouse; a disk image keeps files;
                                                                         a network card unless --no-net, a sound
                                                                         card unless --no-sound)
@@ -144,6 +149,7 @@ fn main() {
     }
 
     let (mut input, mut out, mut opt, mut emit, mut web, mut kernel) = (None, None, "-O2".to_string(), false, false, false);
+    let mut x86 = false;
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -151,6 +157,7 @@ fn main() {
             "--emit-llvm" | "-S" => emit = true,
             "--web" => web = true,
             "--kernel" => kernel = true,
+            "--arch" => x86 = arch(args.next()),
             "-O0" | "-O1" | "-O2" | "-O3" | "-Os" | "-Oz" => opt = a.clone(),
             "-h" | "--help" => return println!("{USAGE}"),
             _ if a.starts_with('-') => die(format!("unknown option {a}\n{USAGE}")),
@@ -162,7 +169,7 @@ fn main() {
         return build_web(&input, out, &opt, emit);
     }
     if kernel {
-        build_kernel(&input, out, &opt, emit);
+        build_kernel(&input, out, &opt, emit, x86);
         return;
     }
     let units = load_or_exit(&input);
@@ -248,7 +255,16 @@ fn build_web(input: &str, out: Option<String>, opt: &str, emit: bool) {
 /// `stellang --kernel os.st`: os.elf, a kernel for QEMU's RISC-V `virt` machine. The program, the C
 /// runtime (with a small libc, runtime_klibc.c, and the boot code, runtime_kernel.c) and the
 /// collector (runtime_gc.c) are compiled freestanding and linked with kernel.ld. Returns the .elf path.
-fn build_kernel(input: &str, out: Option<String>, opt: &str, emit: bool) -> String {
+/// `--arch riscv64|x86_64`: whether it's x86_64.
+fn arch(a: Option<String>) -> bool {
+    match a.as_deref() {
+        Some("x86_64" | "x86-64" | "x86" | "amd64") => true,
+        Some("riscv64" | "riscv" | "rv64") => false,
+        _ => die("--arch: riscv64 or x86_64"),
+    }
+}
+
+fn build_kernel(input: &str, out: Option<String>, opt: &str, emit: bool, x86: bool) -> String {
     let units = load_or_exit(input);
     for u in &units {
         for (imp, pos) in &u.module.imports {
@@ -263,13 +279,16 @@ fn build_kernel(input: &str, out: Option<String>, opt: &str, emit: bool) -> Stri
         exit(1)
     });
     let stem = Path::new(input).file_stem().unwrap().to_string_lossy().into_owned();
-    let base = out.map(|o| o.trim_end_matches(".elf").to_string()).unwrap_or(stem);
+    let base = out.map(|o| o.trim_end_matches(".elf").trim_end_matches(".efi").to_string()).unwrap_or(stem);
     if let Some(dir) = Path::new(&base).parent().filter(|d| !d.as_os_str().is_empty()) {
         fs::create_dir_all(dir).unwrap_or_else(|e| die(format!("{}: {e}", dir.display())));
     }
     if emit {
         fs::write(format!("{base}.ll"), ir).unwrap_or_else(|e| die(e));
         return format!("{base}.ll");
+    }
+    if x86 {
+        return build_kernel_x86(&ir, &base, opt);
     }
     let tmp = env::temp_dir().join(format!("stellang-kernel-{}", std::process::id()));
     fs::create_dir_all(&tmp).unwrap_or_else(|e| die(e));
@@ -292,6 +311,44 @@ fn build_kernel(input: &str, out: Option<String>, opt: &str, emit: bool) -> Stri
              (Debian/Ubuntu: `apt install clang lld`)");
     }
     elf
+}
+
+/// The x86_64 kernel: a position-independent ELF (the program and the runtime, SysV ABI like a native
+/// build), then the UEFI loader (boot_uefi.c, a PE) with that ELF inside. Returns the .efi path.
+fn build_kernel_x86(ir: &str, base: &str, opt: &str) -> String {
+    let tmp = env::temp_dir().join(format!("stellang-kernel-{}", std::process::id()));
+    fs::create_dir_all(&tmp).unwrap_or_else(|e| die(e));
+    let rt = tmp.join("runtime.c");
+    let ld = tmp.join("kernel.ld");
+    let elf = tmp.join("kernel.elf");
+    let boot = tmp.join("boot.c");
+    fs::write(&rt, format!("{RUNTIME_KLIBC}\n{RUNTIME}\n{RUNTIME_GC}\n{RUNTIME_FONT}\n{RUNTIME_KERNEL}\n{RUNTIME_KERNEL_X86}")).unwrap_or_else(|e| die(e));
+    fs::write(&ld, KERNEL_X86_LD).unwrap_or_else(|e| die(e));
+    fs::write(&boot, BOOT_UEFI).unwrap_or_else(|e| die(e));
+    let mut cmd = Command::new("clang");
+    cmd.args(["--target=x86_64-unknown-none-elf", "-fPIE", "-mno-red-zone", "-fno-stack-protector", "-fno-asynchronous-unwind-tables"]);
+    cmd.args(["-ffreestanding", "-fno-builtin", "-nostdlib", "-fuse-ld=lld", opt, "-Wno-override-module"]);
+    cmd.args(["-x", "ir", "-", "-x", "c", "-DST_KERNEL", "-DGC_AUTO", "-Wno-unused-function"]).arg(&rt);
+    cmd.args(["-Wl,-pie", "-Wl,--no-dynamic-linker", "-Wl,-z,norelro", "-Wl,--gc-sections", "-ffunction-sections", "-fdata-sections"]);
+    cmd.arg(format!("-Wl,-T,{}", ld.display())).arg("-o").arg(&elf);
+    let mut child = cmd.stdin(Stdio::piped()).spawn().unwrap_or_else(|e| die(format!("cannot run clang: {e}")));
+    child.stdin.take().unwrap().write_all(ir.as_bytes()).unwrap_or_else(|e| die(e));
+    let ok = child.wait().is_ok_and(|s| s.success());
+    let efi = format!("{base}.efi");
+    let ok = ok
+        && Command::new("clang")
+            .args(["--target=x86_64-unknown-windows", "-ffreestanding", "-fno-builtin", "-nostdlib", "-fuse-ld=lld", "-O2"])
+            .args(["-mno-stack-arg-probe", "-fno-stack-protector", "-Wl,-subsystem:efi_application", "-Wl,-entry:efi_main"])
+            .arg(format!("-DKERNEL_ELF=\"{}\"", elf.display()))
+            .arg(&boot)
+            .args(["-o", &efi])
+            .status()
+            .is_ok_and(|s| s.success());
+    let _ = fs::remove_dir_all(&tmp);
+    if !ok {
+        die("clang couldn't build the kernel. It needs clang with the x86 target and lld (Debian/Ubuntu: `apt install clang lld`)");
+    }
+    efi
 }
 
 /// `stellang boot os.st` (or os.elf): build the kernel if needed and boot it in QEMU, the console on
@@ -320,6 +377,7 @@ fn boot(args: &[String]) {
     let mut no_disk = false;
     let mut net = true;
     let mut sound = true;
+    let mut x86 = false;
     let mut i = 0;
     while i < args.len() && args[i].starts_with("--") {
         match args[i].as_str() {
@@ -327,6 +385,10 @@ fn boot(args: &[String]) {
             "--no-disk" => no_disk = true,
             "--no-net" => net = false,
             "--no-sound" => sound = false,
+            "--arch" => {
+                i += 1;
+                x86 = arch(args.get(i).cloned());
+            }
             "--disk" if i + 1 < args.len() => {
                 i += 1;
                 disk = Some(args[i].clone());
@@ -337,12 +399,16 @@ fn boot(args: &[String]) {
     }
     let args = &args[i..];
     let Some(input) = args.first() else { die(USAGE) };
-    let elf = if input.ends_with(".elf") {
+    let x86 = x86 || input.ends_with(".efi");
+    let elf = if input.ends_with(".elf") || input.ends_with(".efi") {
         input.clone()
     } else {
         let out = env::temp_dir().join(format!("stellang-boot-{}", std::process::id())).display().to_string();
-        build_kernel(input, Some(out), "-O2", false)
+        build_kernel(input, Some(out), "-O2", false, x86)
     };
+    if x86 {
+        return boot_x86(input, &elf, gui, &args[1..]);
+    }
     // the disk: a file that keeps what the kernel writes, from one boot to the next
     let disk = if no_disk {
         None
@@ -406,6 +472,48 @@ fn boot(args: &[String]) {
         let _ = fs::remove_file(&elf);
     }
     exit(status.code().unwrap_or(1));
+}
+
+/// The firmware for QEMU's x86 PC: OVMF (UEFI), wherever the distribution put it.
+fn ovmf() -> String {
+    if let Ok(p) = env::var("STELLANG_OVMF") {
+        return p;
+    }
+    let known = ["/usr/share/edk2/x64/OVMF.4m.fd", "/usr/share/edk2/x64/OVMF.fd", "/usr/share/ovmf/OVMF.fd", "/usr/share/OVMF/OVMF.fd",
+        "/usr/share/qemu/OVMF.fd", "/usr/share/edk2-ovmf/x64/OVMF.fd", "/opt/homebrew/share/qemu/edk2-x86_64-code.fd",
+        "/usr/local/share/qemu/edk2-x86_64-code.fd", "/usr/share/qemu/edk2-x86_64-code.fd"];
+    known.iter().find(|p| Path::new(p).exists()).map(|p| p.to_string()).unwrap_or_else(|| {
+        die("no UEFI firmware for QEMU found (Debian/Ubuntu: `apt install ovmf`, Arch: `pacman -S edk2-ovmf`), or set STELLANG_OVMF")
+    })
+}
+
+/// `stellang boot --arch x86_64`: the .efi on a FAT drive QEMU makes from a folder (as it would be on
+/// a USB stick: EFI/BOOT/BOOTX64.EFI), booted by OVMF. RAM only: no disk image, network or sound.
+fn boot_x86(input: &str, efi: &str, gui: bool, extra: &[String]) {
+    let dir = env::temp_dir().join(format!("stellang-esp-{}", std::process::id()));
+    let boot = dir.join("EFI").join("BOOT");
+    fs::create_dir_all(&boot).unwrap_or_else(|e| die(e));
+    fs::copy(efi, boot.join("BOOTX64.EFI")).unwrap_or_else(|e| die(format!("{efi}: {e}")));
+    let qemu = env::var("STELLANG_QEMU").unwrap_or_else(|_| "qemu-system-x86_64".into());
+    let mut cmd = Command::new(&qemu);
+    cmd.args(["-machine", "q35", "-cpu", "max", "-m", "1G", "-bios", &ovmf(), "-rtc", "base=localtime", "-net", "none"]);
+    cmd.arg("-drive").arg(format!("format=raw,file=fat:rw:{}", dir.display()));
+    cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x01"]);
+    // a USB controller with a mouse, like a laptop's (the keyboard: PS/2, QEMU's default)
+    cmd.args(["-device", "qemu-xhci", "-device", "usb-mouse"]);
+    if gui {
+        cmd.args(["-serial", "mon:stdio"]);
+    } else {
+        cmd.args(["-display", "none", "-serial", "mon:stdio"]);
+    }
+    cmd.args(extra);
+    let status = cmd.status().unwrap_or_else(|e| die(format!("cannot run {qemu}: {e} (Debian/Ubuntu: `apt install qemu-system-x86`)")));
+    let _ = fs::remove_dir_all(&dir);
+    if !input.ends_with(".efi") {
+        let _ = fs::remove_file(efi);
+    }
+    // isa-debug-exit: the kernel's code c comes out as c*2+1
+    exit(status.code().map(|c| if c & 1 == 1 { c >> 1 } else { c }).unwrap_or(1));
 }
 
 /// `stellang dev [dir]`: build `client.st` for the browser (into `public/client.wasm` + `.js`) and
