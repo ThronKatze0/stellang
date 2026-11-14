@@ -18,6 +18,7 @@ const RUNTIME_WEB: &str = include_str!("runtime_web.c");
 const RUNTIME_GC: &str = include_str!("runtime_gc.c");
 const RUNTIME_KLIBC: &str = include_str!("runtime_klibc.c");
 const RUNTIME_KERNEL: &str = include_str!("runtime_kernel.c");
+const RUNTIME_KERNEL_RV: &str = include_str!("runtime_kernel_rv.c");
 const RUNTIME_FONT: &str = include_str!("runtime_font.c");
 const KERNEL_LD: &str = include_str!("kernel.ld");
 const LOADER: &str = include_str!("loader.js");
@@ -274,7 +275,7 @@ fn build_kernel(input: &str, out: Option<String>, opt: &str, emit: bool) -> Stri
     fs::create_dir_all(&tmp).unwrap_or_else(|e| die(e));
     let rt = tmp.join("runtime.c");
     let ld = tmp.join("kernel.ld");
-    fs::write(&rt, format!("{RUNTIME_KLIBC}\n{RUNTIME}\n{RUNTIME_GC}\n{RUNTIME_FONT}\n{RUNTIME_KERNEL}")).unwrap_or_else(|e| die(e));
+    fs::write(&rt, format!("{RUNTIME_KLIBC}\n{RUNTIME}\n{RUNTIME_GC}\n{RUNTIME_FONT}\n{RUNTIME_KERNEL}\n{RUNTIME_KERNEL_RV}")).unwrap_or_else(|e| die(e));
     fs::write(&ld, KERNEL_LD).unwrap_or_else(|e| die(e));
     let elf = format!("{base}.elf");
     let mut cmd = Command::new("clang");
