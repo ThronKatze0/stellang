@@ -676,7 +676,7 @@ click, two-finger scrolling, the click button), **the network** through the PC's
 (e1000/e1000e/I219), a USB Ethernet adapter (CDC-ECM), or a phone sharing its connection over a USB cable
 (Android's USB tethering: RNDIS), with the browser, HTTPS and the rest of the stack on top, **sound** through
 Intel HD Audio (the speakers, headphones or line out the codec has: beeps, the Piano, programs' music), the clock, the
-shell, files, apps, games, the browser's offline parts, and programs compiled inside the OS. `hw` in the shell
+shell, files, apps, games, the browser, and programs compiled inside the OS. `hw` in the shell
 says what was found. Shutdown and reboot go through the firmware.
 
 **What doesn't (yet)**: touchpads on AMD laptops' I²C controllers, **Wi-Fi** (every chip needs its maker's
