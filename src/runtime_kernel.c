@@ -89,16 +89,33 @@ int64_t st_k_alloc_pages(int64_t n) {
     return (int64_t)a;
 }
 
+// Every raw address stellang hands the runtime goes through the machine's guard first (on a PC:
+// only RAM, the framebuffer and the registers of devices StellaOS drives; never a disk controller).
+// A refused access does nothing (reads give 0) and is counted.
+bool arch_mem_ok(int64_t a, int64_t n);
+#define GUARD(a, n, fail) do { if (!arch_mem_ok((int64_t)(a), (int64_t)(n))) { fail; } } while (0)
+
 // Bulk memory, for drivers: copy, fill with a 32-bit value (pixels), strings in and out.
-void st_k_copy(int64_t dst, int64_t src, int64_t n) { if (n > 0) memmove((void *)dst, (const void *)src, (size_t)n); }
+void st_k_copy(int64_t dst, int64_t src, int64_t n) {
+    if (n <= 0) return;
+    GUARD(dst, n, return);
+    GUARD(src, n, return);
+    memmove((void *)dst, (const void *)src, (size_t)n);
+}
 void st_k_fill32(int64_t dst, int64_t count, int64_t v) {
+    if (count <= 0) return;
+    GUARD(dst, count * 4, return);
     volatile uint32_t *p = (uint32_t *)dst;
     for (int64_t i = 0; i < count; i++) p[i] = (uint32_t)v;
 }
-void st_k_write_str(int64_t dst, const char *s) { memcpy((void *)dst, s, strlen(s)); }
+void st_k_write_str(int64_t dst, const char *s) {
+    size_t n = strlen(s);
+    GUARD(dst, n, return);
+    memcpy((void *)dst, s, n);
+}
 char *st_k_read_str(int64_t src, int64_t n) {
     char *r = GC_malloc_atomic(n > 0 ? (size_t)n + 1 : 1);
-    if (n > 0) memcpy(r, (const void *)src, (size_t)n);
+    if (n > 0 && arch_mem_ok(src, n)) memcpy(r, (const void *)src, (size_t)n);
     return r;
 }
 // Bytes as text, for data from outside (the network): NUL bytes become spaces so they can't cut a
@@ -111,6 +128,7 @@ char *st_k_read_text(int64_t src, int64_t n) {
 // The Internet checksum's ones'-complement sum of `n` bytes (big-endian 16-bit words), added to `sum`
 // and folded to 16 bits. The callers check the range first.
 int64_t st_k_csum(int64_t addr, int64_t n, int64_t sum) {
+    if (n > 0 && !arch_mem_ok(addr, n)) return sum;
     const uint8_t *p = (const uint8_t *)addr;
     uint64_t s = (uint64_t)sum;
     for (int64_t i = 0; i + 1 < n; i += 2) s += (uint64_t)p[i] << 8 | p[i + 1];
@@ -229,6 +247,7 @@ void st_sleep(int64_t ms) { // the builtin `sleep(ms)`
 // ---- raw memory (memory-mapped devices) ----
 
 int64_t st_k_peek(int64_t addr, int64_t size) {
+    GUARD(addr, size == 1 || size == 2 || size == 4 ? size : 8, return 0);
     switch (size) {
     case 1: return *(volatile uint8_t *)addr;
     case 2: return *(volatile uint16_t *)addr;
@@ -238,6 +257,7 @@ int64_t st_k_peek(int64_t addr, int64_t size) {
 }
 
 void st_k_poke(int64_t addr, int64_t size, int64_t v) {
+    GUARD(addr, size == 1 || size == 2 || size == 4 ? size : 8, return);
     switch (size) {
     case 1: *(volatile uint8_t *)addr = (uint8_t)v; break;
     case 2: *(volatile uint16_t *)addr = (uint16_t)v; break;
@@ -260,6 +280,10 @@ static int64_t g_w, g_h, g_cx0, g_cy0, g_cx1, g_cy1;
 int64_t st_k_alloc(int64_t bytes) { return (int64_t)(uintptr_t)GC_malloc_atomic(bytes > 0 ? (size_t)bytes : 1); }
 
 void st_g_target(int64_t base, int64_t w, int64_t h) {
+    if (w <= 0 || h <= 0 || !arch_mem_ok(base, w * h * 4)) {
+        g_px = NULL;
+        return;
+    }
     g_px = (uint32_t *)(uintptr_t)base;
     g_w = w, g_h = h;
     g_cx0 = g_cy0 = 0, g_cx1 = w, g_cy1 = h;
@@ -379,7 +403,7 @@ void st_g_line(int64_t x0, int64_t y0, int64_t x1, int64_t y1, int64_t width, in
 // equal to `key` (sprites). Scaled by `scale` (whole pixels: pixel art stays sharp).
 void st_g_blit(int64_t src, int64_t sw, int64_t sh, int64_t sx, int64_t sy, int64_t w, int64_t h, int64_t dx,
                int64_t dy, int64_t mode, int64_t key, int64_t scale) {
-    if (!g_px || !src) return;
+    if (!g_px || !src || sw <= 0 || sh <= 0 || !arch_mem_ok(src, sw * sh * 4)) return;
     if (scale < 1) scale = 1;
     if (sx < 0) w += sx, dx -= sx * scale, sx = 0;
     if (sy < 0) h += sy, dy -= sy * scale, sy = 0;

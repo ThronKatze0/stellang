@@ -61,15 +61,6 @@ const char *st_k_arch(void) { return "x86_64"; }
 
 static void arch_wait(void) { __asm__ volatile("sti; hlt"); }
 
-// Port I/O for drivers in stellang (PCI configuration space, ...).
-int64_t st_k_in(int64_t port, int64_t size) {
-    return size == 1 ? inb((uint16_t)port) : size == 4 ? inl((uint16_t)port) : -1;
-}
-void st_k_out(int64_t port, int64_t size, int64_t v) {
-    if (size == 1) outb((uint16_t)port, (uint8_t)v);
-    else if (size == 4) outl((uint16_t)port, (uint32_t)v);
-}
-
 // ---- UEFI runtime services: the clock and power ----
 
 typedef struct {
@@ -338,6 +329,218 @@ static bool fb_overlaps(uint64_t a, uint64_t n) {
     return boot.fb && boot.fb < a + n && a < end;
 }
 
+// ---- the guard: StellaOS never touches the computer's disks ----
+//
+// Everything stellang code does to hardware goes through a handful of calls here (peek/poke and the
+// bulk copies, the drawing target, port I/O, PCI configuration). They only let through:
+//   memory    RAM (the firmware's memory map), the framebuffer, and the registers (BARs) of devices
+//             of the kinds StellaOS drives: USB (xHCI), Intel's I²C controllers, network, audio
+//   ports     PCI configuration (0xcf8/0xcfc); nothing else (no IDE/ATA ports)
+//   PCI       configuration writes only to those same devices
+// Disk controllers (any mass storage class: NVMe, SATA/AHCI, RAID/VMD, ...) and the chipset's LPC,
+// SMBus and SPI-flash functions are never on the list, so no driver, and no bug in one, can reach
+// them. They're found at boot (configuration reads only, which change nothing) so `hw` can show them.
+// Programs (the RV64 interpreter) only ever reach RAM. Nothing calls UEFI SetVariable.
+
+typedef struct { uint64_t base, end; } Range;
+static Range allowed[160];
+static int n_allowed;
+static uint32_t allowed_bdf[64];
+static int n_allowed_bdf;
+typedef struct { uint8_t bus, dev, func; uint16_t vendor, device; uint32_t cls; uint64_t bar; } Storage;
+static Storage storage[32];
+static int n_storage;
+static uint64_t blocked, blocked_last;
+static uint32_t cf8;
+
+static uint32_t cfg_read(uint32_t bus, uint32_t dev, uint32_t func, uint32_t off) {
+    outl(0xcf8, 0x80000000u | bus << 16 | dev << 11 | func << 8 | (off & 0xfc));
+    return inl(0xcfc);
+}
+static void cfg_write(uint32_t bus, uint32_t dev, uint32_t func, uint32_t off, uint32_t v) {
+    outl(0xcf8, 0x80000000u | bus << 16 | dev << 11 | func << 8 | (off & 0xfc));
+    outl(0xcfc, v);
+}
+
+// Intel VMD (it hides NVMe drives behind itself), whatever class it reports
+static bool is_vmd(uint16_t vendor, uint16_t device) {
+    static const uint16_t ids[] = {0x201d, 0x28c0, 0x467f, 0x4c3d, 0x7d0b, 0x9a0b, 0xa77f, 0xad0b, 0xb60b, 0xc63f};
+    if (vendor != 0x8086) return false;
+    for (unsigned i = 0; i < sizeof ids / sizeof ids[0]; i++) if (ids[i] == device) return true;
+    return false;
+}
+static bool is_storage(uint32_t cls, uint16_t vendor, uint16_t device) { return (cls >> 24) == 0x01 || is_vmd(vendor, device); }
+
+// the kinds of device StellaOS drives (and nothing on bus 0 device 0x1f but audio and Ethernet:
+// that device's other functions are the LPC/eSPI bridge, SMBus and the SPI flash controller)
+static bool is_ours(uint32_t bus, uint32_t dev, uint32_t func, uint32_t cls, uint16_t vendor, uint16_t device) {
+    if (is_storage(cls, vendor, device)) return false;
+    if (bus == 0 && dev == 0x1f && func != 3 && func != 6) return false;
+    uint32_t c = cls >> 8; // class, subclass, interface
+    if (c == 0x0c0330) return true;                                            // USB: xHCI
+    if ((c >> 8) == 0x0c80) return vendor == 0x8086 && bus == 0 && (dev == 0x15 || dev == 0x19 || dev == 0x10); // I²C
+    if ((c >> 16) == 0x02) return true;                                        // network
+    if ((c >> 8) == 0x0403 || (c >> 8) == 0x0401) return true;                 // audio
+    return false;
+}
+
+static void allow(uint64_t base, uint64_t size) {
+    if (size && n_allowed < (int)(sizeof allowed / sizeof allowed[0])) allowed[n_allowed++] = (Range){base, base + size};
+}
+
+// A device of ours: its memory BARs, sized the standard way (decoding off while we look).
+static void own_bars(uint32_t bus, uint32_t dev, uint32_t func) {
+    uint32_t hdr = (cfg_read(bus, dev, func, 0x0c) >> 16) & 0x7f;
+    if (hdr != 0) return;
+    uint32_t cmd = cfg_read(bus, dev, func, 4) & 0xffff;
+    cfg_write(bus, dev, func, 4, cmd & ~3u);
+    for (int i = 0; i < 6; i++) {
+        uint32_t off = 0x10 + 4 * i;
+        uint32_t lo = cfg_read(bus, dev, func, off);
+        if (lo & 1) continue;                       // I/O: not used
+        bool wide = ((lo >> 1) & 3) == 2;
+        uint32_t hi = wide ? cfg_read(bus, dev, func, off + 4) : 0;
+        cfg_write(bus, dev, func, off, 0xffffffffu);
+        uint32_t mlo = cfg_read(bus, dev, func, off) & ~0xfu;
+        uint32_t mhi = 0xffffffffu;
+        if (wide) {
+            cfg_write(bus, dev, func, off + 4, 0xffffffffu);
+            mhi = cfg_read(bus, dev, func, off + 4);
+            cfg_write(bus, dev, func, off + 4, hi);
+        }
+        cfg_write(bus, dev, func, off, lo);
+        uint64_t mask = (uint64_t)mhi << 32 | mlo;
+        uint64_t size = mask ? (~mask + 1) & (wide ? ~0ull : 0xffffffffull) : 0;
+        uint64_t base = ((uint64_t)hi << 32 | lo) & ~0xfull;
+        if (base && size && size < (1ull << 40)) allow(base, size);
+        if (wide) i++;
+    }
+    cfg_write(bus, dev, func, 4, cmd);
+}
+
+static void guard_init(void) {
+    for (uint32_t bus = 0; bus < 256; bus++) {
+        for (uint32_t dev = 0; dev < 32; dev++) {
+            for (uint32_t func = 0; func < 8; func++) {
+                uint32_t id = cfg_read(bus, dev, func, 0);
+                if ((id & 0xffff) == 0xffff) {
+                    if (func == 0) break;
+                    continue;
+                }
+                uint16_t vendor = id & 0xffff, device = id >> 16;
+                uint32_t cls = cfg_read(bus, dev, func, 8);
+                if (is_storage(cls, vendor, device) && n_storage < 32) {
+                    // where its registers are (AHCI: BAR5; else BAR0, 64-bit if it says so): shown, never used
+                    uint32_t off = (cls >> 16) == 0x0106 ? 0x24 : 0x10;
+                    uint32_t lo = cfg_read(bus, dev, func, off);
+                    uint64_t bar = lo & ~0xfull;
+                    if (!(lo & 1) && ((lo >> 1) & 3) == 2 && off < 0x24) bar |= (uint64_t)cfg_read(bus, dev, func, off + 4) << 32;
+                    storage[n_storage++] = (Storage){bus, dev, func, vendor, device, cls >> 8, bar};
+                } else if (is_ours(bus, dev, func, cls, vendor, device) && n_allowed_bdf < 64) {
+                    allowed_bdf[n_allowed_bdf++] = bus << 16 | dev << 11 | func << 8;
+                    own_bars(bus, dev, func);
+                }
+                if (func == 0 && !((cfg_read(bus, dev, 0, 0x0c) >> 16) & 0x80)) break;
+            }
+        }
+    }
+}
+
+static void refuse(uint64_t what) {
+    blocked++;
+    blocked_last = what;
+}
+
+// [a, a+n) wholly inside RAM, the framebuffer and our devices' registers?
+static int guard_hint = -1;
+static bool in_ranges(uint64_t a, uint64_t end) {
+    while (a < end) {
+        bool found = false;
+        if (guard_hint >= 0 && guard_hint < n_allowed && allowed[guard_hint].base <= a && a < allowed[guard_hint].end) {
+            a = allowed[guard_hint].end;
+            continue;
+        }
+        for (int i = 0; i < n_allowed; i++) {
+            if (allowed[i].base <= a && a < allowed[i].end) {
+                a = allowed[i].end;
+                guard_hint = i;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+bool arch_mem_ok(int64_t a, int64_t n) {
+    if (n <= 0) return true;
+    uint64_t s = (uint64_t)a, e = s + (uint64_t)n;
+    if (e < s || !in_ranges(s, e)) {
+        refuse(s);
+        return false;
+    }
+    return true;
+}
+
+static bool ram_only(uint64_t a, uint64_t n) { // RAM, nothing else (programs)
+    for (uint64_t i = 0; i < MAP_N; i++) {
+        const MemDesc *d = MAP_AT(i);
+        if (is_ram(d->type) && d->phys <= a && a + n <= d->phys + d->pages * 4096) return true;
+    }
+    return false;
+}
+
+static void guard_ranges(void) {
+    // RAM from the memory map (adjacent pieces merged), and the framebuffer
+    for (uint64_t i = 0; i < MAP_N; i++) {
+        const MemDesc *d = MAP_AT(i);
+        if (!is_ram(d->type)) continue;
+        uint64_t b = d->phys, e = d->phys + d->pages * 4096;
+        if (n_allowed > 0 && allowed[n_allowed - 1].end == b) allowed[n_allowed - 1].end = e;
+        else allow(b, e - b);
+    }
+    if (boot.fb) allow(boot.fb, boot.fb_stride * boot.fb_height * 4);
+}
+
+// What the guard knows, for `hw`: storage controllers (i: their bus/dev/func, class, vendor:device),
+// and how many accesses it refused.
+int64_t st_k_guard_storage(int64_t i, int64_t what) {
+    if (i < 0 || i >= n_storage) return -1;
+    Storage *s = &storage[i];
+    return what == 0 ? (s->bus << 16 | s->dev << 11 | s->func << 8) : what == 1 ? s->cls : what == 2 ? (s->vendor << 16 | s->device) : (int64_t)s->bar;
+}
+int64_t st_k_guard_count(int64_t what) { return what == 0 ? n_storage : what == 1 ? (int64_t)blocked : what == 2 ? (int64_t)blocked_last : n_allowed_bdf; }
+
+// Port I/O for drivers in stellang: PCI configuration only, and writes only to our devices.
+int64_t st_k_in(int64_t port, int64_t size) {
+    if (port == 0xcf8 && size == 4) return inl(0xcf8);
+    if (port >= 0xcfc && port <= 0xcff) return size == 1 ? inb((uint16_t)port) : size == 4 ? inl((uint16_t)port) : -1;
+    refuse((uint64_t)port);
+    return -1;
+}
+void st_k_out(int64_t port, int64_t size, int64_t v) {
+    if (port == 0xcf8 && size == 4) {
+        cf8 = (uint32_t)v;
+        outl(0xcf8, (uint32_t)v);
+        return;
+    }
+    if (port >= 0xcfc && port <= 0xcff) {
+        uint32_t bdf = cf8 & 0x00ffff00u;
+        bool ours = false;
+        for (int i = 0; i < n_allowed_bdf; i++) if (allowed_bdf[i] == bdf) ours = true;
+        if (!ours) {
+            refuse((uint64_t)bdf);
+            return;
+        }
+        outl(0xcf8, cf8);
+        if (size == 1) outb((uint16_t)port, (uint8_t)v);
+        else if (size == 4) outl((uint16_t)port, (uint32_t)v);
+        return;
+    }
+    refuse((uint64_t)port);
+}
+
 #define P 1ull
 #define RW 2ull
 #define PWT 8ull
@@ -532,12 +735,15 @@ static uint8_t *rv_addr(uint64_t root, uint64_t va, uint64_t need) { // need: R 
     if ((int64_t)va << 25 >> 25 != (int64_t)va) return NULL;
     uint64_t t = root;
     for (int lvl = 2; lvl >= 0; lvl--) {
+        if (!ram_only(t, 4096)) return NULL;     // page tables, and programs' memory: RAM only
         uint64_t pte = ((uint64_t *)t)[(va >> (12 + 9 * lvl)) & 511];
         if (!(pte & 1)) return NULL;
         if (pte & 0xe) { // a leaf
             if (!(pte & 16) || !(pte & need)) return NULL;
             uint64_t size = 1ull << (12 + 9 * lvl);
-            return (uint8_t *)(((pte >> 10) << 12) + (va & (size - 1)));
+            uint64_t phys = ((pte >> 10) << 12) + (va & (size - 1));
+            if (!ram_only(phys & ~4095ull, 4096)) return NULL;
+            return (uint8_t *)phys;
         }
         t = (pte >> 10) << 12;
     }
@@ -744,6 +950,8 @@ void kmain(BootInfo *bi) {
     tables_init();
     heap_init();
     paging_init();
+    guard_ranges();
+    guard_init();
     serial_init();
     read_clock();
     apic_init();

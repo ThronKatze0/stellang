@@ -679,12 +679,16 @@ says what was found. Shutdown and reboot go through the firmware.
 **What doesn't (yet)**: touchpads on AMD laptops' I²C controllers, Wi-Fi and
 Ethernet (no network), sound, the internal disk, and anything saved: files live in RAM and are gone at power-off.
 
-**Nothing it does outlasts a power-off**: StellaOS has no driver for the internal disk (NVMe, SATA) and never writes to
-it; it doesn't touch the firmware's flash or settings (no SMM, no microcode, no UEFI variables); USB devices
-only get the standard setup requests (and hubs their port requests: power, reset); the touchpad gets HID's
-power-on and reset. Of the PC's I²C controllers only Intel's usual ones are touched (never the one at
-PCI 00:1f.5, which holds the firmware's flash). Everything it changes (page tables, the APIC timer, the USB controller)
-is reset by the next power-on. If it ever crashes, the panic stays on the screen: hold the power button.
+**It never touches the computer's disks, and that's enforced, not just left out**: every way StellaOS's code reaches
+hardware (memory and device registers, port I/O, PCI configuration) goes through a guard in the kernel that only
+lets through RAM, the screen, and the registers of the kinds of device StellaOS drives (USB, Intel's I²C, network,
+audio). Disk controllers of every kind (NVMe, SATA/AHCI, RAID/Intel VMD, ...) and the chipset's flash, LPC and SMBus
+functions are never on that list, so no driver, and no bug in one, can reach them; programs only ever reach RAM.
+`hw` lists the disks it found and how many accesses it refused. A test boots it with an NVMe drive full of random
+bytes, tries to read its registers as root (refused) and checks the drive is byte for byte the same afterwards.
+Nor does it touch the firmware's flash or settings (no SMM, no microcode, no UEFI variables). Everything it does
+change (page tables, the APIC timer, the USB controller) is reset by the next power-on. If it ever crashes, the
+panic stays on the screen: hold the power button.
 
 How it's built: a small UEFI loader (`src/boot_uefi.c`) carries the kernel (a position-independent ELF) inside
 it, takes the screen, memory map and runtime services from the firmware, leaves the firmware and jumps in.

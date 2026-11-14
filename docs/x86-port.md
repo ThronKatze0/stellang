@@ -6,6 +6,13 @@ and a USB mouse. RISC-V/QEMU must keep working unchanged.
 
 ## Safety rules (do not break)
 
+- **The disk guard** (`runtime_kernel_x86.c`): peek/poke/copy/fill/strings, the drawing target, port
+  I/O and PCI configuration writes all go through an allowlist: RAM from the memory map, the
+  framebuffer, and the (sized) BARs of devices of our kinds (xHCI, Intel I²C at 00:15/19/10, network,
+  audio; never anything at 00:1f except .3 audio and .6 Ethernet). Mass storage of any class and
+  Intel VMD are recorded (config reads only) and never allowed. The RV64 interpreter only maps RAM.
+  `hw` shows the disks and the refusal count; `stellaos_x86` attacks an NVMe drive and checks it.
+
 - RAM-only on real hardware: no NVMe/AHCI/SATA driver, no writes to any real disk. The file system
   lives in RAM (`disk.open()` finds nothing on x86).
 - No writes to firmware flash, no SMM, no microcode.

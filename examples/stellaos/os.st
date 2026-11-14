@@ -178,7 +178,9 @@ struct Shell {
             },
             "peek" => {
                 let addr = calc.eval(need(argv, 0, "peek <address>")?)?
+                let refused = st_k_guard_count(1)
                 let v = kernel.peek32(addr)
+                if st_k_guard_count(1) != refused { return err("${calc.hex(addr)}: refused (the guard keeps StellaOS to RAM and the devices it drives)") }
                 println("${calc.hex(addr)}: ${calc.hex(v)}")
             },
             "shutdown" | "exit" | "poweroff" => {
@@ -691,6 +693,20 @@ struct Shell {
     // what hardware the drivers found: the screen, keyboards and mice
     fn hw(self) {
         println("machine   ${kernel.arch()}")
+        if kernel.arch() == "x86_64" {
+            // the disk guard (runtime_kernel_x86.c): what it keeps StellaOS away from
+            let n = st_k_guard_count(0)
+            let kinds = {0x0101: "IDE", 0x0104: "RAID", 0x0106: "SATA (AHCI)", 0x0107: "SAS", 0x0108: "NVMe", 0x0105: "ATA"}
+            var disks: [str] = []
+            for i in 0..n {
+                let bdf = st_k_guard_storage(i, 0)
+                let cls = st_k_guard_storage(i, 1)
+                let kind = kinds.get(cls >> 8, "storage")
+                disks.push("${kind} at ${two_hex(bdf >> 16)}:${two_hex((bdf >> 11) & 31)}.${(bdf >> 8) & 7} (registers ${calc.hex(st_k_guard_storage(i, 3))})")
+            }
+            println("disks     ${if n == 0 { "none found" } else { disks.join(", ") }}: never touched (StellaOS runs from RAM)")
+            println("guard     ${st_k_guard_count(3)} devices StellaOS may drive; ${st_k_guard_count(1)} accesses refused")
+        }
         if let d = self.gui {
             let sc = d.screen
             println("display   desktop ${d.width}x${d.height}, on a ${sc.panel_w}x${sc.panel_h} screen (each pixel ${sc.scale}x${sc.scale})${if sc.swap { " (red/blue swapped)" } else { "" }}")
@@ -799,6 +815,13 @@ struct Shell {
 }
 
 extern fn st_k_read_byte() -> int
+extern fn st_k_guard_storage(i: int, what: int) -> int
+extern fn st_k_guard_count(what: int) -> int
+
+fn two_hex(v: int) -> str {
+    let d = "0123456789abcdef"
+    return d[(v >> 4) & 15] + d[v & 15]
+}
 extern fn st_k_inject(b: int)
 extern fn st_chr(code: int) -> str
 fn st_chr_byte(c: int) -> str { return st_chr(c) }

@@ -1570,11 +1570,27 @@ fn stellaos_x86() {
     assert_eq!(fs::read(stick.join("EFI/BOOT/BOOTX64.EFI")).unwrap(), fs::read(&efi).unwrap());
     let c = Command::new(BIN).arg("usb").arg(&efi).arg("/dev/sdz").output().unwrap();
     assert!(!c.status.success() && String::from_utf8_lossy(&c.stderr).contains("is a device"));
+    // a disk StellaOS must never touch: an NVMe drive full of random bytes (and q35's own SATA
+    // controller, which holds the boot drive)
+    let nvme = dir.join("nvme.img");
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let bytes: Vec<u8> = (0..4 << 20)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u8
+        })
+        .collect();
+    fs::write(&nvme, &bytes).unwrap();
     // besides the mouse on a root port: a hub, with a keyboard and a mouse behind it
     let mut q = Command::new(BIN)
         .args(["boot", "--arch", "x86_64"])
         .arg(&efi)
         .args(["-device", "usb-hub,bus=usb-bus.0,port=2", "-device", "usb-kbd,bus=usb-bus.0,port=2.1", "-device", "usb-mouse,bus=usb-bus.0,port=2.3"])
+        .arg("-drive")
+        .arg(format!("file={},if=none,id=nv,format=raw", nvme.display()))
+        .args(["-device", "nvme,serial=stellatest,drive=nv"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1625,6 +1641,18 @@ fn stellaos_x86() {
     typed("uname\r");
     typed("hw\r");
     assert!(wait("USB       1 xHCI controller: mouse", 30), "{}", text.lock().unwrap());
+    // the disks are listed, and their registers are out of reach (even for root)
+    let regs: Vec<String> = {
+        let t = text.lock().unwrap();
+        let line = t.lines().find(|l| l.starts_with("disks ")).unwrap_or("").to_string();
+        line.split("(registers ").skip(1).map(|p| p.split(')').next().unwrap().to_string()).collect()
+    };
+    assert_eq!(regs.len(), 2, "{}", text.lock().unwrap());
+    typed(&format!("sudo peek {}\r", regs[0]));
+    typed("secret1\r");
+    std::thread::sleep(Duration::from_millis(1500));
+    typed(&format!("sudo peek {}\r", regs[1]));
+    assert!(wait(&format!("{}: refused", regs[1]), 30), "{}", text.lock().unwrap());
     typed("run /home/examples/hello.st\r");
     assert!(wait("What's your name?", 120), "{}", text.lock().unwrap());
     typed("Grace\r");
@@ -1634,6 +1662,8 @@ fn stellaos_x86() {
     reader.join().unwrap();
     let text = text.lock().unwrap().clone();
     assert_eq!(status.code(), Some(0), "{text}");
+    assert!(text.contains(": refused (the guard"), "{text}");
+    assert!(fs::read(&nvme).unwrap() == bytes, "the NVMe disk changed");
     for want in [
         "the desktop is up on the display",
         "x86_64, a UEFI PC",
@@ -1643,6 +1673,9 @@ fn stellaos_x86() {
         "port 6: USB hub with 8 ports",
         "port 6.1: USB keyboard",
         "port 6.3: USB mouse",
+        "disks     NVMe at 00:",
+        "SATA (AHCI) at 00:1f.2",
+        "never touched (StellaOS runs from RAM)",
         "touchpad  none found",
         "ACPI lists no HID-over-I",
         "Nice to meet you, Grace.",

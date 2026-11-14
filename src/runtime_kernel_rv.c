@@ -520,3 +520,8 @@ void kmain(uint64_t hart, const uint8_t *dtb) {
 
 // no ACPI on QEMU's RISC-V machine (the device tree says what's there)
 int64_t st_k_acpi_rsdp(void) { return 0; }
+
+// QEMU's RISC-V machine: no real disks to keep away from (its virtio disk is a file on the host)
+bool arch_mem_ok(int64_t a, int64_t n) { (void)a, (void)n; return true; }
+int64_t st_k_guard_storage(int64_t i, int64_t what) { (void)i, (void)what; return -1; }
+int64_t st_k_guard_count(int64_t what) { (void)what; return 0; }
