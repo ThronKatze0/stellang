@@ -667,16 +667,17 @@ the stick out and the computer boots as it always did; turn Secure Boot back on 
 
 **What works**: the desktop on the built-in screen at its own resolution (doubled on high-resolution panels,
 so a 2560x1600 laptop gets a sharp 1280x800 desktop), the built-in keyboard (PS/2, as most laptops wire it),
-USB keyboards and mice (also wireless ones with a receiver) plugged into the computer itself, the clock, the
+USB keyboards and mice (also wireless ones with a receiver), plugged in directly or through hubs (also the
+internal hubs many laptops route their ports and built-in keyboard through), the clock, the
 shell, files, apps, games, the browser's offline parts, and programs compiled inside the OS. `hw` in the shell
 says what was found. Shutdown and reboot go through the firmware.
 
-**What doesn't (yet)**: touchpads (on most new laptops they're on I²C, not PS/2), USB hubs, Wi-Fi and
+**What doesn't (yet)**: touchpads (on most new laptops they're on I²C, not PS/2), Wi-Fi and
 Ethernet (no network), sound, the internal disk, and anything saved: files live in RAM and are gone at power-off.
 
 **Nothing it does outlasts a power-off**: StellaOS has no driver for the internal disk (NVMe, SATA) and never writes to
 it; it doesn't touch the firmware's flash or settings (no SMM, no microcode, no UEFI variables); USB devices
-only get the standard setup requests. Everything it changes (page tables, the APIC timer, the USB controller)
+only get the standard setup requests (and hubs their port requests: power, reset). Everything it changes (page tables, the APIC timer, the USB controller)
 is reset by the next power-on. If it ever crashes, the panic stays on the screen: hold the power button.
 
 How it's built: a small UEFI loader (`src/boot_uefi.c`) carries the kernel (a position-independent ELF) inside

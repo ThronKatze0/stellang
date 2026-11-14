@@ -1544,7 +1544,7 @@ fn kernel_boots_stellaos() {
 }
 
 /// StellaOS on a PC: `stellang boot --arch x86_64` (QEMU's q35 with OVMF, a USB controller with a
-/// mouse). The UEFI loader starts the kernel, the desktop comes up on the firmware's framebuffer, the
+/// mouse, and a hub with a keyboard and another mouse behind it). The UEFI loader starts the kernel, the desktop comes up on the firmware's framebuffer, the
 /// USB mouse is found on the xHCI controller, a program compiled inside the OS runs (on x86, through
 /// the RV64 interpreter), and `shutdown` powers off. Skipped without qemu-system-x86_64 or OVMF.
 #[test]
@@ -1562,9 +1562,11 @@ fn stellaos_x86() {
     let efi = dir.join("os.efi");
     let c = Command::new(BIN).args(["--kernel", "--arch", "x86_64"]).arg(root.join("examples/stellaos/os.st")).arg("-o").arg(&efi).output().unwrap();
     assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    // besides the mouse on a root port: a hub, with a keyboard and a mouse behind it
     let mut q = Command::new(BIN)
         .args(["boot", "--arch", "x86_64"])
         .arg(&efi)
+        .args(["-device", "usb-hub,bus=usb-bus.0,port=2", "-device", "usb-kbd,bus=usb-bus.0,port=2.1", "-device", "usb-mouse,bus=usb-bus.0,port=2.3"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1629,6 +1631,10 @@ fn stellaos_x86() {
         "x86_64, a UEFI PC",
         "display   desktop 1280x800",
         "PS/2      keyboard port",
+        "hub (8 ports)",
+        "port 6: USB hub with 8 ports",
+        "port 6.1: USB keyboard",
+        "port 6.3: USB mouse",
         "Nice to meet you, Grace.",
         "bye!",
     ] {

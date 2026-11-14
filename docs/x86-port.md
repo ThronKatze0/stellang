@@ -60,7 +60,16 @@ above 512 GiB come from RAM) — QEMU put the xHCI BAR at 768 GiB, and real 64-b
 framebuffers) can be up there too. Unknown device vectors get an EOI; NMIs are ignored. `hw` shell
 command (display, PS/2, USB devices + driver log). e2e test `stellaos_x86`.
 
-Not done: touchpads (I²C HID on most new laptops), USB hubs, network, sound, NVMe (on purpose).
+Also done: USB hubs (USB 2 and 3, also chained): set up like a device, then the controller is told
+it's a hub (Configure Endpoint with the slot context's hub bit, port count, TT think time), its ports
+are powered and polled every second (GET_STATUS / port reset / clear changes), and devices behind
+them get a route string, and the translator hub and port when they're full/low speed behind a
+high-speed hub. Unplugging a hub takes down everything behind it. Tested in QEMU (`usb-hub` with a
+keyboard and a mouse behind it, unplug and replug through the monitor); the USB 3 hub path
+(SET_HUB_DEPTH, the USB 3 hub descriptor, warm-reset change) is written to the spec but untested
+(QEMU has no USB 3 hub).
+
+Not done: touchpads (I²C HID on most new laptops), network, sound, NVMe (on purpose).
 
 ## Testing
 
@@ -75,5 +84,5 @@ OVMF on Arch: `/usr/share/edk2/x64/OVMF_CODE.4m.fd`; Debian: `/usr/share/OVMF/OV
 
 - In QEMU x86 (q35 + OVMF): boots to the desktop on the GOP framebuffer (1280x800, and 2x on a
   2560x1600 `-device VGA,edid=on,xres=2560,yres=1600`), PS/2 keyboard + mouse, USB keyboard + mouse
-  (incl. hotplug), compiled programs run, `shutdown` exits.
+  (incl. hotplug, and behind hubs), compiled programs run, `shutdown` exits.
 - Not yet tried on the real laptop. First thing to run there: `hw`.

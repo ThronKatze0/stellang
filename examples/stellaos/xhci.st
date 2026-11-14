@@ -8,8 +8,13 @@
 // event ring, which we poll (no interrupts). Each device gets a slot with a device context: what the
 // controller knows about the device and its endpoints.
 //
-// Not here: hubs (plug the mouse into the computer itself), USB storage or anything else. Nothing is
-// ever written to a USB device except its standard setup requests (address, configuration, protocol).
+// Hubs work too (external ones, and the internal hubs many laptops put their USB ports and built-in
+// keyboard behind): a hub is set up like any device, then its ports are powered and checked every
+// second; what's behind them gets a route string (the hub ports on the way) and, for slow devices
+// behind a fast hub, the hub that translates for them.
+//
+// Not here: USB storage or anything else. Nothing is ever written to a USB device except its standard
+// setup requests (address, configuration, protocol) and, for hubs, their port requests.
 
 import kernel
 import pci
@@ -86,7 +91,7 @@ struct Report {
 // An interrupt endpoint that sends reports.
 struct Pipe {
     slot: int,
-    port: int,
+    where: str,               // root port, then hub ports: "2", "2.1"
     dci: int,                 // device context index: endpoint number * 2 + 1 for IN
     kind: str,
     ring: Ring,
@@ -94,6 +99,37 @@ struct Pipe {
     size: int,
     last: [int] = [],
     errors: int = 0,
+}
+
+// Where a device is: its root port, the route through hubs, and who translates its full/low speed
+// for a high-speed hub on the way.
+struct Loc {
+    root: int,
+    route: int = 0,           // 4 bits per hub level: the hub port at each
+    depth: int = 0,           // hubs on the way
+    speed: int,
+    tt_slot: int = 0,
+    tt_port: int = 0,
+    parent: int = 0,          // the hub's slot (0: a root port)
+    parent_port: int = 0,
+    where: str,
+}
+
+// A device we gave a slot to.
+struct Dev {
+    slot: int,
+    loc: Loc,
+}
+
+// A hub and its ports.
+struct Hub {
+    slot: int,
+    ep0: Ring,
+    loc: Loc,
+    ports: int,
+    usb3: bool,
+    attached: [int] = [],
+    buf: int,
 }
 
 struct Controller {
@@ -111,6 +147,8 @@ struct Controller {
     ev_index: int = 0,
     ev_cycle: int = 1,
     pipes: [Pipe] = [],
+    devs: [Dev] = [],
+    hubs: [Hub] = [],
     stash: [Event] = [],      // transfer events that came while waiting for something else
     attached: [int] = [],     // ports with a device we set up (or gave up on)
     next_scan: int = 0,
@@ -231,15 +269,23 @@ struct Controller {
     // input context: control context, then slot, then endpoints (each `ctx` bytes)
     fn icx(self, input: int, i: int) -> int { return input + self.ctx * i }
 
-    // Set up the device on `port`: give it an address, read what it is, and if it has a boot-
-    // protocol keyboard or mouse interface, start listening to it.
-    fn attach(self, port: int) {
-        let sc = self.portsc(port)
-        let speed = (sc >> 10) & 15        // 1 full, 2 low, 3 high, 4+ super speed
+    // the slot context's first three words for a device at `l`
+    fn slot_ctx(self, at: int, l: Loc, entries: int, hub: bool, ports: int, ttt: int) {
+        kernel.poke32(at, (entries << 27) | (if hub { 1 << 26 } else { 0 }) | (l.speed << 20) | (l.route & 0xf_ffff))
+        kernel.poke32(at + 4, (ports << 24) | (l.root << 16))
+        kernel.poke32(at + 8, (ttt << 16) | (l.tt_port << 8) | l.tt_slot)
+    }
+
+    // Set up the device at `l`: give it an address, read what it is, and if it has a boot-protocol
+    // keyboard or mouse interface, start listening to it; if it's a hub, set up its ports.
+    fn attach(self, l: Loc) {
+        let speed = l.speed                // 1 full, 2 low, 3 high, 4+ super speed
+        let port = l.where
         let done = self.command(0, 0, ENABLE_SLOT << 10)
         if done == none { return }
         let slot = done.unwrap().slot
         if slot < 1 || slot > self.slots { return }
+        self.devs.push(Dev { slot, loc: l })
         let out = kernel.alloc_pages(2)
         kernel.poke64(self.dcbaa + 8 * slot, out)
         let input = kernel.alloc_pages(2)
@@ -247,8 +293,7 @@ struct Controller {
         let mps = if speed >= 4 { 512 } else if speed == 3 { 64 } else { 8 }
         kernel.poke32(input + 4, 3)                                            // add: slot, endpoint 0
         let s = self.icx(input, 1)
-        kernel.poke32(s, (1 << 27) | (speed << 20))                            // 1 context entry
-        kernel.poke32(s + 4, port << 16)                                       // its root hub port
+        self.slot_ctx(s, l, 1, false, 0, 0)
         let e0 = self.icx(input, 2)
         kernel.poke32(e0 + 4, (mps << 16) | (4 << 3) | (3 << 1))               // control, 3 retries
         kernel.poke64(e0 + 8, ep0.base | 1)
@@ -266,6 +311,10 @@ struct Controller {
             kernel.poke32(input + 4, 2)                                        // evaluate endpoint 0
             kernel.poke32(e0 + 4, (real << 16) | (4 << 3) | (3 << 1))
             self.command(input, 0, (EVALUATE_CTX << 10) | (slot << 24))
+        }
+        if kernel.peek8(buf + 4) == 9 {
+            self.setup_hub(slot, ep0, l, input, buf)
+            return
         }
         // the configuration descriptor: first its length, then all of it
         if !self.control(slot, ep0, 0x80, 6, 0x200, 0, 9, buf) { return }
@@ -327,18 +376,120 @@ struct Controller {
             kernel.poke32(ep + 16, (size << 16) | size)
             add = add | (1 << dci)
             last_dci = max(last_dci, dci)
-            pipes.push(Pipe { slot, port, dci, kind: if f[1] == 1 { "keyboard" } else { "mouse" }, ring: r, buf: kernel.alloc_pages(1), size })
+            pipes.push(Pipe { slot, where: port, dci, kind: if f[1] == 1 { "keyboard" } else { "mouse" }, ring: r, buf: kernel.alloc_pages(1), size })
         }
         kernel.poke32(input + 4, add)
         let s2 = self.icx(input, 1)
-        kernel.poke32(s2, (last_dci << 27) | (speed << 20))
-        kernel.poke32(s2 + 4, port << 16)
+        self.slot_ctx(s2, l, last_dci, false, 0, 0)
         if self.command(input, 0, (CONFIGURE_EP << 10) | (slot << 24)) == none { return }
         for p in pipes {
             self.listen(p)
             self.pipes.push(p)
             self.note("port ${port}: USB ${p.kind}")
         }
+    }
+
+    // ---- hubs ----
+
+    // A hub: its configuration, its hub descriptor (how many ports), tell the controller it's a hub,
+    // then power its ports and look at them.
+    fn setup_hub(self, slot: int, ep0: Ring, l: Loc, input: int, buf: int) {
+        let usb3 = l.speed >= 4
+        if l.depth >= 5 {
+            self.note("hub ${l.where}: too deep (5 hubs in a row is USB's limit)")
+            return
+        }
+        if !self.control(slot, ep0, 0x80, 6, 0x200, 0, 9, buf) { return }
+        let config = kernel.peek8(buf + 5)
+        if !self.control(slot, ep0, 0x00, 9, config, 0, 0, 0) {
+            self.note("hub ${l.where}: configuration refused")
+            return
+        }
+        // the hub descriptor (class request; USB 3 hubs have their own kind)
+        if !self.control(slot, ep0, 0xa0, 6, (if usb3 { 0x2a } else { 0x29 }) << 8, 0, 12, buf) {
+            self.note("hub ${l.where}: no hub descriptor")
+            return
+        }
+        let ports = min(kernel.peek8(buf + 2), 15)
+        let chars = kernel.peek16(buf + 3)
+        let good_ms = kernel.peek8(buf + 5) * 2
+        // a USB 3 hub needs to know how deep it is (for the route strings of what's behind it)
+        if usb3 { self.control(slot, ep0, 0x20, 12, l.depth, 0, 0, 0) }
+        // the slot context, now as a hub: its ports, and how long its translator thinks (high speed)
+        kernel.fill32(input, (self.ctx * 33) / 4, 0)
+        kernel.poke32(input + 4, 1)
+        self.slot_ctx(self.icx(input, 1), l, 1, true, ports, if l.speed == 3 { (chars >> 5) & 3 } else { 0 })
+        if self.command(input, 0, (CONFIGURE_EP << 10) | (slot << 24)) == none {
+            self.note("hub ${l.where}: the controller wouldn't take it as a hub")
+            return
+        }
+        for p in 1..ports + 1 { self.control(slot, ep0, 0x23, 3, 8, p, 0, 0) }     // SET_FEATURE PORT_POWER
+        sleep(max(min(good_ms, 500), 20))
+        let h = Hub { slot, ep0, loc: l, ports, usb3, buf: kernel.alloc_pages(1) }
+        self.hubs.push(h)
+        self.note("port ${l.where}: USB${if usb3 { " 3" } else { "" }} hub with ${ports} ports")
+        self.scan_hub(h)
+    }
+
+    // A hub's ports: devices plugged in get set up, ones pulled out go.
+    fn scan_hub(self, h: Hub) {
+        for port in 1..h.ports + 1 {
+            if !self.control(h.slot, h.ep0, 0xa3, 0, 0, port, 4, h.buf) { continue }   // GET_STATUS
+            let status = kernel.peek16(h.buf)
+            let change = kernel.peek16(h.buf + 2)
+            if change & 1 != 0 { self.control(h.slot, h.ep0, 0x23, 1, 16, port, 0, 0) }  // clear C_PORT_CONNECTION
+            let connected = status & 1 != 0
+            if !connected {
+                if h.attached.contains(port) {
+                    h.attached = h.attached.filter(p => p != port)
+                    self.detach_behind(h.slot, port)
+                    self.note("port ${h.loc.where}.${port}: unplugged")
+                }
+                continue
+            }
+            if h.attached.contains(port) { continue }
+            // reset the port; when it's done the port is enabled and says the device's speed
+            self.control(h.slot, h.ep0, 0x23, 3, 4, port, 0, 0)                          // SET_FEATURE PORT_RESET
+            let until = now_ms() + 500
+            var st = 0
+            while now_ms() < until {
+                sleep(10)
+                if !self.control(h.slot, h.ep0, 0xa3, 0, 0, port, 4, h.buf) { break }
+                st = kernel.peek16(h.buf)
+                if st & 0x10 == 0 && st & 2 != 0 { break }
+            }
+            self.control(h.slot, h.ep0, 0x23, 1, 20, port, 0, 0)                         // clear C_PORT_RESET
+            if h.usb3 { self.control(h.slot, h.ep0, 0x23, 1, 29, port, 0, 0) }          // and C_BH_PORT_RESET
+            if st & 2 == 0 { continue }                                                  // not enabled: next time
+            sleep(10)
+            let speed = if h.usb3 { 4 } else if st & 0x200 != 0 { 2 } else if st & 0x400 != 0 { 3 } else { 1 }
+            // full/low speed behind a high-speed hub: that hub's translator does the talking
+            var tt_slot = h.loc.tt_slot
+            var tt_port = h.loc.tt_port
+            if speed < 3 && h.loc.speed == 3 {
+                tt_slot = h.slot
+                tt_port = port
+            }
+            h.attached.push(port)
+            self.attach(Loc { root: h.loc.root, route: h.loc.route | (min(port, 15) << (4 * h.loc.depth)), depth: h.loc.depth + 1,
+                speed, tt_slot, tt_port, parent: h.slot, parent_port: port, where: "${h.loc.where}.${port}" })
+        }
+    }
+
+    // Give back a device's slot, and everything behind it if it's a hub.
+    fn detach(self, slot: int) {
+        for h in self.hubs.filter(h => h.slot == slot) {
+            for port in h.attached { self.detach_behind(slot, port) }
+        }
+        self.hubs = self.hubs.filter(h => h.slot != slot)
+        self.pipes = self.pipes.filter(p => p.slot != slot)
+        self.devs = self.devs.filter(d => d.slot != slot)
+        self.command(0, 0, (10 << 10) | (slot << 24))                                      // Disable Slot
+        kernel.poke64(self.dcbaa + 8 * slot, 0)
+    }
+
+    fn detach_behind(self, hub: int, port: int) {
+        for d in self.devs.filter(d => d.loc.parent == hub && d.loc.parent_port == port) { self.detach(d.slot) }
     }
 
     // ask the endpoint for its next report
@@ -358,14 +509,8 @@ struct Controller {
             if sc & 1 == 0 {
                 if self.attached.contains(port) {
                     self.attached = self.attached.filter(p => p != port)
-                    // its slot goes back to the controller (Disable Slot)
-                    for p in self.pipes.filter(p => p.port == port) {
-                        if !self.pipes.filter(q => q.slot == p.slot && q.port != port).is_empty() { continue }
-                        self.command(0, 0, (10 << 10) | (p.slot << 24))
-                        kernel.poke64(self.dcbaa + 8 * p.slot, 0)
-                        break
-                    }
-                    self.pipes = self.pipes.filter(p => p.port != port)
+                    // its slot (and a hub's devices') go back to the controller
+                    for d in self.devs.filter(d => d.loc.root == port && d.loc.parent == 0) { self.detach(d.slot) }
                     self.note("port ${port}: unplugged")
                 }
                 continue
@@ -380,7 +525,11 @@ struct Controller {
                 if self.portsc(port) & 2 == 0 { continue }           // try again on the next scan
             }
             self.attached.push(port)
-            self.attach(port)
+            self.attach(Loc { root: port, speed: (self.portsc(port) >> 10) & 15, where: "${port}" })
+        }
+        // and the hubs' ports
+        for h in self.hubs.slice(0, self.hubs.len()) {
+            if self.hubs.any(x => x.slot == h.slot) { self.scan_hub(h) }
         }
     }
 
@@ -526,6 +675,7 @@ struct Usb {
         var out: [str] = []
         for c in self.controllers {
             for p in c.pipes { out.push(p.kind) }
+            for h in c.hubs { out.push("hub (${h.ports} ports)") }
         }
         return out
     }
