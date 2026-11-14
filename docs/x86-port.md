@@ -105,7 +105,16 @@ plugged in later (a phone whose tethering gets switched on). `stellaos_x86_net` 
 and fetches a page over e1000e and over usb-net (ECM); RNDIS was checked by hand (QEMU's usb-net
 offers it first). Wi-Fi: not attempted (vendor firmware + 802.11/WPA2).
 
-Not done: AMD's I²C controllers, Wi-Fi, Realtek Ethernet, CDC-NCM, sound, NVMe (on purpose).
+Also done: sound. `hda.st`: Intel HD Audio, controller reset and link up, codec commands through
+the immediate command registers (no CORB/RIRB), the audio function group, output pins by their
+configuration default (line out, speaker, headphones; not "no connection"), a path back to a DAC
+through mixers/selectors (connection select, amps unmuted at 0 dB, pins on, EAPD), the first output
+stream at 48 kHz 16-bit stereo from a 4-period looping buffer kept filled from the DMA position by
+`sound.render` (the synthesizer, shared with the virtio card). `stellaos_x86` beeps through
+ich9-intel-hda + hda-duplex and finds 440 Hz in the WAV.
+
+Not done: AMD's I²C controllers, Wi-Fi, Realtek Ethernet, CDC-NCM, audio behind Intel's DSP (SOF),
+NVMe (on purpose).
 
 ## Testing
 

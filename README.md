@@ -674,13 +674,14 @@ internal hubs many laptops route their ports and built-in keyboard through), **t
 laptops of the last years have: found through the ACPI tables, on Intel's I²C controllers; moving, tapping to
 click, two-finger scrolling, the click button), **the network** through the PC's built-in Intel Ethernet
 (e1000/e1000e/I219), a USB Ethernet adapter (CDC-ECM), or a phone sharing its connection over a USB cable
-(Android's USB tethering: RNDIS), with the browser, HTTPS and the rest of the stack on top, the clock, the
+(Android's USB tethering: RNDIS), with the browser, HTTPS and the rest of the stack on top, **sound** through
+Intel HD Audio (the speakers, headphones or line out the codec has: beeps, the Piano, programs' music), the clock, the
 shell, files, apps, games, the browser's offline parts, and programs compiled inside the OS. `hw` in the shell
 says what was found. Shutdown and reboot go through the firmware.
 
 **What doesn't (yet)**: touchpads on AMD laptops' I²C controllers, **Wi-Fi** (every chip needs its maker's
 firmware and a full 802.11/WPA stack: on a laptop, share the phone's connection over USB instead), Realtek Ethernet,
-sound, the internal disk, and anything saved: files live in RAM and are gone at power-off.
+sound on laptops whose audio needs Intel's DSP firmware (SOF), the internal disk, and anything saved: files live in RAM and are gone at power-off.
 
 **It never touches the computer's disks, and that's enforced, not just left out**: every way StellaOS's code reaches
 hardware (memory and device registers, port I/O, PCI configuration) goes through a guard in the kernel that only

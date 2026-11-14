@@ -130,36 +130,43 @@ struct Card {
     // one period of samples: the tones, mixed
     fn fill(self, at: int) {
         let n = self.period
-        let ch = self.channels
-        let ramp = self.rate / 500                    // 2 ms in and out
-        var mix: [int] = []
-        for i in 0..n { mix.push(0) }
-        for t in self.tones {
-            let count = min(n, t.left)
-            var phase = t.phase
-            var done = t.total - t.left
-            for i in 0..count {
-                var v = if phase & 0x8000_0000 == 0 { VOLUME } else { -VOLUME }
-                let rest = t.total - done
-                if done < ramp { v = v * done / ramp }
-                if rest < ramp { v = v * rest / ramp }
-                mix[i] = mix[i] + v
-                phase = (phase + t.step) & 0xffff_ffff
-                done += 1
-            }
-            t.phase = phase
-            t.left -= count
-        }
+        let mix = render(self.tones, n, self.rate)
         self.tones = self.tones.filter(t => t.left > 0)
         for i in 0..n {
-            let v = max(-32767, min(32767, mix[i])) & 0xffff
-            if ch == 1 {
+            let v = mix[i] & 0xffff
+            if self.channels == 1 {
                 kernel.poke16(at + 2 * i, v)
             } else {
                 kernel.poke32(at + 4 * i, v | v << 16)
             }
         }
     }
+}
+
+// The next `n` samples of the tones playing (16-bit, mixed), each tone moved on; tones that are
+// done have left == 0 after.
+fn render(tones: [Tone], n: int, rate: int) -> [int] {
+    let ramp = rate / 500                    // 2 ms in and out
+    var mix: [int] = []
+    for i in 0..n { mix.push(0) }
+    for t in tones {
+        let count = min(n, t.left)
+        var phase = t.phase
+        var done = t.total - t.left
+        for i in 0..count {
+            var v = if phase & 0x8000_0000 == 0 { VOLUME } else { -VOLUME }
+            let rest = t.total - done
+            if done < ramp { v = v * done / ramp }
+            if rest < ramp { v = v * rest / ramp }
+            mix[i] = mix[i] + v
+            phase = (phase + t.step) & 0xffff_ffff
+            done += 1
+        }
+        t.phase = phase
+        t.left -= count
+    }
+    for i in 0..n { mix[i] = max(-32767, min(32767, mix[i])) }
+    return mix
 }
 
 // The sound card, if QEMU has one (`stellang boot` adds it).

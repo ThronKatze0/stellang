@@ -1591,6 +1591,10 @@ fn stellaos_x86() {
         .arg("-drive")
         .arg(format!("file={},if=none,id=nv,format=raw", nvme.display()))
         .args(["-device", "nvme,serial=stellatest,drive=nv"])
+        // Intel HD Audio, recorded to a WAV file
+        .arg("-audiodev")
+        .arg(format!("wav,id=snd0,path={}", dir.join("hda.wav").display()))
+        .args(["-device", "ich9-intel-hda", "-device", "hda-duplex,audiodev=snd0"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1653,6 +1657,10 @@ fn stellaos_x86() {
     std::thread::sleep(Duration::from_millis(1500));
     typed(&format!("sudo peek {}\r", regs[1]));
     assert!(wait(&format!("{}: refused", regs[1]), 30), "{}", text.lock().unwrap());
+    typed("beep 440 600\r");
+    std::thread::sleep(Duration::from_millis(800));
+    typed("sound\r");
+    assert!(wait("Intel HD Audio: 48000 Hz", 30), "{}", text.lock().unwrap());
     typed("run /home/examples/hello.st\r");
     assert!(wait("What's your name?", 120), "{}", text.lock().unwrap());
     typed("Grace\r");
@@ -1664,6 +1672,18 @@ fn stellaos_x86() {
     assert_eq!(status.code(), Some(0), "{text}");
     assert!(text.contains(": refused (the guard"), "{text}");
     assert!(fs::read(&nvme).unwrap() == bytes, "the NVMe disk changed");
+    // the beep came out of the HD Audio codec: 440 Hz
+    let data = fs::read(dir.join("hda.wav")).unwrap();
+    let rate = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
+    let channels = u16::from_le_bytes(data[22..24].try_into().unwrap()) as usize;
+    let samples: Vec<i16> = data[44..].chunks(2 * channels).filter(|c| c.len() == 2 * channels).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+    let win = rate / 10;
+    let pitches: Vec<f64> = samples
+        .chunks(win)
+        .filter(|w| w.len() == win && w.iter().filter(|&&s| s.abs() > 1000).count() > win * 9 / 10)
+        .map(|w| w.windows(2).filter(|p| (p[0] < 0) != (p[1] < 0)).count() as f64 / 2.0 / 0.1)
+        .collect();
+    assert!(pitches.iter().any(|hz| (hz - 440.0).abs() < 10.0), "no 440 Hz in the HD Audio output: {pitches:?}");
     for want in [
         "the desktop is up on the display",
         "x86_64, a UEFI PC",

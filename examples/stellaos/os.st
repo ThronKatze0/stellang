@@ -43,6 +43,7 @@ import sound
 import users
 import login
 import piano
+import hda
 import xhci
 
 const VERSION = "0.3"
@@ -75,6 +76,7 @@ struct Shell {
     sudo_until: int = 0,          // a recent sudo: no password again until then
     random: rng.Rng? = none,
     snd: sound.Card? = none,
+    hda: hda.Out? = none,
 
     fn prompt(self) -> str {
         let e = kernel.ESC
@@ -285,12 +287,15 @@ struct Shell {
             "beep" => {
                 let hz = if argv.len() > 0 { int(argv[0])? } else { 880 }
                 let ms = if argv.len() > 1 { int(argv[1])? } else { 200 }
-                if self.snd == none { return err("no sound card (`stellang boot` adds one unless --no-sound)") }
+                if self.snd.is_none() && self.hda.is_none() { return err("no sound card (`stellang boot` adds one unless --no-sound)") }
                 self.beep(max(20, min(hz, 20000)), max(1, min(ms, 10000)))
             },
             "sound" => {
                 if let c = self.snd {
                     println("virtio sound card: stream ${c.stream}, ${c.rate} Hz, ${c.channels} channel${if c.channels == 1 { "" } else { "s" }}, 16-bit; ${c.played} periods played")
+                } else if let h = self.hda {
+                    println("${h.kind}: 48000 Hz, 2 channels, 16-bit; ${h.played} periods played")
+                    for line in h.log { println("  ${line}") }
                 } else {
                     println("no sound card (`stellang boot` adds one unless --no-sound)")
                 }
@@ -351,6 +356,7 @@ struct Shell {
 
     fn beep(self, hz: int, ms: int) {
         if let c = self.snd { c.beep(hz, ms) }
+        if let h = self.hda { h.beep(hz, ms) }
     }
 
     fn code_env(self) -> code.Env {
@@ -469,10 +475,10 @@ struct Shell {
             d.cover(none)
             self.open_terminal(d)
         }
-        if let c = self.snd {
-            c.beep(523, 90)
-            kernel.after(100, () => c.beep(659, 90))
-            kernel.after(200, () => c.beep(784, 160))
+        if self.snd.is_some() || self.hda.is_some() {
+            self.beep(523, 90)
+            kernel.after(100, () => self.beep(659, 90))
+            kernel.after(200, () => self.beep(784, 160))
         }
         println("")
         println("${kernel.ESC}[1mHello, ${name}!${kernel.ESC}[0m${kernel.ESC}[2m  (your files: ${a.home}; `help` for commands)${kernel.ESC}[0m")
@@ -963,6 +969,7 @@ fn main() {
     sh.fs.who = "nobody"
     sh.cwd = "/"
     sh.snd = sound.open()
+    if sh.snd.is_none() && kernel.arch() == "x86_64" { sh.hda = hda.open() }
     let r = rng.open()
     sh.random = some(r)
     sh.accounts = some(users.Users { fs: sh.fs, random: () => r.u32() })
