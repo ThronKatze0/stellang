@@ -1,12 +1,18 @@
-// Keyboard and mouse: a driver for virtio-input devices (QEMU's virtio-keyboard-device and
-// virtio-tablet-device), written in stellang.
+// Keyboard and mouse, written in stellang: virtio-input devices on QEMU's RISC-V machine (virtio-
+// keyboard-device, virtio-tablet-device); on a PC, the PS/2 controller (a laptop's built-in keyboard,
+// sometimes its touchpad) and USB keyboards and mice (xhci.st).
 //
-// Each device sends Linux-style input events (type, code, value: 8 bytes) into buffers we lend it
-// on its event queue. We turn them into `Event`s: keys with names like the browser's (`"a"`, `"A"`,
-// `"Enter"`, `"ArrowUp"`), the pointer's position on the screen, buttons and the wheel.
+// Everything is turned into Linux-style key codes and pointer moves first (virtio-input sends those
+// as they are: type, code, value, 8 bytes each; PS/2's scan code set 1 is almost the same numbers;
+// USB HID usages go through a table), then into `Event`s: keys with names like the browser's
+// (`"a"`, `"A"`, `"Enter"`, `"ArrowUp"`), the pointer's position on the screen, buttons and the wheel.
 
 import kernel
 import virtio
+import xhci
+
+extern fn st_k_ps2_read() -> int
+extern fn st_k_ps2_mouse() -> int
 
 // Linux event types and codes
 const EV_SYN = 0
@@ -48,9 +54,22 @@ struct Input {
     caps: bool = false,
     layout: str = "us",       // "us" or "de"
     pending: [Event] = [],
+    // PC: the PS/2 controller and USB
+    ps2: bool = false,
+    ps2_e0: bool = false,     // the next scan code is an extended one (E0 xx)
+    ps2_skip: int = 0,        // bytes left of a Pause key's sequence
+    ps2_size: int = 3,        // mouse packets: 3 bytes, 4 with a wheel
+    ps2_pkt: [int] = [],
+    held: [bool] = [],        // keys down by code (to tell a repeat from a press)
+    buttons_down: int = 0,    // mouse buttons down (bit 0 left, 1 right, 2 middle)
+    usb: xhci.Usb? = none,
 
     // Everything that happened since the last call.
     fn poll(self) -> [Event] {
+        if self.ps2 { self.poll_ps2() }
+        if let c = self.usb {
+            for r in c.poll() { self.usb_report(r) }
+        }
         for i, q in self.queues {
             while true {
                 let used = q.take()
@@ -102,6 +121,141 @@ struct Input {
         }
     }
 
+    // ---- the pointer, for drivers that see relative moves (PS/2, USB mice) ----
+
+    fn rel(self, dx: int, dy: int) {
+        if dx == 0 && dy == 0 { return }
+        self.x = min(max(self.x + dx, 0), self.screen_w - 1)
+        self.y = min(max(self.y + dy, 0), self.screen_h - 1)
+        self.moved = true
+    }
+
+    // the buttons down now (bit 0 left, 1 right, 2 middle): presses and releases for what changed
+    fn set_buttons(self, mask: int) {
+        for b in 0..3 {
+            let was = self.buttons_down >> b & 1
+            let now = mask >> b & 1
+            if was != now { self.event(0, EV_KEY, BTN_LEFT + b, now) }
+        }
+        self.buttons_down = mask & 7
+    }
+
+    // a key by Linux code, down or up; a press of a key already down is a repeat
+    fn key_press(self, code: int, down: bool) {
+        if self.held.is_empty() {
+            for i in 0..256 { self.held.push(false) }
+        }
+        if code <= 0 || code >= 256 { return }
+        let value = if !down { 0 } else if self.held[code] { 2 } else { 1 }
+        self.held[code] = down
+        self.key(code, value)
+    }
+
+    // ---- PS/2 ----
+
+    fn poll_ps2(self) {
+        while true {
+            let v = st_k_ps2_read()
+            if v < 0 { break }
+            if v >= 0x100 { self.ps2_mouse_byte(v & 0xff) } else { self.ps2_key_byte(v) }
+        }
+    }
+
+    // scan code set 1: a key's code on press, with 0x80 on release; E0 before the extended keys
+    fn ps2_key_byte(self, b: int) {
+        if self.ps2_skip > 0 {
+            self.ps2_skip -= 1
+            return
+        }
+        if b == 0xe1 {             // Pause: E1 1D 45 E1 9D C5, and no release
+            self.ps2_skip = 5
+            return
+        }
+        if b == 0xe0 {
+            self.ps2_e0 = true
+            return
+        }
+        if b == 0xfa || b == 0xfe || b == 0xee || b == 0 || b == 0xff { return }   // answers, errors
+        let e0 = self.ps2_e0
+        self.ps2_e0 = false
+        let down = b < 0x80
+        let sc = b & 0x7f
+        if !e0 {
+            self.key_press(sc, down)    // set 1's numbers are Linux's key codes (1 Escape .. 88 F12)
+            return
+        }
+        let code = match sc {
+            0x1c => 96,    // keypad Enter
+            0x1d => 97,    // right Ctrl
+            0x35 => 98,    // keypad /
+            0x38 => 100,   // AltGr
+            0x47 => 102,   // Home
+            0x48 => 103,   // Up
+            0x49 => 104,   // Page Up
+            0x4b => 105,   // Left
+            0x4d => 106,   // Right
+            0x4f => 107,   // End
+            0x50 => 108,   // Down
+            0x51 => 109,   // Page Down
+            0x52 => 110,   // Insert
+            0x53 => 111,   // Delete
+            0x5b => 125,   // Windows keys
+            0x5c => 125,
+            _ => 0,        // E0 2A (the fake Shift of Print Screen) and others: nothing
+        }
+        if code != 0 { self.key_press(code, down) }
+    }
+
+    // mouse packets: buttons and signs, x, y (up is +), the wheel
+    fn ps2_mouse_byte(self, b: int) {
+        if self.ps2_pkt.is_empty() && b & 8 == 0 { return }   // not the first byte of a packet: resync
+        self.ps2_pkt.push(b)
+        if self.ps2_pkt.len() < self.ps2_size { return }
+        let p = self.ps2_pkt
+        self.ps2_pkt = []
+        if p[0] & 0xc0 == 0 {      // no overflow
+            let dx = p[1] - ((p[0] << 4) & 0x100)
+            let dy = p[2] - ((p[0] << 3) & 0x100)
+            self.rel(dx, -dy)
+        }
+        self.set_buttons((p[0] & 1) | (p[0] >> 1 & 1) << 1 | (p[0] >> 2 & 1) << 2)
+        if self.ps2_size == 4 {
+            let z = signed8(p[3])   // + is towards the user
+            if z != 0 { self.pending.push(Event { kind: "wheel", delta: z, x: self.x, y: self.y }) }
+        }
+    }
+
+    // ---- USB (boot protocol reports from xhci.st) ----
+
+    fn usb_report(self, r: xhci.Report) {
+        let d = r.data
+        if r.kind == "mouse" && d.len() >= 3 {
+            self.rel(signed8(d[1]), signed8(d[2]))
+            self.set_buttons(d[0])
+            if d.len() >= 4 && d[3] != 0 { self.pending.push(Event { kind: "wheel", delta: -signed8(d[3]), x: self.x, y: self.y }) }
+        } else if r.kind == "keyboard" && d.len() >= 8 {
+            // modifiers (bit 0 left Ctrl .. 7 right GUI), then up to 6 keys held
+            let mods = [29, 42, 56, 125, 97, 54, 100, 125]
+            for i in 0..8 {
+                let now = d[0] >> i & 1 == 1
+                let was = r.last.len() >= 8 && r.last[0] >> i & 1 == 1
+                if now != was { self.key_press(mods[i], now) }
+            }
+            if d[2] == 1 { return }   // too many keys at once: nothing to go by
+            // released: in the last report, not in this one; pressed: the other way round
+            if r.last.len() >= 8 {
+                for k in 2..8 {
+                    let u = r.last[k]
+                    if u > 3 && !d.slice(2, 8).contains(u) { self.key_press(hid_key(u), false) }
+                }
+            }
+            for k in 2..8 {
+                let u = d[k]
+                if u > 3 && (r.last.len() < 8 || !r.last.slice(2, 8).contains(u)) { self.key_press(hid_key(u), true) }
+            }
+        }
+    }
+
     fn key(self, code: int, value: int) {
         let down = value != 0
         if code == 42 || code == 54 { self.shift = down }
@@ -126,6 +280,13 @@ struct Input {
 // screen of `w` x `h` pixels.
 fn open(w: int, h: int) -> Input {
     let inp = Input { screen_w: w, screen_h: h, x: w / 2, y: h / 2 }
+    if kernel.arch() == "x86_64" {
+        inp.ps2 = true
+        let m = st_k_ps2_mouse()
+        if m > 0 { inp.ps2_size = m }
+        inp.usb = some(xhci.open())
+        return inp
+    }
     for d in virtio.find(virtio.INPUT) {
         if !d.start(0) { continue }
         let q = d.queue(0, 64) catch e {
@@ -237,4 +398,19 @@ fn letter(layout: str, code: int) -> str? {
     let c = typed(layout, code, false, false, false)
     if c != "" && c.upper() != c { return some(c) }
     return none
+}
+
+fn signed8(b: int) -> int {
+    return if b >= 128 { b - 256 } else { b }
+}
+
+// USB HID keyboard usages (page 7) as Linux key codes: 4 "a" .. 0x65 Menu; 0 for the others
+const HID_KEYS = [0, 0, 0, 0, 30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20,
+    22, 47, 17, 45, 21, 44, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 28, 1, 14, 15, 57, 12, 13, 26, 27, 43, 43, 39,
+    40, 41, 51, 52, 53, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88, 99, 70, 119, 110, 102, 104,
+    111, 107, 109, 106, 105, 108, 103, 69, 98, 55, 74, 78, 96, 79, 80, 81, 75, 76, 77, 71, 72, 73, 82, 83,
+    86, 127]
+
+fn hid_key(usage: int) -> int {
+    return if usage < HID_KEYS.len() { HID_KEYS[usage] } else { 0 }
 }

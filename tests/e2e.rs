@@ -1543,6 +1543,99 @@ fn kernel_boots_stellaos() {
     assert!(String::from_utf8_lossy(&c.stderr).contains("needs a host operating system"));
 }
 
+/// StellaOS on a PC: `stellang boot --arch x86_64` (QEMU's q35 with OVMF, a USB controller with a
+/// mouse). The UEFI loader starts the kernel, the desktop comes up on the firmware's framebuffer, the
+/// USB mouse is found on the xHCI controller, a program compiled inside the OS runs (on x86, through
+/// the RV64 interpreter), and `shutdown` powers off. Skipped without qemu-system-x86_64 or OVMF.
+#[test]
+fn stellaos_x86() {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    if Command::new("qemu-system-x86_64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-x86_64");
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tmpdir("x86");
+    let efi = dir.join("os.efi");
+    let c = Command::new(BIN).args(["--kernel", "--arch", "x86_64"]).arg(root.join("examples/stellaos/os.st")).arg("-o").arg(&efi).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let mut q = Command::new(BIN)
+        .args(["boot", "--arch", "x86_64"])
+        .arg(&efi)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let text = Arc::new(Mutex::new(String::new()));
+    let mut out = q.stdout.take().unwrap();
+    let t2 = text.clone();
+    let reader = std::thread::spawn(move || {
+        let mut b = [0u8; 4096];
+        while let Ok(n) = out.read(&mut b) {
+            if n == 0 {
+                break;
+            }
+            t2.lock().unwrap().push_str(&String::from_utf8_lossy(&b[..n]).replace('\r', ""));
+        }
+    });
+    let mut stdin = q.stdin.take().unwrap();
+    let wait = |want: &str, secs: u64| -> bool {
+        let end = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < end {
+            if text.lock().unwrap().contains(want) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    };
+    if !wait("new user name:", 240) {
+        let _ = q.kill();
+        let mut err = String::new();
+        let _ = q.stderr.take().unwrap().read_to_string(&mut err);
+        if err.contains("no UEFI firmware") {
+            eprintln!("skipped: no OVMF");
+            return;
+        }
+        panic!("StellaOS didn't come up:\n{}\n{err}", text.lock().unwrap());
+    }
+    let mut typed = |s: &str| {
+        stdin.write_all(s.as_bytes()).unwrap();
+        stdin.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+    };
+    for line in ["ada\r", "secret1\r", "secret1\r"] {
+        typed(line);
+    }
+    assert!(wait("$ ", 60), "{}", text.lock().unwrap());
+    typed("uname\r");
+    typed("hw\r");
+    assert!(wait("USB       1 xHCI controller: mouse", 30), "{}", text.lock().unwrap());
+    typed("run /home/examples/hello.st\r");
+    assert!(wait("What's your name?", 120), "{}", text.lock().unwrap());
+    typed("Grace\r");
+    assert!(wait("5 squared is 25", 60), "{}", text.lock().unwrap());
+    typed("shutdown\r");
+    let status = q.wait().unwrap();
+    reader.join().unwrap();
+    let text = text.lock().unwrap().clone();
+    assert_eq!(status.code(), Some(0), "{text}");
+    for want in [
+        "the desktop is up on the display",
+        "x86_64, a UEFI PC",
+        "display   desktop 1280x800",
+        "PS/2      keyboard port",
+        "Nice to meet you, Grace.",
+        "bye!",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+}
+
 /// StellaOS's desktop, driven like a person would: keys typed on the (virtio) keyboard go to the
 /// focused Terminal window and from there to the shell; a double click on a desktop icon opens an
 /// app; files written in one boot are on the disk in the next.

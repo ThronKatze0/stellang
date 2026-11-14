@@ -178,7 +178,9 @@ static void ps2_poll(void) {
     if (!has_ps2) return;
     for (int n = 0; n < 32; n++) {
         uint8_t s = inb(0x64);
-        if (!(s & 1)) break;
+        // 0xff: nothing there (any more: a firmware's PS/2 emulation over USB ends when xhci.st
+        // takes the controller)
+        if (s == 0xff || !(s & 1)) break;
         uint8_t b = inb(0x60);
         uint32_t next = (ps2_head + 1) % 512;
         if (next != ps2_tail) ps2[ps2_head] = (uint16_t)(b | (s & 0x20 ? 0x100 : 0)), ps2_head = next;
@@ -204,6 +206,13 @@ static int ps2_reply(void) {
     return -1;
 }
 
+static int ps2_packet;
+static int ps2_mouse(uint8_t b) { // a byte to the mouse; its answer (0xfa: understood)
+    ps2_cmd(0xd4);
+    ps2_data(b);
+    return ps2_reply();
+}
+
 static void ps2_init(void) {
     if (inb(0x64) == 0xff) return; // no controller (some newer laptops)
     has_ps2 = true;
@@ -219,13 +228,19 @@ static void ps2_init(void) {
     ps2_data((uint8_t)cfg);
     ps2_cmd(0xae); // keyboard on
     ps2_cmd(0xa8); // mouse on
-    ps2_cmd(0xd4); // to the mouse: set defaults, then report
-    ps2_data(0xf6);
-    ps2_reply();
-    ps2_cmd(0xd4);
-    ps2_data(0xf4);
-    ps2_reply();
+    // the mouse (or touchpad): defaults, then the IntelliMouse knock (sample rates 200, 100, 80)
+    // that turns on the wheel and 4-byte packets, then reporting
+    if (ps2_mouse(0xf6) != 0xfa) return; // nothing on the mouse port
+    static const uint8_t knock[] = {200, 100, 80};
+    for (int i = 0; i < 3; i++) ps2_mouse(0xf3), ps2_mouse(knock[i]);
+    ps2_packet = 3;
+    if (ps2_mouse(0xf2) == 0xfa && ps2_reply() == 3) ps2_packet = 4;
+    ps2_mouse(0xf3), ps2_mouse(100);
+    ps2_mouse(0xf4);
 }
+
+// The PS/2 mouse's packets: 3 bytes, 4 with a wheel, 0 if there's no PS/2 mouse.
+int64_t st_k_ps2_mouse(void) { return ps2_packet; }
 
 // ---- the screen, for panics ----
 
@@ -294,13 +309,15 @@ static void tables_init(void) {
     __asm__ volatile("lidt %0" ::"m"(i));
 }
 
-// ---- page tables: identity, 512 GiB ----
+// ---- page tables: identity, the whole physical address space ----
 //
-// The first 4 GiB in 2 MiB pages, the rest in 1 GiB pages. RAM (by the memory map) is write-back,
-// the framebuffer write-combining (PAT entry 1), everything else uncached: device registers.
+// The first 4 GiB in 2 MiB pages, the rest in 1 GiB pages, up to what the CPU can address (devices
+// can sit far above RAM: 64-bit PCI BARs, a discrete GPU's framebuffer). RAM (by the memory map) is
+// write-back, the framebuffer write-combining (PAT entry 1), everything else uncached: device
+// registers. The tables above 4 GiB come from RAM (heap_init ran first).
 
 static uint64_t pml4[512] __attribute__((aligned(4096)));
-static uint64_t pdpt[512] __attribute__((aligned(4096)));
+static uint64_t pdpt0[512] __attribute__((aligned(4096)));
 static uint64_t pd[4][512] __attribute__((aligned(4096)));
 
 typedef struct { uint32_t type, pad; uint64_t phys, virt, pages, attr; } MemDesc;
@@ -315,6 +332,10 @@ static bool ram_overlaps(uint64_t a, uint64_t n) {
     }
     return false;
 }
+static bool fb_overlaps(uint64_t a, uint64_t n) {
+    uint64_t end = boot.fb + boot.fb_stride * boot.fb_height * 4;
+    return boot.fb && boot.fb < a + n && a < end;
+}
 
 #define P 1ull
 #define RW 2ull
@@ -326,28 +347,45 @@ static void paging_init(void) {
     uint32_t r[4];
     cpuid(0x80000001, r);
     bool gig = r[3] & (1u << 26);
+    cpuid(0x80000000, r);
+    unsigned bits = 36;
+    if (r[0] >= 0x80000008) cpuid(0x80000008, r), bits = r[0] & 0xff;
+    if (bits > 48) bits = 48;
+    if (bits < 32) bits = 32;
+    uint64_t gigs = gig ? 1ull << (bits - 30) : 4;
     // PAT: entry 1 (PWT) becomes write-combining; 0 stays write-back, 3 (PCD|PWT) uncached
     wrmsr(0x277, (rdmsr(0x277) & ~0xff00ull) | 0x0100ull);
-    pml4[0] = (uint64_t)pdpt | P | RW;
-    for (uint64_t g = 0; g < 512; g++) {
+    for (uint64_t g = 0; g < gigs; g++) {
         uint64_t a = g << 30;
-        if (g < 4 || !gig) {
-            if (g >= 4) { pdpt[g] = 0; continue; } // no 1 GiB pages: only the first 4 GiB
+        uint64_t *pdpt = pdpt0;
+        if (g >> 9) { // above 512 GiB: a table per 512 GiB, from the heap's memory
+            uint64_t i = g >> 9;
+            if (!(pml4[i] & P)) {
+                uint64_t t = (heap_next + 4095) & ~4095ull;
+                heap_next = t + 4096;
+                memset((void *)t, 0, 4096);
+                pml4[i] = t | P | RW;
+            }
+            pdpt = (uint64_t *)(pml4[i] & ~4095ull);
+        }
+        if (g < 4) {
             pdpt[g] = (uint64_t)pd[g] | P | RW;
             for (uint64_t k = 0; k < 512; k++) {
                 uint64_t b = a + (k << 21);
                 uint64_t attr = ram_overlaps(b, 1 << 21) ? 0 : PCD | PWT;
-                if (boot.fb && b < boot.fb + boot.fb_stride * boot.fb_height * 4 && boot.fb < b + (1 << 21)) attr = PWT;
+                if (fb_overlaps(b, 1 << 21)) attr = PWT;
                 pd[g][k] = b | P | RW | PS | attr;
             }
         } else {
             uint64_t attr = ram_overlaps(a, 1ull << 30) ? 0 : PCD | PWT;
             // a framebuffer up here (a discrete GPU's): write-combining for the whole GiB
             // ponytail: other devices in the same GiB get WC too; split into 2 MiB pages if one does
-            if (boot.fb && boot.fb >> 30 == g) attr = PWT;
-            pdpt[g] = a | P | RW | PS | attr;
+            if (fb_overlaps(a, 1ull << 30)) attr = PWT;
+            pdpt[g & 511] = a | P | RW | PS | attr;
         }
     }
+    pml4[0] = (uint64_t)pdpt0 | P | RW;
+    heap_start = heap_next; // the tables are the kernel's, not the heap's
     __asm__ volatile("mov %0, %%cr3" ::"r"(pml4) : "memory");
 }
 
@@ -403,7 +441,13 @@ void st_isr(uint64_t vec, uint64_t err, uint64_t *frame) {
         apic_write(0xb0, 0);
         return;
     }
-    if (vec >= 32) return; // spurious
+    // anything else from outside (a device the firmware left switched on): acknowledge and ignore
+    // it, or the local APIC would hold back the timer behind it. 39 is spurious: no acknowledgment.
+    if (vec >= 32) {
+        if (vec != 39) apic_write(0xb0, 0);
+        return;
+    }
+    if (vec == 2) return; // NMI: real machines send them now and then (nothing we handle)
     uint64_t cr2;
     __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
     char m[256];
@@ -520,7 +564,7 @@ static int64_t rv_run(uint64_t *f, uint64_t until) {
         uint32_t in = *(uint32_t *)(page + (pc & 4095));
         uint32_t op = in & 0x7f, rd = (in >> 7) & 31, f3 = (in >> 12) & 7, rs1 = (in >> 15) & 31, rs2 = (in >> 20) & 31, f7 = in >> 25;
         int64_t imm_i = (int32_t)in >> 20;
-        int64_t imm_s = ((int32_t)in >> 25 << 5) | ((in >> 7) & 31);
+        int64_t imm_s = ((int64_t)((int32_t)in >> 25) << 5) | ((in >> 7) & 31);
         int64_t imm_b = ((int64_t)((int32_t)in >> 31) << 12) | ((in >> 7 & 1) << 11) | ((in >> 25 & 63) << 5) | ((in >> 8 & 15) << 1);
         int64_t imm_u = (int64_t)(int32_t)(in & 0xfffff000);
         int64_t imm_j = ((int64_t)((int32_t)in >> 31) << 20) | (in & 0xff000) | ((in >> 20 & 1) << 11) | ((in >> 21 & 1023) << 1);
@@ -695,8 +739,8 @@ void kmain(BootInfo *bi) {
     boot = *bi;
     timebase = boot.tsc_hz ? boot.tsc_hz : 2000000000ull;
     tables_init();
-    paging_init();
     heap_init();
+    paging_init();
     serial_init();
     read_clock();
     apic_init();

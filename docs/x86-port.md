@@ -40,13 +40,27 @@ and a USB mouse. RISC-V/QEMU must keep working unchanged.
 - [x] A. Build: `stellang --kernel --arch x86_64` → `os.efi`; `stellang boot --arch x86_64 [--gui]`
       runs QEMU + OVMF (`-drive fat:` dir, `-device qemu-xhci -device usb-mouse`).
 - [x] B. runtime split + `runtime_kernel_x86.c` + `boot_uefi.c`
-- [x] C. (written, not yet exercised by running a program) RV64 interpreter for user processes on x86
-- [ ] D. stellang side: done: `kernel.arch()`, port I/O, `time_ms`, virtio guard, RDRAND in rng.st.
-      TODO: display.st on x86 (`st_k_fb(0..4)`: fb, width, height, stride, format) + `display.size()`
-- [ ] E. PS/2 keyboard + mouse in input.st
-- [ ] F. `pci.st`, `xhci.st`, USB HID boot-protocol mouse + keyboard
-- [ ] G. HiDPI: integer upscale of the 1024x768 desktop when the panel is ≥ 2048 wide
-- [ ] H. README: making the USB stick, Secure Boot off, what works / what doesn't
+- [x] C. RV64 interpreter for user processes on x86. Fixed: store offsets (`imm_s`) were
+      zero-extended, so every `sd x, -n(sp)` faulted. tests/stellaos_procs.st passes on x86 except
+      the two memory-heavy programs, which hit the 3 s limit under QEMU's x86 emulation (no KVM here).
+- [x] D. display.st on x86: `Screen` over the GOP framebuffer (stride, RGB/BGR via `gfx.SWAP_RB`),
+      `display.size()`; wm.st composes into its back buffer and calls `Screen.show` per damaged rect.
+      The loader accepts bitmask modes with standard masks, refuses Blt-only, and swaps a mode under
+      1024 wide for the biggest one up to 4K.
+- [x] E. PS/2 keyboard (scan code set 1, E0/E1, repeats) + mouse (IntelliMouse wheel, 4-byte packets)
+- [x] F. `pci.st`, `xhci.st`: BIOS handoff, scratchpads, command/event rings (polled), port reset,
+      Address Device, Evaluate Context for full-speed EP0, config parsing, SET_PROTOCOL boot, interrupt
+      IN endpoints, EP0/endpoint stall recovery, hotplug (scan every second, Disable Slot on unplug).
+- [x] G. HiDPI: integer scale = the largest with ≥ 1024x720 desktop pixels (2560x1600 → 2x, 1280x800);
+      the scaled blit widens each row once and memcpys it (never reads the WC framebuffer).
+- [x] H. README: making the USB stick, Secure Boot off, what works / what doesn't.
+
+Also done: identity map now covers the CPU's whole physical address width (up to 48 bits; tables
+above 512 GiB come from RAM) — QEMU put the xHCI BAR at 768 GiB, and real 64-bit BARs (GPU
+framebuffers) can be up there too. Unknown device vectors get an EOI; NMIs are ignored. `hw` shell
+command (display, PS/2, USB devices + driver log). e2e test `stellaos_x86`.
+
+Not done: touchpads (I²C HID on most new laptops), USB hubs, network, sound, NVMe (on purpose).
 
 ## Testing
 
@@ -59,7 +73,7 @@ OVMF on Arch: `/usr/share/edk2/x64/OVMF_CODE.4m.fd`; Debian: `/usr/share/OVMF/OV
 
 ## Where it stands (keep this current)
 
-- Boots to the shell in QEMU x86 (`stellang boot --arch x86_64 examples/stellaos/os.st`).
-- The desktop doesn't come up yet: display.st only knows ramfb (task D).
-- C side ready for stellang: `st_k_ps2_read()` (byte | 0x100 if from the mouse port, -1 if none),
-  `st_k_fb(what)`, `kernel.inb/inl/outb/outl`.
+- In QEMU x86 (q35 + OVMF): boots to the desktop on the GOP framebuffer (1280x800, and 2x on a
+  2560x1600 `-device VGA,edid=on,xres=2560,yres=1600`), PS/2 keyboard + mouse, USB keyboard + mouse
+  (incl. hotplug), compiled programs run, `shutdown` exits.
+- Not yet tried on the real laptop. First thing to run there: `hw`.

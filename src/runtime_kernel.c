@@ -389,6 +389,21 @@ void st_g_blit(int64_t src, int64_t sw, int64_t sh, int64_t sx, int64_t sy, int6
     int64_t x = dx, y = dy, cw = w * scale, ch = h * scale;
     if (!g_clipr(&x, &y, &cw, &ch)) return;
     const uint32_t *s = (const uint32_t *)(uintptr_t)src;
+    // a plain (or red/blue-swapped) copy, scaled up (the desktop on a high-resolution screen): each
+    // source row is widened once, then copied `scale` times; the screen is only ever written
+    static uint32_t wide[8192];
+    if ((mode == 0 || mode == 3) && (scale > 1 || mode == 3) && cw <= 8192) {
+        for (int64_t r = 0; r < ch;) {
+            int64_t srow = (y - dy + r) / scale;
+            const uint32_t *row = s + (sy + srow) * sw + sx;
+            for (int64_t i = 0; i < cw; i++) {
+                uint32_t v = row[(x - dx + i) / scale];
+                wide[i] = mode == 3 ? (v & 0x00ff00) | (v >> 16 & 0xff) | (v & 0xff) << 16 : v;
+            }
+            for (; r < ch && (y - dy + r) / scale == srow; r++) memcpy(g_px + (y + r) * g_w + x, wide, (size_t)cw * 4);
+        }
+        return;
+    }
     for (int64_t r = 0; r < ch; r++) {
         const uint32_t *row = s + (sy + (y - dy + r) / scale) * sw + sx;
         uint32_t *p = g_px + (y + r) * g_w + x;
@@ -399,6 +414,7 @@ void st_g_blit(int64_t src, int64_t sw, int64_t sh, int64_t sx, int64_t sy, int6
         for (int64_t i = 0; i < cw; i++) {
             uint32_t v = row[(x - dx + i) / scale];
             if (mode == 0) p[i] = v;
+            else if (mode == 3) p[i] = (v & 0x00ff00) | (v >> 16 & 0xff) | (v & 0xff) << 16;
             else if (mode == 2) { if ((v & 0xffffff) != ((uint32_t)key & 0xffffff)) p[i] = v & 0xffffff; }
             else {
                 uint32_t a = v >> 24;

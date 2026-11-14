@@ -12,6 +12,7 @@ import kernel
 import ramfs
 import calc
 import wm
+import display
 import web
 import ui
 import input
@@ -103,7 +104,8 @@ struct Shell {
             "help" => help(),
             "echo" => println(rest),
             "clear" => kernel.clear_screen(),
-            "uname" => println("StellaOS ${VERSION} (stellang, riscv64, QEMU virt)"),
+            "uname" => println("StellaOS ${VERSION} (stellang, ${if kernel.arch() == "x86_64" { "x86_64, a UEFI PC" } else { "riscv64, QEMU virt" }})"),
+            "hw" => self.hw(),
             "uptime" => println("up ${seconds(kernel.uptime())}, ${kernel.ticks()} timer ticks"),
             "mem" => mem(),
             "gc" => {
@@ -686,6 +688,26 @@ struct Shell {
         return all.join("\n")
     }
 
+    // what hardware the drivers found: the screen, keyboards and mice
+    fn hw(self) {
+        println("machine   ${kernel.arch()}")
+        if let d = self.gui {
+            let sc = d.screen
+            println("display   desktop ${d.width}x${d.height}, on a ${sc.panel_w}x${sc.panel_h} screen (each pixel ${sc.scale}x${sc.scale})${if sc.swap { " (red/blue swapped)" } else { "" }}")
+            let inp = d.inp
+            if inp.ps2 { println("PS/2      keyboard port; mouse packets of ${inp.ps2_size} bytes") }
+            if let u = inp.usb {
+                println("USB       ${u.controllers.len()} xHCI controller${if u.controllers.len() == 1 { "" } else { "s" }}: ${u.devices().join(", ")}")
+                for c in u.controllers {
+                    for line in c.log { println("          ${line}") }
+                }
+            }
+            if !inp.devices.is_empty() { println("virtio    ${inp.devices.len()} input device${if inp.devices.len() == 1 { "" } else { "s" }}") }
+        } else {
+            println("display   none")
+        }
+    }
+
     fn desktop(self) -> wm.Desktop! {
         if let d = self.gui { return d }
         return err("no desktop (boot with `stellang boot --gui`)")
@@ -705,7 +727,8 @@ struct Shell {
 
     // Take over the display, keyboard and mouse, and put the apps on the desktop.
     fn start_desktop(self) -> void! {
-        let d = wm.start(1024, 768)?
+        let size = display.size()
+        let d = wm.start(size[0], size[1])?
         self.gui = some(d)
         let fs = self.fs
         let edit = (path: str) => {
@@ -801,7 +824,7 @@ fn need(argv: [str], i: int, usage: str) -> str! {
 fn help() {
     println("files     ls [dir]  cd <dir>  pwd  mkdir <dir>  cat <file>  rm <path>  wc <file>")
     println("          write <file> <text>  append <file> <text>  edit <file>")
-    println("system    mem  gc  df  sync  uptime  uname  history  clear  shutdown  reboot")
+    println("system    mem  gc  df  sync  uptime  uname  hw  history  clear  shutdown  reboot")
     println("jobs      every <ms> <command>  jobs  kill <job>  sleep <ms>")
     println("tools     echo <text>  calc <expr>  peek <address>  date  beep [hz] [ms]  sound  panic")
     println("network   ifconfig [set <ip>/<bits> [gw] | dhcp]  ping [-c n] <host>  host <name>  arp  firewall [ping on|off|log]")

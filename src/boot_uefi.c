@@ -82,14 +82,23 @@ typedef struct {
     usize fb_size;
 } Mode;
 
-typedef struct {
-    void *query, *set, *blt;
+typedef struct Gop {
+    Status(EFIAPI *query)(struct Gop *, u32 mode, usize *size, ModeInfo **info);
+    Status(EFIAPI *set)(struct Gop *, u32 mode);
+    void *blt;
     Mode *mode;
 } Gop;
 
+// A mode we can draw on: 32-bit pixels, red/green/blue bytes in either order.
+static int usable(const ModeInfo *m) {
+    if (m->format == 0 || m->format == 1) return 1;
+    return m->format == 2 && m->masks[1] == 0xff00 && m->masks[3] == 0xff000000u &&
+           ((m->masks[0] == 0xff0000 && m->masks[2] == 0xff) || (m->masks[0] == 0xff && m->masks[2] == 0xff0000));
+}
+
 // What the kernel gets (runtime_kernel_x86.c has the same struct).
 typedef struct {
-    u64 fb, fb_width, fb_height, fb_stride, fb_format; // fb_format: 0 RGBX, 1 BGRX (0x00RRGGBB), 2 other
+    u64 fb, fb_width, fb_height, fb_stride, fb_format; // fb_format: 0 RGBX, 1 BGRX (0x00RRGGBB)
     u64 mmap, mmap_size, mmap_desc;                    // the memory map after ExitBootServices
     u64 runtime;                                       // EFI_RUNTIME_SERVICES *
     u64 tsc_hz;
@@ -169,12 +178,29 @@ Status EFIAPI efi_main(Handle image, SystemTable *table) {
     BootInfo bi;
     mset(&bi, 0, sizeof bi);
     if (!ERR(bs->locate_protocol(&gop_guid, 0, (void **)&gop)) && gop && gop->mode && gop->mode->info) {
+        // laptops start in the panel's own resolution; only a small mode (800x600 from a boot menu)
+        // is swapped for the biggest one up to 4K
+        if (gop->mode->info->width < 1024 || !usable(gop->mode->info)) {
+            u32 best = gop->mode->mode;
+            u64 best_px = 0;
+            for (u32 i = 0; i < gop->mode->max_mode; i++) {
+                ModeInfo *m = 0;
+                usize sz = 0;
+                if (ERR(gop->query(gop, i, &sz, &m)) || !m || !usable(m) || m->width > 3840) continue;
+                if ((u64)m->width * m->height > best_px) best = i, best_px = (u64)m->width * m->height;
+            }
+            if (best_px && best != gop->mode->mode) gop->set(gop, best);
+        }
         ModeInfo *m = gop->mode->info;
-        bi.fb = gop->mode->fb;
-        bi.fb_width = m->width;
-        bi.fb_height = m->height;
-        bi.fb_stride = m->stride;
-        bi.fb_format = m->format < 2 ? m->format : 2;
+        if (usable(m) && gop->mode->fb) {
+            bi.fb = gop->mode->fb;
+            bi.fb_width = m->width;
+            bi.fb_height = m->height;
+            bi.fb_stride = m->stride;
+            bi.fb_format = m->format == 2 ? (m->masks[0] == 0xff ? 0 : 1) : m->format;
+        } else {
+            say("(the screen's pixels are in a format StellaOS can't draw: no desktop)\n");
+        }
     } else {
         say("(no graphics output: the desktop won't come up)\n");
     }

@@ -465,7 +465,8 @@ println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"p
 
 ## An operating system: StellaOS
 
-`stellang --kernel os.st` compiles a program into a kernel (`os.elf`, RISC-V 64, for QEMU's `virt` machine);
+`stellang --kernel os.st` compiles a program into a kernel (`os.elf`, RISC-V 64, for QEMU's `virt` machine;
+with `--arch x86_64`, `os.efi`, which boots a real PC from a USB stick: see [below](#on-a-real-pc-x86_64-uefi));
 `stellang boot os.st` builds it and boots it. It is the same language with the same garbage collector, minus
 the host OS: `import kernel` (and `gfx`) instead of `http`, `net` and `fs`.
 
@@ -600,7 +601,8 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
   `/etc/ca` (for a company's own CA, say). `stellaos_crypto` checks the primitives against known answers;
   `stellaos_https` runs real TLS servers (`openssl s_server`) at the kernel, with a good certificate, an
   unknown CA and the wrong name.
-- **Drivers, in stellang**: the display (QEMU's ramfb, through fw_cfg DMA), virtio (the transport and its
+- **Drivers, in stellang**: the display (QEMU's ramfb, through fw_cfg DMA; on a PC the firmware's framebuffer),
+  on a PC also PS/2 and USB keyboards and mice (`pci.st`, `xhci.st`), virtio (the transport and its
   queues), keyboard and mouse (virtio-input; US and German layouts), the disk (virtio-blk), the network card
   (virtio-net), the sound card (virtio-sound) and the host's random numbers (virtio-rng). The file system
   is saved to the disk a moment after each change and loaded at boot; `stellang boot` keeps the disk image in
@@ -641,6 +643,49 @@ fn main() {
 - The embedded userland (`userland.st`: the programs' runtime and the examples) is made from
   `examples/stellaos/userland/` by `tools/genuserland.py`.
 - Next: images (PNG, JPEG), generics in the compiler, more harts.
+
+### On a real PC (x86_64, UEFI)
+
+The same OS boots on an x86_64 laptop or desktop with UEFI, from a USB stick, and runs entirely in RAM.
+
+```sh
+stellang --kernel --arch x86_64 examples/stellaos/os.st -o os.efi
+stellang boot --arch x86_64 --gui examples/stellaos/os.st     # try it in QEMU first (needs OVMF: `apt install ovmf`)
+```
+
+**Making the stick** (no `dd`, nothing to install): format a USB stick as FAT32 (most already are) and copy
+`os.efi` onto it as `EFI/BOOT/BOOTX64.EFI`:
+
+```sh
+mkdir -p /media/$USER/STICK/EFI/BOOT
+cp os.efi /media/$USER/STICK/EFI/BOOT/BOOTX64.EFI
+```
+
+Then on the PC: turn **Secure Boot off** in the firmware setup (os.efi isn't signed), plug the stick in, and pick
+it in the one-time boot menu (usually F12, F11, F10, F8 or Esc right after power-on; F2 or Del for setup). Take
+the stick out and the computer boots as it always did; turn Secure Boot back on if you use it.
+
+**What works**: the desktop on the built-in screen at its own resolution (doubled on high-resolution panels,
+so a 2560x1600 laptop gets a sharp 1280x800 desktop), the built-in keyboard (PS/2, as most laptops wire it),
+USB keyboards and mice (also wireless ones with a receiver) plugged into the computer itself, the clock, the
+shell, files, apps, games, the browser's offline parts, and programs compiled inside the OS. `hw` in the shell
+says what was found. Shutdown and reboot go through the firmware.
+
+**What doesn't (yet)**: touchpads (on most new laptops they're on I²C, not PS/2), USB hubs, Wi-Fi and
+Ethernet (no network), sound, the internal disk, and anything saved: files live in RAM and are gone at power-off.
+
+**Nothing it does outlasts a power-off**: StellaOS has no driver for the internal disk (NVMe, SATA) and never writes to
+it; it doesn't touch the firmware's flash or settings (no SMM, no microcode, no UEFI variables); USB devices
+only get the standard setup requests. Everything it changes (page tables, the APIC timer, the USB controller)
+is reset by the next power-on. If it ever crashes, the panic stays on the screen: hold the power button.
+
+How it's built: a small UEFI loader (`src/boot_uefi.c`) carries the kernel (a position-independent ELF) inside
+it, takes the screen, memory map and runtime services from the firmware, leaves the firmware and jumps in.
+`src/runtime_kernel_x86.c` sets up its own GDT, IDT and identity page tables, the local APIC timer (1 kHz), the
+PS/2 controller and the TSC clock; the drivers above it are stellang: `display.st` (the firmware's framebuffer),
+`input.st` (PS/2 scan codes and mouse packets), `pci.st`, `xhci.st` (USB: rings, enumeration, HID boot
+protocol). Programs compiled inside the OS are RISC-V machine code on both machines; on x86 the kernel runs them
+with an RV64 interpreter that walks the same page tables, so `proc.st` is the same everywhere.
 
 ## Editor support
 

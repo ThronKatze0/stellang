@@ -401,6 +401,7 @@ const char *st_k_arch(void) { return "riscv64"; }
 int64_t st_k_in(int64_t port, int64_t size) { (void)port, (void)size; return -1; }
 void st_k_out(int64_t port, int64_t size, int64_t v) { (void)port, (void)size, (void)v; }
 int64_t st_k_ps2_read(void) { return -1; }
+int64_t st_k_ps2_mouse(void) { return 0; }
 int64_t st_k_fb(int64_t what) { (void)what; return 0; }
 int64_t st_k_hw_random(void) { return -1; }
 

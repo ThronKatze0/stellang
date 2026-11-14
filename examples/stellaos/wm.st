@@ -79,7 +79,7 @@ struct Launcher {
 }
 
 struct Desktop {
-    screen: gfx.Surface,
+    screen: display.Screen,
     back: gfx.Surface,
     wallpaper: gfx.Surface,
     cursor: gfx.Surface,
@@ -570,11 +570,9 @@ struct Desktop {
                     b.clip(r[0], r[1], r[2], r[3])
                     b.draw(ov, 0, 0)
                     b.sprite(self.cursor, self.px - 1, self.py - 1, 1)
-                    self.screen.clip(r[0], r[1], r[2], r[3])
-                    self.screen.draw(b, 0, 0)
+                    self.screen.show(b, r[0], r[1], r[2], r[3])
                 }
                 b.unclip()
-                self.screen.unclip()
                 self.damage = []
                 return
             }
@@ -589,11 +587,9 @@ struct Desktop {
             if r[1] + r[3] > self.height - TASKBAR_H { self.draw_taskbar() }
             if self.menu && overlaps(self.menu_rect(), r) { self.draw_menu() }
             b.sprite(self.cursor, self.px - 1, self.py - 1, 1)
-            self.screen.clip(r[0], r[1], r[2], r[3])
-            self.screen.draw(b, 0, 0)
+            self.screen.show(b, r[0], r[1], r[2], r[3])
         }
         b.unclip()
-        self.screen.unclip()
         self.damage = []
     }
 

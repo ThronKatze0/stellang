@@ -43,6 +43,7 @@ const BIG = 7         // Inter Bold 34 px: scores, splash screens
 const COPY = 0
 const ALPHA = 1       // the source's top byte is its opacity (0xAARRGGBB)
 const KEYED = 2       // pixels of one color are see-through
+const SWAP_RB = 3     // a copy with red and blue swapped (for screens that want 0x00BBGGRR)
 
 struct Surface {
     width: int,
