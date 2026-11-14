@@ -37,11 +37,12 @@ and a USB mouse. RISC-V/QEMU must keep working unchanged.
 
 ## Tasks / status
 
-- [ ] A. Build: `stellang --kernel --arch x86_64` → `os.efi`; `stellang boot --arch x86_64 [--gui]`
+- [x] A. Build: `stellang --kernel --arch x86_64` → `os.efi`; `stellang boot --arch x86_64 [--gui]`
       runs QEMU + OVMF (`-drive fat:` dir, `-device qemu-xhci -device usb-mouse`).
-- [ ] B. runtime split + `runtime_kernel_x86.c` + `boot_uefi.c`
-- [ ] C. RV64 interpreter for user processes on x86
-- [ ] D. stellang side: `kernel.arch()`, port I/O, `time_ms`, display/virtio/rng on x86
+- [x] B. runtime split + `runtime_kernel_x86.c` + `boot_uefi.c`
+- [x] C. (written, not yet exercised by running a program) RV64 interpreter for user processes on x86
+- [ ] D. stellang side: done: `kernel.arch()`, port I/O, `time_ms`, virtio guard, RDRAND in rng.st.
+      TODO: display.st on x86 (`st_k_fb(0..4)`: fb, width, height, stride, format) + `display.size()`
 - [ ] E. PS/2 keyboard + mouse in input.st
 - [ ] F. `pci.st`, `xhci.st`, USB HID boot-protocol mouse + keyboard
 - [ ] G. HiDPI: integer upscale of the 1024x768 desktop when the panel is ≥ 2048 wide
@@ -55,3 +56,10 @@ stellang boot --arch x86_64 --gui examples/stellaos/os.st   # QEMU x86_64 + OVMF
 
 OVMF on Arch: `/usr/share/edk2/x64/OVMF_CODE.4m.fd`; Debian: `/usr/share/OVMF/OVMF_CODE.fd`
 (`STELLANG_OVMF` overrides).
+
+## Where it stands (keep this current)
+
+- Boots to the shell in QEMU x86 (`stellang boot --arch x86_64 examples/stellaos/os.st`).
+- The desktop doesn't come up yet: display.st only knows ramfb (task D).
+- C side ready for stellang: `st_k_ps2_read()` (byte | 0x100 if from the mouse port, -1 if none),
+  `st_k_fb(what)`, `kernel.inb/inl/outb/outl`.
