@@ -10,6 +10,7 @@
 import kernel
 import virtio
 import xhci
+import touchpad
 
 extern fn st_k_ps2_read() -> int
 extern fn st_k_ps2_mouse() -> int
@@ -63,12 +64,16 @@ struct Input {
     held: [bool] = [],        // keys down by code (to tell a repeat from a press)
     buttons_down: int = 0,    // mouse buttons down (bit 0 left, 1 right, 2 middle)
     usb: xhci.Usb? = none,
+    touch: touchpad.Touch? = none,
 
     // Everything that happened since the last call.
     fn poll(self) -> [Event] {
         if self.ps2 { self.poll_ps2() }
         if let c = self.usb {
             for r in c.poll() { self.usb_report(r) }
+        }
+        if let t = self.touch {
+            for m in t.poll() { self.usb_report(xhci.Report { kind: "mouse", data: m.map(v => v & 0xff), last: [] }) }
         }
         for i, q in self.queues {
             while true {
@@ -285,6 +290,7 @@ fn open(w: int, h: int) -> Input {
         let m = st_k_ps2_mouse()
         if m > 0 { inp.ps2_size = m }
         inp.usb = some(xhci.open())
+        inp.touch = some(touchpad.open())
         return inp
     }
     for d in virtio.find(virtio.INPUT) {

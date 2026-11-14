@@ -702,6 +702,11 @@ struct Shell {
                     for line in c.log { println("          ${line}") }
                 }
             }
+            if let t = inp.touch {
+                let found = t.describe()
+                println("touchpad  ${if found.is_empty() { "none found" } else { found.join(", ") }}")
+                for line in t.log { println("          ${line}") }
+            }
             if !inp.devices.is_empty() { println("virtio    ${inp.devices.len()} input device${if inp.devices.len() == 1 { "" } else { "s" }}") }
         } else {
             println("display   none")

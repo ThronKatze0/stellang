@@ -47,6 +47,9 @@ const USAGE: &str = "usage:
                                                                         keyboard and mouse; a disk image keeps files;
                                                                         a network card unless --no-net, a sound
                                                                         card unless --no-sound)
+  stellang usb <os.st|os.efi> <folder>                                  put StellaOS on a USB stick (x86_64 UEFI): writes
+                                                                        <folder>/EFI/BOOT/BOOTX64.EFI; <folder> is where the
+                                                                        (FAT32) stick is mounted
   stellang dev [dir]                                                    full-stack dev loop: client.st -> public/, server.st; rebuild on change
   stellang check <file.st>                                             type-check only
   stellang fmt [--emoji|--plain] <file.st>                              re-indent in place
@@ -119,6 +122,7 @@ fn main() {
         Some("lsp") => return lsp::run(),
         Some("dev") => return dev(args.get(1).map(String::as_str).unwrap_or(".")),
         Some("boot") => return boot(&args[1..]),
+        Some("usb") => return usb(&args[1..]),
         Some("--version" | "-V") => return println!("stellang {}", env!("CARGO_PKG_VERSION")),
         Some("grammar") => match args.get(1).map(String::as_str) {
             Some("textmate") => return print!("{}", grammar::textmate()),
@@ -472,6 +476,40 @@ fn boot(args: &[String]) {
         let _ = fs::remove_file(&elf);
     }
     exit(status.code().unwrap_or(1));
+}
+
+/// `stellang usb os.st /media/me/STICK`: build StellaOS for x86_64 UEFI and copy it to where a PC's
+/// firmware looks on a removable drive (EFI/BOOT/BOOTX64.EFI). Only a file is written, into a folder
+/// the user names (the mounted stick); nothing writes to a device directly.
+fn usb(args: &[String]) {
+    let (Some(input), Some(folder)) = (args.first(), args.get(1)) else {
+        die("usage: stellang usb <os.st|os.efi> <folder where the USB stick is mounted>")
+    };
+    if folder.starts_with("/dev/") || folder.starts_with("\\\\.\\") {
+        die(format!("{folder} is a device: mount the stick (FAT32) and give its folder, like /media/$USER/STICK"));
+    }
+    let dir = Path::new(folder);
+    if !dir.is_dir() {
+        die(format!("{folder}: no such folder (mount the USB stick first; it needs a FAT32 file system)"));
+    }
+    let efi = if input.ends_with(".efi") {
+        input.clone()
+    } else {
+        let out = env::temp_dir().join(format!("stellang-usb-{}", std::process::id())).display().to_string();
+        build_kernel(input, Some(out), "-O2", false, true)
+    };
+    let boot = dir.join("EFI").join("BOOT");
+    fs::create_dir_all(&boot).unwrap_or_else(|e| die(format!("{}: {e}", boot.display())));
+    let target = boot.join("BOOTX64.EFI");
+    let replaced = target.exists();
+    let n = fs::copy(&efi, &target).unwrap_or_else(|e| die(format!("{}: {e}", target.display())));
+    if !input.ends_with(".efi") {
+        let _ = fs::remove_file(&efi);
+    }
+    println!("{}: StellaOS ({} KiB){}", target.display(), n / 1024, if replaced { ", replacing the one that was there" } else { "" });
+    println!("Next: eject the stick safely, plug it into the PC, turn Secure Boot off in its firmware setup,");
+    println!("and pick the stick in the one-time boot menu (often F12, F11, F10, F8 or Esc right after power-on).");
+    println!("StellaOS runs from RAM and never writes to the PC's own disk.");
 }
 
 /// The firmware for QEMU's x86 PC: OVMF (UEFI), wherever the distribution put it.

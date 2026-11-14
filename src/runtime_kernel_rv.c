@@ -517,3 +517,6 @@ void kmain(uint64_t hart, const uint8_t *dtb) {
 
     kexit(main());
 }
+
+// no ACPI on QEMU's RISC-V machine (the device tree says what's there)
+int64_t st_k_acpi_rsdp(void) { return 0; }

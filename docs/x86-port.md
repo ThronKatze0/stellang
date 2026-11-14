@@ -69,7 +69,26 @@ keyboard and a mouse behind it, unplug and replug through the monitor); the USB 
 (SET_HUB_DEPTH, the USB 3 hub descriptor, warm-reset change) is written to the spec but untested
 (QEMU has no USB 3 hub).
 
-Not done: touchpads (I²C HID on most new laptops), network, sound, NVMe (on purpose).
+Also done: touchpads (HID over I²C), in four parts, all stellang:
+- `acpi.st`: the RSDP from the loader (UEFI configuration table), XSDT/RSDT, FADT → DSDT, SSDTs. No
+  AML interpreter: it looks through the bytecode for devices compatible with PNP0C50 (EISA id or
+  string), their I2cSerialBus resource (address, speed, controller path), the constants their _DSM
+  returns (the HID descriptor register), and the controller's _ADR (Name or Method).
+- `i2c.st`: Intel LPSS DesignWare I²C, polled; FIFO-paced transfers, abort/timeout handling. Only PCI
+  bus 0 devices 0x15/0x19/0x10 from Intel are ever touched (never 00:1f.5, the SPI flash controller).
+- `hid.st`: a HID report descriptor parser (usage pages, collections, report ids, push/pop, ranges)
+  and `Pad`: mouse mode (what touchpads start in) and precision-touchpad mode (finger tracking,
+  tap-to-click, two-finger scroll, the button), out as boot-protocol mouse reports.
+- `touchpad.st`: HID over I²C (HID descriptor, power on, reset, report descriptor, input reads),
+  probing the usual addresses when the firmware fills the address in at run time.
+Tested without hardware (`tests/stellaos_touch.st`: made-up ACPI tables and a precision touchpad's
+descriptor); on QEMU the scan runs over OVMF's real tables and finds none. Not tried on a real
+touchpad yet: `hw` prints what was found and why not.
+
+`stellang usb os.st <folder>` builds the .efi and writes `<folder>/EFI/BOOT/BOOTX64.EFI` (refuses
+`/dev/...`).
+
+Not done: AMD's I²C controllers, network, sound, NVMe (on purpose).
 
 ## Testing
 
@@ -85,4 +104,5 @@ OVMF on Arch: `/usr/share/edk2/x64/OVMF_CODE.4m.fd`; Debian: `/usr/share/OVMF/OV
 - In QEMU x86 (q35 + OVMF): boots to the desktop on the GOP framebuffer (1280x800, and 2x on a
   2560x1600 `-device VGA,edid=on,xres=2560,yres=1600`), PS/2 keyboard + mouse, USB keyboard + mouse
   (incl. hotplug, and behind hubs), compiled programs run, `shutdown` exits.
-- Not yet tried on the real laptop. First thing to run there: `hw`.
+- Not yet tried on the real laptop. First thing to run there: `hw` (screen, PS/2, USB devices and
+  hubs, the touchpad search with its ACPI findings).

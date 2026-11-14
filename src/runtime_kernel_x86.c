@@ -20,6 +20,7 @@ typedef struct {
     uint64_t runtime;
     uint64_t tsc_hz;
     uint64_t kernel, kernel_size;
+    uint64_t rsdp;
 } BootInfo;
 
 static BootInfo boot;
@@ -476,6 +477,8 @@ static void gc_roots(void) {
 }
 
 int64_t st_k_kernel_size(void) { return (int64_t)boot.kernel_size; }
+// ACPI's RSDP (acpi.st reads the tables; they're in memory the identity map covers)
+int64_t st_k_acpi_rsdp(void) { return (int64_t)boot.rsdp; }
 
 // The heap: the largest block of free RAM (conventional memory, by the firmware's map).
 static void heap_init(void) {

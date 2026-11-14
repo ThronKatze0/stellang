@@ -1562,6 +1562,14 @@ fn stellaos_x86() {
     let efi = dir.join("os.efi");
     let c = Command::new(BIN).args(["--kernel", "--arch", "x86_64"]).arg(root.join("examples/stellaos/os.st")).arg("-o").arg(&efi).output().unwrap();
     assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    // `stellang usb`: the stick's folder gets EFI/BOOT/BOOTX64.EFI; a device path is refused
+    let stick = dir.join("stick");
+    fs::create_dir_all(&stick).unwrap();
+    let c = Command::new(BIN).arg("usb").arg(&efi).arg(&stick).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    assert_eq!(fs::read(stick.join("EFI/BOOT/BOOTX64.EFI")).unwrap(), fs::read(&efi).unwrap());
+    let c = Command::new(BIN).arg("usb").arg(&efi).arg("/dev/sdz").output().unwrap();
+    assert!(!c.status.success() && String::from_utf8_lossy(&c.stderr).contains("is a device"));
     // besides the mouse on a root port: a hub, with a keyboard and a mouse behind it
     let mut q = Command::new(BIN)
         .args(["boot", "--arch", "x86_64"])
@@ -1635,6 +1643,8 @@ fn stellaos_x86() {
         "port 6: USB hub with 8 ports",
         "port 6.1: USB keyboard",
         "port 6.3: USB mouse",
+        "touchpad  none found",
+        "ACPI lists no HID-over-I",
         "Nice to meet you, Grace.",
         "bye!",
     ] {
@@ -2465,5 +2475,46 @@ fn stellaos_programs() {
         .collect();
     for want in [330.0, 392.0] {
         assert!(pitches.iter().any(|hz| (hz - want).abs() < 10.0), "no {want} Hz tone in the sound: {pitches:?}");
+    }
+}
+
+/// The touchpad driver's logic, without a touchpad (QEMU has none): tests/stellaos_touch.st scans the
+/// ACPI tables of two made-up laptops for HID-over-I²C devices (a fixed address; an address filled in
+/// at run time, the controller's _ADR in another table) and drives the HID side with a precision
+/// touchpad's report descriptor: mouse mode, and touchpad mode with motion, a tap, two-finger
+/// scrolling and a physical click.
+#[test]
+fn stellaos_touch() {
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-riscv64");
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tmpdir("touch");
+    for e in fs::read_dir(root.join("examples/stellaos")).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_file() {
+            fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+        }
+    }
+    fs::copy(root.join("tests/stellaos_touch.st"), dir.join("touch_test.st")).unwrap();
+    let elf = dir.join("t.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(dir.join("touch_test.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let out = Command::new("qemu-system-riscv64")
+        .args(["-machine", "virt", "-m", "128M", "-nographic", "-bios", "default", "-kernel"])
+        .arg(&elf)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    for want in [
+        "device TPD0 hid ELAN0D61 address 0x15 speed 400000 on I2C1 adr 0x150001 registers [1, 32]",
+        "device TPD1 hid PNP0C50 address 0x0 speed 1000000 on I2C0 adr 0x150000 registers []",
+        "== nothing\n== mouse mode\nmode mouse ids true report 2\n[[1, 5, -5, 0]]\n[[0, -56, 0, 0]]\n[]\n",
+        "mode touchpad report 1 contacts 2 range 3200 buttons 1\n[]\n[[0, 50, 0, 0]]\n[[0, 0, 127, 0], [0, 0, 23, 0]]\n[]\n",
+        "[]\n[[1, 0, 0, 0], [0, 0, 0, 0]]\n[]\n[[0, 0, 0, -2]]\n[]\n[[1, 0, 0, 0]]\n[[1, 10, 0, 0]]\n[[0, 0, 0, 0]]\ndone",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
 }

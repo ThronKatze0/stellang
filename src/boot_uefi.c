@@ -66,6 +66,8 @@ typedef struct {
     void *err;
     void *runtime;
     BootServices *boot;
+    usize nr_tables;
+    struct { Guid guid; void *table; } *tables;  // configuration tables: ACPI's among them
 } SystemTable;
 
 typedef struct {
@@ -103,6 +105,7 @@ typedef struct {
     u64 runtime;                                       // EFI_RUNTIME_SERVICES *
     u64 tsc_hz;
     u64 kernel, kernel_size;                           // where the kernel landed
+    u64 rsdp;                                          // ACPI's root (2.0 if there is one), 0 if none
 } BootInfo;
 
 extern const u8 kernel_elf[];
@@ -236,6 +239,20 @@ Status EFIAPI efi_main(Handle image, SystemTable *table) {
     bi.kernel = base;
     bi.kernel_size = top;
     bi.runtime = (u64)st->runtime;
+
+    // ACPI (where the touchpad is, among much else): the 2.0 table if there is one, else 1.0
+    static const Guid acpi20 = {0x8868e871, 0xe4f1, 0x11d3, {0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81}};
+    static const Guid acpi10 = {0xeb9d2d30, 0x2d88, 0x11d3, {0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d}};
+    for (usize i = 0; i < st->nr_tables; i++) {
+        const Guid *g = &st->tables[i].guid;
+        int is20 = g->a == acpi20.a && g->b == acpi20.b && g->c == acpi20.c;
+        int is10 = g->a == acpi10.a && g->b == acpi10.b && g->c == acpi10.c;
+        for (int k = 0; k < 8; k++) {
+            if (g->d[k] != acpi20.d[k]) is20 = 0;
+            if (g->d[k] != acpi10.d[k]) is10 = 0;
+        }
+        if (is20 || (is10 && !bi.rsdp)) bi.rsdp = (u64)st->tables[i].table;
+    }
 
     // the time stamp counter's rate, against the firmware's microsecond stall
     u64 t0 = rdtsc();
