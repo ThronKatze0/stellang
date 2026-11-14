@@ -1,5 +1,6 @@
 // kernel: programs that ARE the operating system. Build with `stellang --kernel os.st` (makes os.elf,
-// a RISC-V 64 kernel), run with `stellang boot os.st` (builds, then boots it in QEMU).
+// a RISC-V 64 kernel; `--arch x86_64` makes os.efi, for PCs with UEFI), run with `stellang boot os.st`
+// (builds, then boots it in QEMU).
 //
 //     import kernel
 //
@@ -321,10 +322,27 @@ fn irq_count(irq: int) -> int {
 
 // Milliseconds since 1970-01-01, from the machine's real-time clock (QEMU's: UTC, or local time when
 // booted with `-rtc base=localtime`, as `stellang boot` does).
-fn time_ms() -> int {
-    let lo = st_k_peek(0x10_1000, 4)       // reading the low half latches the high half
-    let hi = st_k_peek(0x10_1004, 4)
-    return ((hi << 32) | lo) / 1_000_000
+fn time_ms() -> int { return st_k_rtc_ms() }
+
+extern fn st_k_rtc_ms() -> int
+extern fn st_k_arch() -> str
+extern fn st_k_in(port: int, size: int) -> int
+extern fn st_k_out(port: int, size: int, value: int)
+extern fn st_k_hw_random() -> int
+
+// The machine: "riscv64" (QEMU's virt) or "x86_64" (a PC booted by UEFI).
+fn arch() -> str { return st_k_arch() }
+
+// x86 I/O ports (PCI configuration space, ...); on RISC-V there are none (reads give -1).
+fn inb(port: int) -> int { return st_k_in(port, 1) }
+fn inl(port: int) -> int { return st_k_in(port, 4) }
+fn outb(port: int, v: int) { st_k_out(port, 1, v) }
+fn outl(port: int, v: int) { st_k_out(port, 4, v) }
+
+// 63 random bits from the CPU itself (x86's RDRAND), if it has a generator.
+fn hw_random() -> int? {
+    let v = st_k_hw_random()
+    return if v < 0 { none } else { some(v) }
 }
 
 struct Date {

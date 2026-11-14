@@ -184,6 +184,7 @@ struct Queue {
 // Every device of a kind (INPUT, BLOCK, ...) QEMU plugged in.
 fn find(kind: int) -> [Device] {
     var out: [Device] = []
+    if kernel.arch() != "riscv64" { return out }      // virtio-mmio is QEMU virt's
     for slot in 0..SLOTS {
         let base = MMIO + slot * 0x1000
         if kernel.peek32(base + MAGIC) != 0x7472_6976 { continue }   // "virt"

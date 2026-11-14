@@ -41,6 +41,7 @@ struct Rng {
     counter: int = 0,
     out: [int] = [],                         // words not handed out yet
     source: Source? = none,
+    cpu: bool = false,                       // the CPU has a generator (x86 RDRAND)
     used: int = 0,                           // words handed out since the last reseed
 
     // a random number 0 .. 2^32-1
@@ -87,6 +88,9 @@ struct Rng {
                 i += 4
             }
         }
+        if self.cpu {
+            for i in 0..8 { mix.push((kernel.hw_random() ?? 0) & MASK) }
+        }
         mix.push(jitter())
         mix.push(kernel.time_ms() & MASK)
         for i, w in mix { self.key[i % 8] = self.key[i % 8] ^ w }
@@ -97,7 +101,7 @@ struct Rng {
     }
 
     fn strong(self) -> bool {
-        return self.source.is_some()
+        return self.source.is_some() || self.cpu
     }
 }
 
@@ -161,6 +165,9 @@ fn open() -> Rng {
         d.go()
         r.source = some(Source { dev: d, q, buf: kernel.alloc_pages(1) })
         break
+    }
+    if r.source.is_none() {
+        r.cpu = kernel.hw_random().is_some()
     }
     r.reseed()
     r.reseed()

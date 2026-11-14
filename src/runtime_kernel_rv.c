@@ -396,6 +396,20 @@ static void gc_roots(void) {
     gc_runs++;
 }
 
+const char *st_k_arch(void) { return "riscv64"; }
+// what only x86 has
+int64_t st_k_in(int64_t port, int64_t size) { (void)port, (void)size; return -1; }
+void st_k_out(int64_t port, int64_t size, int64_t v) { (void)port, (void)size, (void)v; }
+int64_t st_k_ps2_read(void) { return -1; }
+int64_t st_k_fb(int64_t what) { (void)what; return 0; }
+int64_t st_k_hw_random(void) { return -1; }
+
+// The real time: QEMU's goldfish RTC (nanoseconds since 1970; reading the low half latches the high).
+int64_t st_k_rtc_ms(void) {
+    uint64_t lo = REG32(0x101000), hi = REG32(0x101004);
+    return (int64_t)((hi << 32 | lo) / 1000000);
+}
+
 int64_t st_k_kernel_size(void) { return (int64_t)((uintptr_t)&__kernel_end - 0x80200000ul); }
 
 // ---- time ----

@@ -56,6 +56,8 @@ static uint64_t rdtime(void) {
     return (uint64_t)hi << 32 | lo;
 }
 
+const char *st_k_arch(void) { return "x86_64"; }
+
 static void arch_wait(void) { __asm__ volatile("sti; hlt"); }
 
 // Port I/O for drivers in stellang (PCI configuration space, ...).
