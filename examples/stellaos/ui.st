@@ -72,6 +72,10 @@ struct Style {
     nowrap: bool = false,
     scroll: bool = false,
     underline: bool = false,
+    vars: {str: str} = {},    // CSS custom properties (--x) in effect
+    upper: str = "",          // text-transform: "uppercase" or "lowercase"
+    hidden: bool = false,     // visibility: hidden (takes room, isn't drawn)
+    no_marker: bool = false,  // list-style: none
 
     fn face(self) -> int {
         if self.mono { return if self.bold { gfx.MONO_BOLD } else { gfx.MONO } }
@@ -119,6 +123,7 @@ struct El {
     avail_h: int = -1,        // its content height when that's decided from outside (for height: N%)
     words: [Word] = [],       // inline content
     pref: int = -1,           // max-content width, cached during a layout
+    uid: int = 0,             // an identity for scripts (jsdom.st), given when first needed
 
     fn attr(self, name: str) -> str { return self.attrs.get(name) ?? "" }
     fn has(self, name: str) -> bool { return self.attrs.contains(name) }
@@ -144,22 +149,108 @@ struct Field {
     seen_checked: bool = false,
 }
 
-// a stylesheet rule: `selector { declarations }`; a selector is a chain of compounds ("nav button.on")
-struct Rule {
-    chain: [Compound],
-    css: str,
-}
+// ---- stylesheets: rules, selectors, the cascade ----
 
-struct Compound {
+// a compound selector: tag, #id, .classes, [attributes], :pseudo-classes (div.note[title]:first-child)
+struct Sel {
     tag: str = "",
     id: str = "",
     classes: [str] = [],
+    attrs: [[str]] = [],      // [name, op, value]; op: "" (present), "=", "~=", "^=", "$=", "*=", "|="
+    pseudos: [str] = [],      // first-child, last-child, only-child, empty, root, link, nth-child(...)
+    nots: [Sel] = [],         // :not(...)
+}
+
+struct Decl {
+    name: str,
+    value: str,
+    important: bool = false,
+}
+
+// `a > b.c, d { ... }` gives a rule per selector
+struct Rule {
+    sels: [Sel],              // left to right
+    combs: [str],             // between sels[i] and sels[i+1]: " " (descendant), ">", "+", "~"
+    decls: [Decl],
+    spec: int,
+    order: int,
+}
+
+// rules, indexed by what their rightmost part needs (an id, a class, a tag), so an element only
+// tries the rules that could match it
+struct Sheet {
+    rules: [Rule] = [],
+    by_id: {str: [int]} = {},
+    by_class: {str: [int]} = {},
+    by_tag: {str: [int]} = {},
+    any: [int] = [],
+
+    fn add(self, r: Rule) {
+        let i = self.rules.len()
+        self.rules.push(r)
+        let last = r.sels[r.sels.len() - 1]
+        if last.id != "" {
+            push_at(self.by_id, last.id, i)
+        } else if !last.classes.is_empty() {
+            push_at(self.by_class, last.classes[0], i)
+        } else if last.tag != "" {
+            push_at(self.by_tag, last.tag, i)
+        } else {
+            self.any.push(i)
+        }
+    }
+
+    // add a stylesheet's rules after the ones already here
+    fn add_css(self, css: str, limit: int) {
+        for r in parse_rules(css, self.rules.len()) {
+            if self.rules.len() >= limit { return }
+            self.add(r)
+        }
+    }
+
+    // the rules matching `e`, in cascade order (specificity, then order in the sheet)
+    fn matching(self, e: El, stop: bool) -> [Rule] {
+        if self.rules.is_empty() { return [] }
+        var cand: [int] = []
+        let id = e.attr("id")
+        if id != "" { if let l = self.by_id.get(id) { for i in l { cand.push(i) } } }
+        var seen: [str] = []
+        for c in e.attr("class").split(" ") {
+            if c == "" || seen.contains(c) { continue }
+            seen.push(c)
+            if let l = self.by_class.get(c) { for i in l { cand.push(i) } }
+        }
+        if let l = self.by_tag.get(tag_of(e)) { for i in l { cand.push(i) } }
+        for i in self.any { cand.push(i) }
+        var keys: [int] = []
+        var by_key: {int: int} = {}
+        for i in cand {
+            let r = self.rules[i]
+            if matches_at(e, r, r.sels.len() - 1, stop) {
+                let k = r.spec * 1_000_000 + r.order
+                keys.push(k)
+                by_key[k] = i
+            }
+        }
+        keys.sort()
+        return keys.map(k => self.rules[by_key[k]])
+    }
+}
+
+fn push_at(m: {str: [int]}, k: str, i: int) {
+    if let l = m.get(k) { l.push(i) } else { m[k] = [i] }
+}
+
+// an element's tag as pages name it (the browser keeps the original in data-tag)
+fn tag_of(e: El) -> str {
+    if let t = e.attrs.get("data-tag") { return t }
+    return e.tag
 }
 
 struct Ui {
     ctx: int,
     view: fn() -> Node,
-    sheet: [Rule] = [],
+    sheet: Sheet = Sheet {},
     html: str = "",
     root: El = El { tag: "body" },
     width: int = 0,
@@ -170,6 +261,7 @@ struct Ui {
     hover: str = "",
     active: str = "",
     render: bool = true,
+    restyle: bool = true,
     relayout: bool = true,
     repaint: bool = true,
     last_click: int = 0,
@@ -177,6 +269,13 @@ struct Ui {
     mx: int = -1,
     my: int = -1,
     blink: int = 0,
+    // pages shown inside the app (the browser): element trees put into `data-slot` elements, styled
+    // only by their own sheet, with links and forms handed to the app
+    slots: {str: El} = {},
+    page_sheet: Sheet = Sheet {},
+    links: [fn(El)] = [],
+    page_hooks: [fn(El, str, str) -> bool] = [],   // events on page elements, for the page's scripts
+    forms: [fn(El, str)] = [],
 
     fn tick(self, t: wm.Tick) -> bool {
         if t.signals { self.render = true }
@@ -203,7 +302,9 @@ struct Ui {
             if html != self.html {
                 self.html = html
                 self.root = parse(html)
+                self.fill_slots(self.root)
                 self.sync_fields(self.root)
+                self.restyle = true
                 self.relayout = true
             }
         }
@@ -214,8 +315,12 @@ struct Ui {
         }
         if self.relayout {
             self.relayout = false
-            style_tree(self.root, Style {}, self)
-            self.root.st.scroll = true
+            if self.restyle {
+                // styles depend only on the tree: worked out again only when it changes
+                self.restyle = false
+                style_tree(self.root, Style {}, self, false)
+                self.root.st.scroll = true
+            }
             clear_pref(self.root)
             layout(self.root, 0, 0, self.width, self.height, self)
             self.root.h = self.height
@@ -226,6 +331,25 @@ struct Ui {
         s.clear(if self.root.st.bg >= 0 { self.root.st.bg } else { 0xffffff })
         let p = Painter { s, ui: self }
         p.el(self.root, 0, 0, [0, 0, s.width, s.height])
+    }
+
+    // Show `page` in the element with data-slot="name".
+    fn set_slot(self, name: str, page: El) {
+        self.slots[name] = page
+        self.html = ""            // re-read the app's HTML, which puts the page in
+        self.render = true
+    }
+
+    fn fill_slots(self, e: El) {
+        if let name = e.attrs.get("data-slot") {
+            if let page = self.slots.get(name) {
+                page.parent = some(e)
+                e.kids = [page]
+                repath(page, "${e.path}.0")
+                return
+            }
+        }
+        for k in e.kids { self.fill_slots(k) }
     }
 
     // fields keep what's typed, unless the app gives them a new value
@@ -261,6 +385,10 @@ struct Ui {
 
     // Call the nearest handler for `event` from `e` up. Returns whether there was one.
     fn fire(self, e: El, event: str, value: str) -> bool {
+        // a page's own scripts first (they may cancel the default action)
+        for h in self.page_hooks {
+            if h(e, event, value) { return true }
+        }
         var cur: El? = some(e)
         while true {
             if let c = cur {
@@ -364,7 +492,7 @@ struct Ui {
         self.repaint = true
         if changed {
             f.text = cs.join("")
-            self.relayout = true
+            if multi { self.relayout = true }   // a one-line field keeps its size: no new layout
             self.fire(e, "input", f.text)
         }
         return true
@@ -471,6 +599,19 @@ struct Ui {
         }
         if !self.fire(e, "click", "") {
             if e.tag == "button" && e.attr("type") != "button" { self.submit_from(e) }
+            // a link in a page
+            var cur: El? = some(e)
+            while true {
+                if let c = cur {
+                    if c.tag == "a" && c.has("href") {
+                        for f in self.links { f(c) }
+                        break
+                    }
+                    cur = c.parent
+                } else {
+                    break
+                }
+            }
         } else if e.tag == "button" && e.attr("type") == "submit" {
             self.submit_from(e)
         }
@@ -484,7 +625,9 @@ struct Ui {
                 if c.tag == "form" {
                     var parts: [str] = []
                     self.form_fields(c, parts)
-                    self.fire(c, "submit", parts.join("&"))
+                    if !self.fire(c, "submit", parts.join("&")) {
+                        for f in self.forms { f(c, parts.join("&")) }
+                    }
                     return
                 }
                 cur = c.parent
@@ -585,7 +728,15 @@ fn app(view: fn() -> Node) -> wm.App {
 // The same, with a stylesheet for its classes: "button.on { background: #6c5ce7 } .muted { color: gray }".
 // Selectors: tags, .classes, #ids, combined (button.on) and nested (nav .item); later rules win.
 fn styled(view: fn() -> Node, css: str) -> wm.App {
-    let u = Ui { ctx: st_k_ui_new(), view, sheet: parse_sheet(css) }
+    return window_app(make(view, css))
+}
+
+// The Ui itself (for apps that reach into it, like the browser putting pages into slots).
+fn make(view: fn() -> Node, css: str) -> Ui {
+    return Ui { ctx: st_k_ui_new(), view, sheet: parse_sheet(css) }
+}
+
+fn window_app(u: Ui) -> wm.App {
     return wm.App {
         tick: (t: wm.Tick) => u.tick(t),
         paint: (s: gfx.Surface) => u.paint(s),
@@ -596,9 +747,15 @@ fn styled(view: fn() -> Node, css: str) -> wm.App {
 
 // ---- stylesheets ----
 
-fn parse_sheet(css: str) -> [Rule] {
+fn parse_sheet(css: str) -> Sheet {
+    let sh = Sheet {}
+    sh.add_css(css, 1_000_000)
+    return sh
+}
+
+// `selectors { declarations }` blocks, flat (no @media: see html.flatten_css); `first` numbers them
+fn parse_rules(css: str, first: int) -> [Rule] {
     var rules: [Rule] = []
-    // drop comments
     var text = css
     while text.contains("/*") {
         let a = text.find("/*")
@@ -609,63 +766,317 @@ fn parse_sheet(css: str) -> [Rule] {
     for block in text.split("}") {
         let open = block.find("{")
         if open < 0 { continue }
-        let body = block.slice(open + 1, block.len())
-        for sel in block.slice(0, open).split(",") {
-            let t = sel.trim()
-            if t == "" || t.contains(":") || t.contains(">") || t.contains("[") { continue }   // not supported: skip
-            let chain = t.split(" ").filter(x => x != "").map(x => compound(x))
-            rules.push(Rule { chain, css: body })
+        let decls = parse_decls(block.slice(open + 1, block.len()))
+        if decls.is_empty() { continue }
+        for sel in split_top(block.slice(0, open)) {
+            if let r = parse_selector(sel.trim()) {
+                r.decls = decls
+                r.order = first + rules.len()
+                rules.push(r)
+            }
         }
     }
     return rules
 }
 
-fn compound(s: str) -> Compound {
-    let c = Compound {}
-    var cur: [str] = []
-    var kind = "tag"
-    for ch in (s + ".").chars() {
-        if ch == "." || ch == "#" {
-            let part = cur.join("")
-            if part != "" {
-                if kind == "tag" { c.tag = part }
-                if kind == "class" { c.classes.push(part) }
-                if kind == "id" { c.id = part }
-            }
-            cur = []
-            kind = if ch == "." { "class" } else { "id" }
-        } else {
-            cur.push(ch)
+fn parse_decls(body: str) -> [Decl] {
+    var out: [Decl] = []
+    for part in split_semis(body) {
+        let at = part.find(":")
+        if at <= 0 { continue }
+        let name = part.slice(0, at).trim().lower()
+        var v = part.slice(at + 1, part.len()).trim()
+        var imp = false
+        let bang = v.find("!")
+        if bang >= 0 && v.slice(bang + 1, v.len()).trim().lower() == "important" {
+            imp = true
+            v = v.slice(0, bang).trim()
         }
+        if name != "" && v != "" { out.push(Decl { name, value: v, important: imp }) }
     }
-    if c.tag == "*" { c.tag = "" }
-    return c
+    return out
 }
 
-fn matches_one(e: El, c: Compound) -> bool {
-    if c.tag != "" && c.tag != e.tag { return false }
-    if c.id != "" && e.attr("id") != c.id { return false }
-    if !c.classes.is_empty() {
+// split on ";" outside parentheses (url(data:...;...))
+fn split_semis(s: str) -> [str] {
+    if !s.contains("(") { return s.split(";") }
+    var out: [str] = []
+    var cur: [str] = []
+    var depth = 0
+    for c in s.chars() {
+        if c == "(" { depth += 1 }
+        if c == ")" { depth = max(depth - 1, 0) }
+        if c == ";" && depth == 0 {
+            out.push(cur.join(""))
+            cur = []
+        } else {
+            cur.push(c)
+        }
+    }
+    out.push(cur.join(""))
+    return out
+}
+
+// One selector ("nav > a.on:first-child"). none if it uses what we can't match (:hover, ::before...).
+fn parse_selector(s: str) -> Rule? {
+    if s == "" { return none }
+    let cs = s.chars()
+    var sels: [Sel] = []
+    var combs: [str] = []
+    var i = 0
+    var pending = ""
+    var spec = 0
+    while i < cs.len() {
+        let c = cs[i]
+        if c == " " || c == "\n" || c == "\t" || c == "\r" {
+            if !sels.is_empty() && pending == "" { pending = " " }
+            i += 1
+            continue
+        }
+        if c == ">" || c == "+" || c == "~" {
+            if sels.is_empty() { return none }
+            pending = c
+            i += 1
+            continue
+        }
+        // a compound
+        if !sels.is_empty() {
+            combs.push(if pending == "" { " " } else { pending })
+        }
+        pending = ""
+        let sel = Sel {}
+        let end = compound_at(cs, i, sel)
+        if end < 0 { return none }
+        spec += specificity(sel)
+        sels.push(sel)
+        i = end
+    }
+    if sels.is_empty() || combs.len() != sels.len() - 1 { return none }
+    return some(Rule { sels, combs, decls: [], spec, order: 0 })
+}
+
+fn specificity(sel: Sel) -> int {
+    var n = 0
+    if sel.id != "" { n += 10000 }
+    n += 100 * (sel.classes.len() + sel.attrs.len() + sel.pseudos.len())
+    if sel.tag != "" { n += 1 }
+    for x in sel.nots { n += specificity(x) }
+    return n
+}
+
+fn name_char(c: str) -> bool {
+    return "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_".contains(c) || st_ord(c) > 127
+}
+
+// read a compound selector from cs[i..]; returns where it ends (-1: unsupported)
+fn compound_at(cs: [str], start: int, sel: Sel) -> int {
+    var i = start
+    // the tag
+    var t: [str] = []
+    if i < cs.len() && cs[i] == "*" {
+        i += 1
+    } else {
+        while i < cs.len() && name_char(cs[i]) {
+            t.push(cs[i])
+            i += 1
+        }
+    }
+    sel.tag = t.join("").lower()
+    while i < cs.len() {
+        let c = cs[i]
+        if c == "#" || c == "." {
+            var n: [str] = []
+            i += 1
+            while i < cs.len() && name_char(cs[i]) {
+                n.push(cs[i])
+                i += 1
+            }
+            if n.is_empty() { return -1 }
+            if c == "#" { sel.id = n.join("") } else { sel.classes.push(n.join("")) }
+        } else if c == "[" {
+            let close = index_from(cs, "]", i)
+            if close < 0 { return -1 }
+            let inner = cs.slice(i + 1, close).join("").trim()
+            i = close + 1
+            var op = ""
+            var at = -1
+            for o in ["~=", "^=", "$=", "*=", "|="] {
+                let k = inner.find(o)
+                if k > 0 && (at < 0 || k < at) {
+                    at = k
+                    op = o
+                }
+            }
+            let eq = inner.find("=")
+            if at < 0 && eq > 0 {
+                at = eq
+                op = "="
+            }
+            if op == "" {
+                sel.attrs.push([inner.lower(), "", ""])
+            } else {
+                var v = inner.slice(at + op.len(), inner.len()).trim()
+                if v.ends_with(" i") || v.ends_with(" s") { v = v.slice(0, v.len() - 2).trim() }
+                if (v.starts_with("\"") && v.ends_with("\"")) || (v.starts_with("'") && v.ends_with("'")) { v = v.slice(1, v.len() - 1) }
+                sel.attrs.push([inner.slice(0, at).trim().lower(), op, v])
+            }
+        } else if c == ":" {
+            if i + 1 < cs.len() && cs[i + 1] == ":" { return -1 }     // ::before and friends
+            var n: [str] = []
+            i += 1
+            while i < cs.len() && name_char(cs[i]) {
+                n.push(cs[i])
+                i += 1
+            }
+            let name = n.join("").lower()
+            var arg = ""
+            if i < cs.len() && cs[i] == "(" {
+                let close = index_from(cs, ")", i)
+                if close < 0 { return -1 }
+                arg = cs.slice(i + 1, close).join("").trim()
+                i = close + 1
+            }
+            if name == "not" {
+                let inner = Sel {}
+                let ics = arg.chars()
+                if compound_at(ics, 0, inner) != ics.len() { return -1 }
+                sel.nots.push(inner)
+            } else if name == "first-child" || name == "last-child" || name == "only-child" || name == "empty" || name == "root" || name == "link" || name == "any-link" {
+                sel.pseudos.push(name)
+            } else if name == "nth-child" || name == "nth-of-type" {
+                sel.pseudos.push("nth:" + arg.lower().replace(" ", ""))
+            } else {
+                return -1        // :hover, :focus, :checked, ... : state we don't track
+            }
+        } else {
+            break
+        }
+    }
+    if sel.tag == "" && sel.id == "" && sel.classes.is_empty() && sel.attrs.is_empty() && sel.pseudos.is_empty() && sel.nots.is_empty() && !(start < cs.len() && cs[start] == "*") { return -1 }
+    return i
+}
+
+fn index_from(cs: [str], what: str, from: int) -> int {
+    var i = from
+    while i < cs.len() {
+        if cs[i] == what { return i }
+        i += 1
+    }
+    return -1
+}
+
+// the element children of e's parent, and e's position among them
+fn siblings(e: El) -> [El] {
+    if let p = e.parent { return p.kids.filter(k => k.tag != "") }
+    return [e]
+}
+
+fn sel_matches(e: El, s: Sel) -> bool {
+    if e.tag == "" { return false }
+    if s.tag != "" {
+        let t = tag_of(e)
+        if s.tag != t && !(s.tag == "html" && t == "body" && is_page_root(e)) { return false }
+    }
+    if s.id != "" && e.attr("id") != s.id { return false }
+    if !s.classes.is_empty() {
         let mine = e.attr("class").split(" ")
-        for k in c.classes {
+        for k in s.classes {
             if !mine.contains(k) { return false }
         }
+    }
+    for a in s.attrs {
+        if a[0] == "data-tag" || a[0].starts_with("data-on") { return false }
+        if !e.has(a[0]) { return false }
+        let v = e.attr(a[0])
+        let want = a[2]
+        let op = a[1]
+        if op == "=" && v != want { return false }
+        if op == "~=" && !v.split(" ").contains(want) { return false }
+        if op == "^=" && !v.starts_with(want) { return false }
+        if op == "$=" && !v.ends_with(want) { return false }
+        if op == "*=" && !v.contains(want) { return false }
+        if op == "|=" && v != want && !v.starts_with(want + "-") { return false }
+    }
+    if !s.pseudos.is_empty() {
+        let sib = siblings(e)
+        var pos = 0
+        for k, x in sib {
+            if x.path == e.path { pos = k }
+        }
+        for p in s.pseudos {
+            if p == "first-child" && pos != 0 { return false }
+            if p == "last-child" && pos != sib.len() - 1 { return false }
+            if p == "only-child" && sib.len() != 1 { return false }
+            if p == "empty" && !e.kids.is_empty() { return false }
+            if p == "root" && !is_page_root(e) { return false }
+            if (p == "link" || p == "any-link") && !(tag_of(e) == "a" && e.has("href")) { return false }
+            if p.starts_with("nth:") && !nth(p.slice(4, p.len()), pos + 1) { return false }
+        }
+    }
+    for n in s.nots {
+        if sel_matches(e, n) { return false }
     }
     return true
 }
 
-// does `e` match chain[0..=i] (chain[i] itself, earlier parts on some ancestors)?
-fn matches(e: El, chain: [Compound], i: int) -> bool {
-    if !matches_one(e, chain[i]) { return false }
+fn is_page_root(e: El) -> bool {
+    if let p = e.parent { return p.has("data-slot") || e.attr("data-tag") == "body" }
+    return true
+}
+
+// :nth-child(an+b) with odd, even, 3, 2n+1, -n+3
+fn nth(arg: str, k: int) -> bool {
+    if arg == "odd" { return k % 2 == 1 }
+    if arg == "even" { return k % 2 == 0 }
+    let n = arg.find("n")
+    if n < 0 { return k == (int(arg) catch -1) }
+    let a_s = arg.slice(0, n)
+    let a = if a_s == "" || a_s == "+" { 1 } else if a_s == "-" { -1 } else { int(a_s) catch 0 }
+    let rest = arg.slice(n + 1, arg.len())
+    let b = if rest == "" { 0 } else { int(rest.replace("+", "")) catch 0 }
+    if a == 0 { return k == b }
+    let d = k - b
+    return d % a == 0 && d / a >= 0
+}
+
+// Does `e` match the rule's selectors 0..=i, with sels[i] on e itself? `stop`: don't look above the
+// page (an element with data-slot) for ancestors.
+fn matches_at(e: El, r: Rule, i: int, stop: bool) -> bool {
+    if !sel_matches(e, r.sels[i]) { return false }
     if i == 0 { return true }
-    var cur = e.parent
-    while true {
-        if let p = cur {
-            if matches(p, chain, i - 1) { return true }
-            cur = p.parent
-        } else {
-            return false
+    let comb = r.combs[i - 1]
+    if comb == ">" {
+        if let p = e.parent {
+            if stop && p.has("data-slot") { return false }
+            return matches_at(p, r, i - 1, stop)
         }
+        return false
+    }
+    if comb == " " {
+        var cur = e.parent
+        while true {
+            if let p = cur {
+                if stop && p.has("data-slot") { return false }
+                if matches_at(p, r, i - 1, stop) { return true }
+                cur = p.parent
+            } else {
+                return false
+            }
+        }
+        return false
+    }
+    // + and ~: earlier siblings
+    let sib = siblings(e)
+    var pos = -1
+    for k, x in sib {
+        if x.path == e.path { pos = k }
+    }
+    if pos <= 0 { return false }
+    if comb == "+" { return matches_at(sib[pos - 1], r, i - 1, stop) }
+    var j = pos - 1
+    while j >= 0 {
+        if matches_at(sib[j], r, i - 1, stop) { return true }
+        j -= 1
     }
     return false
 }
@@ -773,23 +1184,99 @@ fn hex2(n: int) -> str {
 
 // ---- style ----
 
-fn style_tree(e: El, parent: Style, u: Ui) {
+fn style_tree(e: El, parent: Style, u: Ui, page: bool) {
     let st = Style { color: parent.color, size: parent.size, bold: parent.bold, mono: parent.mono,
-        text_align: parent.text_align, pre: parent.pre, nowrap: parent.nowrap, underline: parent.underline && e.tag == "" }
+        text_align: parent.text_align, pre: parent.pre, nowrap: parent.nowrap, underline: parent.underline && e.tag == "",
+        vars: parent.vars, upper: parent.upper, hidden: parent.hidden, no_marker: parent.no_marker }
     defaults(e, st)
     if e.tag != "" {
-        for r in u.sheet {
-            if matches(e, r.chain, r.chain.len() - 1) { apply_css(st, r.css) }
+        // the cascade: matching rules by specificity and order, then the style attribute;
+        // !important declarations after the rest
+        var normal: [Decl] = []
+        var imp: [Decl] = []
+        let sheet = if page { u.page_sheet } else { u.sheet }
+        for r in sheet.matching(e, page) {
+            for d in r.decls {
+                if d.important { imp.push(d) } else { normal.push(d) }
+            }
+        }
+        if let css = e.attrs.get("style") {
+            for d in parse_decls(css) {
+                if d.important { imp.push(d) } else { normal.push(d) }
+            }
+        }
+        if !normal.is_empty() || !imp.is_empty() {
+            // custom properties (--x) first, so var(--x) can use them
+            var own = false
+            var all: [Decl] = []
+            for d in normal { all.push(d) }
+            for d in imp { all.push(d) }
+            for d in all {
+                if d.name.starts_with("--") {
+                    if !own {
+                        var copy: {str: str} = {}
+                        for k in st.vars.keys() { copy[k] = st.vars.get(k) ?? "" }
+                        st.vars = copy
+                        own = true
+                    }
+                    st.vars[d.name] = d.value
+                }
+            }
+            for d in normal { apply_decl(st, d.name, subst_vars(d.value, st.vars)) }
+            for d in imp { apply_decl(st, d.name, subst_vars(d.value, st.vars)) }
         }
     }
-    if let css = e.attrs.get("style") { apply_css(st, css) }
     if e.has("disabled") {
         st.color = gfx.mix(st.color, 0xffffff, 1, 2)
         if st.bg >= 0 { st.bg = gfx.mix(st.bg, 0xffffff, 1, 3) }
     }
     e.st = st
     e.pref = -1
-    for k in e.kids { style_tree(k, st, u) }
+    let inside = page || e.has("data-slot")
+    for k in e.kids { style_tree(k, st, u, inside) }
+    // an inline element with blocks inside acts as a block (what browsers do, roughly, by splitting it)
+    if st.inline() && e.tag != "" {
+        for k in e.kids {
+            if k.tag != "" && k.st.display != "none" && !k.st.inline() && !k.st.atomic() && k.tag != "br" {
+                st.display = "block"
+                break
+            }
+        }
+    }
+}
+
+// var(--name) and var(--name, fallback), from the custom properties in effect
+fn subst_vars(v: str, vars: {str: str}) -> str {
+    var out = v
+    var guard = 0
+    while out.contains("var(") && guard < 8 {
+        guard += 1
+        let a = out.find("var(")
+        // the matching ")"
+        var depth = 0
+        var end = -1
+        let cs = out.slice(a + 4, out.len()).chars()
+        var off = 0
+        for c in cs {
+            if c == "(" { depth += 1 }
+            if c == ")" {
+                if depth == 0 {
+                    end = a + 4 + off
+                    break
+                }
+                depth -= 1
+            }
+            off += c.len()
+        }
+        if end < 0 { return out }
+        let inner = out.slice(a + 4, end)
+        let comma = inner.find(",")
+        let name = (if comma >= 0 { inner.slice(0, comma) } else { inner }).trim()
+        let fallback = if comma >= 0 { inner.slice(comma + 1, inner.len()).trim() } else { "" }
+        let value = vars.get(name) ?? fallback
+        out = out.slice(0, a) + value + out.slice(end + 1, out.len())
+    }
+    return out
 }
 
 fn defaults(e: El, st: Style) {
@@ -817,7 +1304,7 @@ fn defaults(e: El, st: Style) {
             st.margin = [0, 0, 6, 0]
         },
         "p" => { st.margin = [0, 0, 8, 0] },
-        "b" | "strong" | "th" => { st.bold = true },
+        "b" | "strong" => { st.bold = true },
         "small" => { st.size = 12 },
         "code" | "pre" | "kbd" => {
             st.mono = true
@@ -890,6 +1377,7 @@ fn defaults(e: El, st: Style) {
             st.row = true
         },
         "td" | "th" => {
+            st.bold = st.bold || t == "th"
             st.grow = 1
             st.pad = [4, 6, 4, 6]
         },
@@ -908,12 +1396,21 @@ fn defaults(e: El, st: Style) {
 }
 
 fn apply_css(st: Style, css: str) {
-    for decl in css.split(";") {
-        let at = decl.find(":")
-        if at < 0 { continue }
-        let name = decl.slice(0, at).trim().lower()
-        let v = decl.slice(at + 1, decl.len()).trim()
+    for d in parse_decls(css) { apply_decl(st, d.name, d.value) }
+}
+
+// one declaration; values we can't use (calc(), an unknown unit, a var() with no value) are skipped
+fn apply_decl(st: Style, name: str, value: str) {
+        let v = value.trim()
+        let lv = v.lower()
+        if lv.contains("calc(") || lv.contains("var(") || lv.contains("min(") || lv.contains("max(") || lv.contains("clamp(") { return }
+        if lv == "inherit" || lv == "initial" || lv == "unset" || lv == "revert" { return }
         match name {
+            "visibility" => { st.hidden = lv == "hidden" || lv == "collapse" },
+            "opacity" => { st.hidden = number_x10(v) == 0 && !v.contains("%") },
+            "text-transform" => { st.upper = if lv == "uppercase" || lv == "lowercase" { lv } else { "" } },
+            "list-style" | "list-style-type" => { st.no_marker = lv.contains("none") },
+            "row-gap" | "column-gap" => { if is_length(v) { if is_length(v) { st.gap = length(v, st.size) } } },
             "display" => { st.display = v },
             "flex-direction" => { st.row = !v.starts_with("column") },
             "flex-wrap" => { st.wrap = v == "wrap" },
@@ -922,24 +1419,24 @@ fn apply_css(st: Style, css: str) {
             "grid-template-columns" => { st.columns = grid_columns(v) },
             "align-items" => { st.align = v.replace("flex-", "") },
             "justify-content" => { st.justify = v.replace("flex-", "") },
-            "padding" => { st.pad = sides(v, st.size) },
-            "padding-top" => { st.pad[0] = length(v, st.size) },
-            "padding-right" => { st.pad[1] = length(v, st.size) },
-            "padding-bottom" => { st.pad[2] = length(v, st.size) },
-            "padding-left" => { st.pad[3] = length(v, st.size) },
+            "padding" => { if v.split(" ").all(x => x == "" || is_length(x)) { st.pad = sides(v, st.size) } },
+            "padding-top" => { if is_length(v) { if is_length(v) { st.pad[0] = length(v, st.size) } } },
+            "padding-right" => { if is_length(v) { if is_length(v) { st.pad[1] = length(v, st.size) } } },
+            "padding-bottom" => { if is_length(v) { if is_length(v) { st.pad[2] = length(v, st.size) } } },
+            "padding-left" => { if is_length(v) { if is_length(v) { st.pad[3] = length(v, st.size) } } },
             "margin" => {
                 st.center = v.contains("auto")
                 st.margin = sides(v, st.size)
             },
-            "margin-top" => { st.margin[0] = length(v, st.size) },
-            "margin-right" => { st.margin[1] = length(v, st.size) },
-            "margin-bottom" => { st.margin[2] = length(v, st.size) },
-            "margin-left" => { st.margin[3] = length(v, st.size) },
+            "margin-top" => { if is_length(v) { st.margin[0] = length(v, st.size) } },
+            "margin-right" => { if is_length(v) { st.margin[1] = length(v, st.size) } },
+            "margin-bottom" => { if is_length(v) { st.margin[2] = length(v, st.size) } },
+            "margin-left" => { if is_length(v) { st.margin[3] = length(v, st.size) } },
             "width" => size_of(v, st, true),
             "height" => size_of(v, st, false),
-            "min-width" => { st.min_width = length(v, st.size) },
-            "min-height" => { st.min_height = length(v, st.size) },
-            "max-width" => { st.max_width = length(v, st.size) },
+            "min-width" => { if is_length(v) { st.min_width = length(v, st.size) } },
+            "min-height" => { if is_length(v) { st.min_height = length(v, st.size) } },
+            "max-width" => { if is_length(v) { st.max_width = length(v, st.size) } },
             "background" | "background-color" => background(st, v),
             "color" => { st.color = color(v) ?? st.color },
             "border" => border(st, v, [0, 1, 2, 3]),
@@ -950,7 +1447,17 @@ fn apply_css(st: Style, css: str) {
             "border-color" => { st.border_color = color(v) ?? st.border_color },
             "border-radius" => { st.radius = length(v.split(" ")[0], st.size) },
             "box-shadow" => { st.shadow = v != "none" },
-            "font-size" => { st.size = length(v, st.size) },
+            "font-size" => {
+                let kw = {"xx-small": 9, "x-small": 10, "small": 12, "medium": 13, "large": 16, "x-large": 20, "xx-large": 26, "smaller": st.size - 2, "larger": st.size + 3}
+                if let k = kw.get(lv) {
+                    st.size = k
+                } else if v.ends_with("%") {
+                    st.size = st.size * number(v.slice(0, v.len() - 1)) / 100
+                } else if is_length(v) {
+                    st.size = length(v, st.size)
+                }
+                st.size = min(max(st.size, 8), 64)
+            },
             "font-weight" => { st.bold = v == "bold" || v == "600" || v == "700" || v == "800" || v == "900" || v == "bolder" },
             "font-family" => { st.mono = v.contains("mono") || v.contains("courier") },
             "font" => {
@@ -969,16 +1476,48 @@ fn apply_css(st: Style, css: str) {
             "overflow" | "overflow-y" | "overflow-x" => { st.scroll = v == "auto" || v == "scroll" },
             _ => {},
         }
-    }
 }
 
 fn size_of(v: str, st: Style, horizontal: bool) {
+    if !is_length(v) { return }
     if v.ends_with("%") {
         let p = number(v.slice(0, v.len() - 1))
         if horizontal { st.width_pct = p } else { st.height_pct = p }
     } else if v != "auto" {
         if horizontal { st.width = length(v, st.size) } else { st.height = length(v, st.size) }
     }
+}
+
+// hsl(h, s%, l%) as 0xRRGGBB
+fn hsl(h0: int, s: int, l: int) -> int {
+    let h = ((h0 % 360) + 360) % 360
+    let c = (100 - abs(2 * l - 100)) * s / 100           // chroma, 0..100
+    let hp = h * 100 / 60                                // 0..600
+    let x = c * (100 - abs(hp % 200 - 100)) / 100
+    let m = l - c / 2
+    var r = 0
+    var g = 0
+    var b = 0
+    if hp < 100 {
+        r = c
+        g = x
+    } else if hp < 200 {
+        r = x
+        g = c
+    } else if hp < 300 {
+        g = c
+        b = x
+    } else if hp < 400 {
+        g = x
+        b = c
+    } else if hp < 500 {
+        r = x
+        b = c
+    } else {
+        r = c
+        b = x
+    }
+    return gfx.rgb(min(max((r + m) * 255 / 100, 0), 255), min(max((g + m) * 255 / 100, 0), 255), min(max((b + m) * 255 / 100, 0), 255))
 }
 
 fn background(st: Style, v: str) {
@@ -993,7 +1532,23 @@ fn background(st: Style, v: str) {
         }
         return
     }
-    if let c = color(v) { st.bg = c } else if v == "transparent" || v == "none" { st.bg = -1 }
+    if let c = color(v) {
+        st.bg = c
+        return
+    }
+    if v == "transparent" || v == "none" {
+        st.bg = -1
+        return
+    }
+    // the shorthand: "#fff url(...) no-repeat" -- its color part
+    for part in split_top(v.replace(",", " ")) {
+        for word in part.split(" ") {
+            if let c = color(word) {
+                st.bg = c
+                return
+            }
+        }
+    }
 }
 
 fn border(st: Style, v: str, which: [int]) {
@@ -1015,8 +1570,29 @@ fn grid_columns(v: str) -> int {
 }
 
 // "8px", "1.5em", "12" -> pixels
+// a number with a unit we know (px, em, rem, pt, %, vw, vh) or a bare 0
+fn is_length(v: str) -> bool {
+    let t = v.trim().lower()
+    if t == "0" { return true }
+    var num = t
+    for unit in ["px", "rem", "em", "pt", "%", "vw", "vh"] {
+        if t.ends_with(unit) {
+            num = t.slice(0, t.len() - unit.len())
+            if num == "" { return false }
+            for c in num.chars() {
+                if !"0123456789.-+".contains(c) { return false }
+            }
+            return true
+        }
+    }
+    return false
+}
+
 fn length(v: str, font: int) -> int {
-    let t = v.trim()
+    let t = v.trim().lower()
+    if t.ends_with("pt") { return number_x10(t.slice(0, t.len() - 2)) * 4 / 30 }
+    if t.ends_with("vw") { return number_x10(t.slice(0, t.len() - 2)) * 10 / 10 * 7 / 10 }   // a window about 700px wide
+    if t.ends_with("vh") { return number_x10(t.slice(0, t.len() - 2)) * 5 / 10 }
     if t.ends_with("em") {
         return number_x10(t.slice(0, t.len() - (if t.ends_with("rem") { 3 } else { 2 }))) * (if t.ends_with("rem") { 16 } else { font }) / 10
     }
@@ -1055,6 +1631,15 @@ const NAMED = {
     "pink": 0xff79c6, "teal": 0x16a085, "navy": 0x1b2a4a, "silver": 0xc0c0c0, "gold": 0xffd700,
     "crimson": 0xdc143c, "tomato": 0xff6347, "salmon": 0xfa8072, "skyblue": 0x87ceeb, "lime": 0x32cd32,
     "darkgray": 0x555555, "lightgray": 0xd3d3d3, "whitesmoke": 0xf5f5f5, "slategray": 0x708090,
+    "maroon": 0x800000, "olive": 0x808000, "aqua": 0x00ffff, "cyan": 0x00ffff, "fuchsia": 0xff00ff,
+    "magenta": 0xff00ff, "brown": 0xa52a2a, "beige": 0xf5f5dc, "ivory": 0xfffff0, "khaki": 0xf0e68c,
+    "lavender": 0xe6e6fa, "linen": 0xfaf0e6, "darkblue": 0x00008b, "darkgreen": 0x006400, "darkred": 0x8b0000,
+    "lightblue": 0xadd8e6, "lightgreen": 0x90ee90, "lightyellow": 0xffffe0, "dimgray": 0x696969,
+    "gainsboro": 0xdcdcdc, "indigo": 0x4b0082, "violet": 0xee82ee, "coral": 0xff7f50, "chocolate": 0xd2691e,
+    "steelblue": 0x4682b4, "royalblue": 0x4169e1, "seagreen": 0x2e8b57, "forestgreen": 0x228b22,
+    "firebrick": 0xb22222, "darkorange": 0xff8c00, "aliceblue": 0xf0f8ff, "ghostwhite": 0xf8f8ff,
+    "snow": 0xfffafa, "mintcream": 0xf5fffa, "honeydew": 0xf0fff0, "azure": 0xf0ffff, "wheat": 0xf5deb3,
+    "tan": 0xd2b48c, "plum": 0xdda0dd, "orchid": 0xda70d6, "turquoise": 0x40e0d0, "darkslategray": 0x2f4f4f,
 }
 
 fn color(v: str) -> int? {
@@ -1068,10 +1653,16 @@ fn color(v: str) -> int? {
         if h.len() >= 6 { return some(hexval(h.slice(0, 6))) }
         return none
     }
-    if t.starts_with("rgb") {
+    if t.starts_with("rgb") && t.contains("(") {
         let inner = t.slice(t.find("(") + 1, t.len() - 1)
-        let p = inner.replace("/", ",").split(",").map(x => number(x.trim()))
-        if p.len() >= 3 { return some(gfx.rgb(p[0], p[1], p[2])) }
+        let p = inner.replace("/", " ").replace(",", " ").split(" ").filter(x => x != "").map(x => if x.ends_with("%") { number(x.slice(0, x.len() - 1)) * 255 / 100 } else { number(x) })
+        if p.len() >= 3 { return some(gfx.rgb(min(max(p[0], 0), 255), min(max(p[1], 0), 255), min(max(p[2], 0), 255))) }
+        return none
+    }
+    if t.starts_with("hsl") && t.contains("(") {
+        let inner = t.slice(t.find("(") + 1, t.len() - 1)
+        let p = inner.replace("/", " ").replace(",", " ").replace("deg", "").replace("%", "").split(" ").filter(x => x != "").map(x => number(x))
+        if p.len() >= 3 { return some(hsl(p[0], p[1], p[2])) }
         return none
     }
     return NAMED.get(t)
@@ -1185,6 +1776,8 @@ fn layout(e: El, x: int, y: int, w: int, h: int, u: Ui) {
         content = if e.tag == "textarea" { field_lines(e, u) * gfx.line_height(st.face()) } else if e.is_field() { gfx.line_height(st.face()) } else { 0 }
     } else if st.columns > 0 {
         content = layout_grid(e, cx, cy, cw, u)
+    } else if e.attr("data-tag") == "table" && !st.flex() {
+        content = layout_table(e, cx, cy, cw, u)
     } else if st.flex() {
         let inner_h = if fixed_h >= 0 { fixed_h - vextra(st) } else { -1 }
         content = if st.row { layout_row(e, cx, cy, cw, inner_h, u) } else { layout_column(e, cx, cy, cw, inner_h, u) }
@@ -1353,6 +1946,114 @@ fn layout_row(e: El, cx: int, cy: int, cw: int, ch: int, u: Ui) -> int {
     return y - cy
 }
 
+// ---- tables (web pages: the browser marks them with data-tag="table") ----
+
+fn table_rows(e: El, out: [El]) {
+    for k in elements(e) {
+        let t = k.attr("data-tag")
+        if k.tag == "tr" { out.push(k) } else if t == "thead" || t == "tbody" || t == "tfoot" { table_rows(k, out) }
+    }
+}
+
+fn span(k: El) -> int {
+    return min(max(int(k.attr("colspan")) catch 1, 1), 20)
+}
+
+// Column widths from the cells' content, across all rows; then each row's cells side by side.
+fn layout_table(e: El, cx: int, cy: int, cw: int, u: Ui) -> int {
+    var rows: [El] = []
+    table_rows(e, rows)
+    var ncol = 0
+    for r in rows {
+        var n = 0
+        for c in elements(r) { n += span(c) }
+        ncol = max(ncol, n)
+    }
+    if ncol == 0 { return layout_blocks(e, cx, cy, cw, u) }
+    var prefs: [int] = []
+    for i in 0..ncol { prefs.push(0) }
+    for r in rows {
+        var col = 0
+        for c in elements(r) {
+            let s = span(c)
+            let w = if c.st.width >= 0 { c.st.width } else { pref(c, u) }
+            if s == 1 { prefs[col] = max(prefs[col], w) }
+            col += s
+        }
+    }
+    var total = 0
+    for p in prefs { total += p }
+    // the table's width: as asked (width="85%"), else its content's, at most what there is
+    var target = min(total, cw)
+    let wa = e.attr("width")
+    if wa.ends_with("%") {
+        target = cw * min(number(wa.slice(0, wa.len() - 1)), 100) / 100
+    } else if e.st.width_pct >= 0 {
+        target = cw * min(e.st.width_pct, 100) / 100
+    } else if wa != "" {
+        target = min(number(wa), cw)
+    }
+    var widths: [int] = []
+    if total <= target {
+        // room to spare: share it out like the content
+        for p in prefs { widths.push(if total > 0 { p + (target - total) * p / total } else { target / ncol }) }
+    } else {
+        // too wide: narrow columns keep their width, the wide ones share the rest
+        let fair = target / ncol
+        var fixed = 0
+        var wide = 0
+        for p in prefs {
+            if p <= fair { fixed += p } else { wide += p }
+        }
+        let room = max(target - fixed, ncol * 20)
+        for p in prefs { widths.push(if p <= fair { p } else { max(p * room / max(wide, 1), 20) }) }
+    }
+    // centered by <center> / align="center" (the table itself; its text starts at the left)
+    var tx = cx
+    if let p = e.parent {
+        if p.st.text_align == "center" || e.attr("align") == "center" || e.st.center { tx = cx + max(cw - target, 0) / 2 }
+    }
+    var y = cy
+    for r in rows {
+        let cells = elements(r)
+        var tallest = 0
+        for pass in 0..2 {
+            var x = tx
+            var col = 0
+            for c in cells {
+                let s = span(c)
+                var w = 0
+                for i in col..min(col + s, ncol) { w += widths[i] }
+                layout(c, x, y, w, if pass == 0 { -1 } else { tallest }, u)
+                tallest = max(tallest, c.h)
+                x += w
+                col += s
+            }
+        }
+        r.x = tx
+        r.y = y
+        r.w = target
+        r.h = tallest
+        r.inner_h = tallest
+        r.words = []
+        y += tallest
+    }
+    // row groups (tbody, ...) cover their rows
+    for g in elements(e) {
+        if g.tag == "tr" { continue }
+        var gr: [El] = []
+        table_rows(g, gr)
+        if gr.is_empty() { continue }
+        g.x = tx
+        g.y = gr[0].y
+        g.w = target
+        g.h = gr[gr.len() - 1].y + gr[gr.len() - 1].h - g.y
+        g.inner_h = g.h
+        g.words = []
+    }
+    return y - cy
+}
+
 fn basis(k: El, cw: int, u: Ui) -> int {
     if k.st.width >= 0 { return k.st.width }
     if k.st.width_pct >= 0 { return cw * k.st.width_pct / 100 }
@@ -1401,8 +2102,8 @@ fn layout_inline(e: El, cx: int, cy: int, cw: int, u: Ui) -> int {
             x = 0
             continue
         }
-        if it.box && it.el.st.display == "block" {
-            // a block among inline content: its own line(s)
+        if it.box && !it.el.st.inline() && !it.el.st.atomic() {
+            // a block-level box (block, flex, grid, table, ...) among inline content: its own line(s)
             if !line.is_empty() {
                 y = finish_line(e, line, cx, y, cw, 0, u)
                 line = []
@@ -1475,12 +2176,14 @@ fn gather(e: El, st: Style, out: [Word], u: Ui) {
                     out.push(Word { text: l, w: gfx.text_width(l, face), h: lh, face, color: k.st.color, el: owner, bg: inline_bg(owner, e) })
                 }
             } else {
-                let lead = k.text.starts_with(" ") || k.text.starts_with("\n")
+                var text = k.text.replace("\n", " ").replace("\t", " ").replace("\r", " ")
+                if k.st.upper == "uppercase" { text = text.upper() } else if k.st.upper == "lowercase" { text = text.lower() }
+                let lead = text.starts_with(" ")
                 if lead && !out.is_empty() { out[out.len() - 1].space = max(out[out.len() - 1].space, space) }
-                let words = k.text.replace("\n", " ").split(" ").filter(w => w != "")
+                let words = text.split(" ").filter(w => w != "")
                 for i, wd in words {
                     let last = i + 1 == words.len()
-                    let trail = !last || k.text.ends_with(" ")
+                    let trail = !last || text.ends_with(" ")
                     out.push(Word { text: wd, w: gfx.text_width(wd, face), h: lh, face, color: k.st.color, el: owner,
                         space: if trail { space } else { 0 }, underline: k.st.underline || owner.st.underline, bg: inline_bg(owner, e) })
                 }
@@ -1494,6 +2197,20 @@ fn gather(e: El, st: Style, out: [Word], u: Ui) {
 }
 
 // an inline element's own background (code, mark), not the block's
+// the background showing through a transparent element
+fn backdrop(e: El) -> int {
+    var cur = e.parent
+    while true {
+        if let c = cur {
+            if c.st.bg >= 0 { return c.st.bg }
+            cur = c.parent
+        } else {
+            break
+        }
+    }
+    return 0xffffff
+}
+
 fn inline_bg(owner: El, block: El) -> int {
     if owner.path == block.path { return -1 }
     return owner.st.bg
@@ -1508,7 +2225,7 @@ struct Painter {
     // clip: the visible rectangle [x, y, w, h] in surface coordinates; (ox, oy) shifts content
     fn el(self, e: El, ox: int, oy: int, clip: [int]) {
         let st = e.st
-        if st.display == "none" || e.tag == "" { return }
+        if st.display == "none" || e.tag == "" || st.hidden { return }
         let s = self.s
         let x = e.x - ox
         let y = e.y - oy
@@ -1531,7 +2248,8 @@ struct Painter {
         if any_border && st.radius > 0 && bw[0] == bw[1] && bw[1] == bw[2] && bw[2] == bw[3] {
             let k = bw[0]
             s.round(x, y, e.w, e.h, st.radius, bc)
-            if bg >= 0 { s.round(x + k, y + k, e.w - 2 * k, e.h - 2 * k, max(st.radius - k, 0), bg) }
+            // the inside: its background, or (transparent) what's behind it
+            s.round(x + k, y + k, e.w - 2 * k, e.h - 2 * k, max(st.radius - k, 0), if bg >= 0 { bg } else { backdrop(e) })
             if focused && e.is_field() {
                 s.round_shade(x - 2, y - 2, e.w + 4, e.h + 4, st.radius + 2, ACCENT, 50)
                 s.round(x + 1, y + 1, e.w - 2, e.h - 2, max(st.radius - 1, 0), bg)
@@ -1554,7 +2272,7 @@ struct Painter {
             }
         }
         // what's special about some elements
-        if e.tag == "li" {
+        if e.tag == "li" && !st.no_marker {
             if let p = e.parent {
                 let face = st.face()
                 let mark = if p.tag == "ol" { "${index_in(p, e) + 1}." } else { "•" }
@@ -1705,6 +2423,14 @@ fn hit_in(e: El, x: int, y: int, u: Ui) -> El? {
         if x >= w.x && x < w.x + w.w + w.space && y + sy >= w.y && y + sy < w.y + w.h { return some(w.el) }
     }
     return some(e)
+}
+
+fn repath(e: El, path: str) {
+    e.path = path
+    for i, k in e.kids {
+        k.parent = some(e)
+        repath(k, "${path}.${i}")
+    }
 }
 
 fn find_path(e: El, path: str) -> El? {

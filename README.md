@@ -470,7 +470,8 @@ println({"pt": Point { x: 1.0, y: 2.0 }})  // print and "${}" show anything: {"p
 the host OS: `import kernel` (and `gfx`) instead of `http`, `net` and `fs`.
 
 [`examples/stellaos`](examples/stellaos) is an operating system written that way: a desktop with windows, apps and
-games, a shell, and files that are kept on a disk.
+games, a shell, files that are kept on a disk, a network stack with a web browser, users who log in, sound, and
+a programming environment: programs written inside it are compiled there and run as processes of their own.
 
 <p align="center"><img src=".github/stellaos.png" alt="the StellaOS desktop: Calculator, Snake and the Terminal" width="720"></p>
 
@@ -489,11 +490,119 @@ stellang boot examples/stellaos/os.st          # just the shell (Ctrl-A X force-
   browser sends. Files, Notes, Calculator, System Monitor and Mines are written like that.
 - **Games** draw directly (`gfx`: fast rectangles, anti-aliased circles and rounded shapes, lines, sprites and
   scaled pixel art, text in Inter and DejaVu Sans Mono) and get every frame and key: Snake, Bricks, Paint.
+- **Browser** (`browser.st`, `html.st`): real websites over HTTPS (Wikipedia, Hacker News, Bing and DuckDuckGo
+  searches, ...). An address bar that also searches (Bing), back/forward, links, GET and POST forms, a reader
+  view for pages that mark their main part, Latin, Greek and Cyrillic text. Search result links skip the
+  engines' click-tracking redirects; https pages never redirect down to http; pages are capped at 4 MiB,
+  20,000 elements and 40 levels deep. No images yet.
+  - **CSS** (in `ui.st`): pages' own stylesheets, `<style>` and linked: selectors with `>`, `+`, `~`,
+    attributes, `:first-child`/`:last-child`/`:nth-child()`/`:not()`, the cascade (specificity, order,
+    `!important`), custom properties and `var()`, `@media` (print dropped), flexbox, grid, tables laid out by
+    their content, colors (`rgb`, `hsl`, names), units (`px em rem pt % vw vh`). Not yet: floats,
+    positioning, `:hover`, transforms, web fonts.
+  - **JavaScript** (`jsparse.st`, `js.st`, `jsstd.st`, `jsre.st`, `jsdom.st`): an engine written in stellang
+    (a parser and a tree-walking interpreter) with most of the modern language (let/const, arrow functions,
+    classes with `extends`/`super`/getters, destructuring, spread/rest, template literals, `?.` and `??`,
+    regular expressions, `async`/`await`, labels, exceptions) and the standard library (Object, Array, String,
+    Number, Math, JSON, RegExp, Date, Map, Set, Promise, errors). Scripts get the DOM: `document`,
+    `querySelector(All)`, creating and changing elements (`innerHTML`, `textContent`, `classList`, `style`,
+    `dataset`, attributes), events (click, input, change, submit, keys; `addEventListener`, inline `onclick`,
+    `preventDefault`), `setTimeout`/`setInterval`, `localStorage` (in memory, per site), `location`. Small and
+    medium scripts work (menus, tabs, counters, todo lists, form checks); big app frameworks are another
+    matter.
+  - **Safe by design**: scripts are sandboxed. They see their own page and nothing else: no network (`fetch`
+    and `XMLHttpRequest` refuse), no files, no `eval`, no access to the browser's controls (the toolkit's own
+    attributes can't be set by a page). Every run has a step budget (a runaway loop is stopped after about a
+    second, a page's scripts in total after 15 million steps), recursion is capped, regular expressions give
+    up on catastrophic backtracking, and script navigation is limited. The **JS** button turns scripts off.
+    `stellaos_js` tests the language, the DOM and these limits.
+<p align="center"><img src=".github/stellaos-browser.png" alt="the StellaOS browser showing a page, the Terminal behind it after ping, host and firewall" width="720"></p>
+
+- **Code: write programs inside the OS** (`code.st`, `cc.st`, `rv.st`, `proc.st`). An editor (syntax colors,
+  line numbers, selection with Shift or the mouse, copy/cut/paste, undo/redo, auto-indent and closing braces,
+  Ctrl-/ comments, completion as you type, find and go-to-line, a file sidebar; the program is checked a
+  moment after you stop typing, so mistakes show at their line before you run it) with a **Run** button (F5): the program is compiled right there to RISC-V machine code (a 30 KB
+  program in about 40 ms) and runs as a process. Its output and questions are in the console under the editor,
+  its graphics in a window of its own; a compile error is marked at its line, a crash ends the program with a
+  message and nothing else. From the shell: `run hello.st`, `run tool.st a b` (the words come back from
+  `args()`), `run long.st &` (in the background), `cc game.st -o game` then `run game`, `ps`, `kill <pid>`. Example programs are in `/home/examples` (a game, bouncing balls, a sketch pad, music, files).
+  - **The language** is stellang, the parts a one-file program needs: `fn`, `struct` with fields, defaults and
+    methods (and `Type.function()`s without `self`), `enum`s, plain or carrying values (`Circle(radius: float)`,
+    `Rect { w: float, h: float = 1.0 }`, recursive ones), `Shape.Circle(1.0)` or `.Circle(1.0)`, taken apart by
+    `match` (`Circle(r)`, `Rect { w, h }`, nested patterns, `|`, `_`; every variant must be covered),
+    `const`/`let`/`var`, `int`/`float`/`bool`/`str`, lists (`[int]`, `[[str]]`, `[Point]`) and maps (`{str: int}`:
+    `m[k]`, `m[k] = v`, `get(k, default) contains remove keys values`, `for k, v in m`), options (`T?`, `none`,
+    `some(x)`, `??`, `if let`, `unwrap is_some is_none`; `get first last find` give them), results (`T!`,
+    `err("why")`, `x?` passes an error on, `x catch default`, `x catch e { ... }`, `int(s)`/`float(s)`, a
+    `main() -> void!` that fails prints the error), `in` (lists, strings, maps), `if`/`else` and
+    `match` (also as values), `while`, `for x in list`, `for i, x in list`, `for i in a..b`, `break`/`continue`,
+    closures (`x => x * k`, `(a: int, b: int) => { ... }`, `fn(int) -> bool` types; they share the `var`s they
+    use, like stellang's), functions as values, `map filter any all count` on lists,
+    string interpolation, the string and list methods (`len slice find contains split lines chars upper lower
+    trim replace repeat`; `push pop insert remove slice contains index_of sort reverse join sum`; floats'
+    `sqrt floor ceil round abs`, `int(x)` and `float(x)`). `==` compares structs, lists, maps and options by content (the compiler writes
+    an equality function per type, in the language itself). Not yet: generics, traits, imports. Every index is checked, division by zero is caught,
+    runtime errors name their line, and memory is garbage-collected (a mark-and-sweep collector, also written
+    in the language).
+  - **Built in**: `print println input read_line sleep now_ms random exit max min abs parse_int parse_float
+    is_number char args pid user gc_count memory_used`, math (`sin cos tan atan atan2 exp log pow sqrt PI E`),
+    files (`read_file write_file file_exists`: as the program's user, relative to their home), graphics
+    (`window clear rect circle line text big_text mono_text text_width show key mouse_x mouse_y mouse_down rgb`)
+    and sound (`beep(hz, ms)`, `note("A4")`). The runtime behind them (strings, lists, printing, the system
+    calls) is written in the same language (`userland/crt.st`) and compiled with every program.
+  - **Processes**: each program runs in the CPU's user mode with its own page table that maps only its own
+    8 MiB (code read-and-execute, data read-and-write, a guard page under the stack): the kernel, the devices
+    and other programs simply aren't there for it. A timer interrupt takes the CPU back every millisecond, so an
+    endless loop can't freeze the desktop. Everything else is a system call, and the kernel checks every
+    address and length it is handed. A null pointer, a write to the kernel or to the program's own code, a
+    runaway stack, a privileged instruction or a bad pointer passed to a system call ends that program, with a
+    message. `stellaos_procs` tests all of these with hand-made machine code.
+<p align="center"><img src=".github/stellaos-code.png" alt="the Code editor in StellaOS with bounce.st, and the program running in its own window" width="720"></p>
+
+- **Users**: a login screen (on a fresh system it makes the first account, the administrator) and a `login:` on
+  the console. Passwords are kept as salted PBKDF2-HMAC-SHA256 hashes (10,000 rounds) in `/etc/shadow`, which
+  only root can read; wrong passwords make the next try wait longer. Files and directories have owners and
+  Unix modes (`ls -l`, `chmod`, `chown`), homes are private (`0700`), programs get their user's rights, and
+  administrators run commands as root with `sudo` (changing the network, the firewall, peeking at memory).
+  `adduser`, `passwd`, `whoami`, `users`, `logout` (also in the launcher menu).
+- **Sound** (`sound.st`): a virtio-sound driver and a small synthesizer (square-wave tones with soft edges,
+  several at once). `stellang boot` adds the card and plays it through the host's audio (PulseAudio/PipeWire or
+  ALSA, Core Audio, DirectSound; `STELLANG_AUDIO=none` or `--no-sound`); `beep [hz] [ms]` and `sound` in the
+  shell, `beep`/`note` for programs, and a **Piano** app (mouse or keyboard). `stellaos_programs` records it to
+  a WAV file and checks the notes.
 - **Terminal**: the shell in a window (an ANSI terminal: colors, line editing, scrollback).
 - **Shell**: `ls cd mkdir cat write edit rm wc`, `every 500 uptime` / `jobs` / `kill`, `calc`, `mem`, `df`,
-  `date`, `open <app>`, `windows`, `keyboard us|de`.
+  `date`, `open <app>`, `windows`, `keyboard us|de`; programs: `code run cc ps kill`; users: `whoami users adduser
+  passwd sudo logout chmod chown`; sound: `beep sound`; and for the network `ifconfig`, `ping`, `host`, `fetch`
+  (HTTP or HTTPS; `-i` shows the headers and the TLS details, `-o file` saves), `browse`, `arp`, `netstat`,
+  `firewall`, `dns`.
+- **Network** (`nic.st`, `inet.st`, `tcp.st`, `www.st`): a virtio-net driver, then Ethernet, ARP, IPv4, ICMP,
+  UDP, DHCP, DNS, TCP and HTTP/1.1, all in stellang. `stellang boot` plugs in a network card on QEMU's user
+  network (`--no-net` for none); nothing outside can connect in. Built to be hard to attack:
+  - every byte from the wire is read through a bounds-checked view (`bytes.st`), so a packet that lies about
+    its lengths is dropped, not followed off the end of a buffer; checksums are checked, IP fragments refused
+  - nothing listens, and closed ports don't answer at all (a port scan sees nothing); pings go unanswered
+    unless `firewall ping on`, and then at most 20 a second
+  - ARP is learned only from answers to our own questions (no cache poisoning); DNS answers must match a random
+    query id, a random source port and the question; compressed names can't loop
+  - TCP: random initial sequence numbers and ports from a ChaCha20 generator seeded by the host (virtio-rng);
+    a reset or SYN that isn't exactly in sequence gets a challenge ACK, not obeyed (RFC 5961); data in order
+    only, 4 MiB per connection
+  - `firewall log` keeps what was refused. A test (`stellaos_network`) attacks the kernel on a LAN of its own:
+    a port scan, ARP poisoning, 3,000 malformed frames, a ping flood, hostile DNS answers and TCP injection.
+- **HTTPS: TLS 1.3, from scratch in stellang** (`tls.st`): X25519 key exchange (`x25519.st`), ChaCha20-Poly1305
+  and AES-128-GCM (`aead.st`), SHA-256/384/512, HMAC and HKDF (`sha2.st`), big-number RSA (PKCS #1 v1.5 and
+  PSS, `bn.st`, `rsa.st`) and ECDSA on P-256 and P-384 (`ecc.st`), and X.509 certificates (`x509.st`). A
+  server must present a chain to one of Mozilla's 118 root certificates (`roots.st`, made by
+  `tools/genroots.py`), every signature in it must check, every certificate must be in date, CAs must be CAs,
+  the certificate must name the host, and the server must sign the handshake with its key; otherwise nothing is
+  sent. TLS 1.3 only: no older versions to downgrade to. More roots can be trusted by putting PEM files in
+  `/etc/ca` (for a company's own CA, say). `stellaos_crypto` checks the primitives against known answers;
+  `stellaos_https` runs real TLS servers (`openssl s_server`) at the kernel, with a good certificate, an
+  unknown CA and the wrong name.
 - **Drivers, in stellang**: the display (QEMU's ramfb, through fw_cfg DMA), virtio (the transport and its
-  queues), keyboard and mouse (virtio-input; US and German layouts), and the disk (virtio-blk). The file system
+  queues), keyboard and mouse (virtio-input; US and German layouts), the disk (virtio-blk), the network card
+  (virtio-net), the sound card (virtio-sound) and the host's random numbers (virtio-rng). The file system
   is saved to the disk a moment after each change and loaded at boot; `stellang boot` keeps the disk image in
   `~/.cache/stellang/` (`--disk file.img` to choose one, `--no-disk` for none).
 
@@ -523,13 +632,15 @@ fn main() {
 - `gfx`: `Surface` (`clear rect shade frame round circle line pixel text text_in draw sprite blit gradient clip`),
   `surface wrap sprite text_width line_height rgb mix tint`, and the faces `UI TEXT TITLE MONO BIG` (and bold).
 - Ints have the bit operations drivers need: `& | ^ ~ << >>` and `0xFF`, `0b1010`, `0o755` literals (with `_`).
-- Underneath is about 800 lines of C (`src/runtime_kernel.c`): boot, the trap handler (timer ticks through
-  OpenSBI, devices through the PLIC; a CPU exception prints a panic with its address), the console, the device
-  tree, the GC's pages, and the pixel loops of `gfx`. Interrupts never run stellang code: they queue and count,
+- Underneath is about 900 lines of C (`src/runtime_kernel.c`): boot, the trap handler (timer ticks through
+  OpenSBI, devices through the PLIC; a CPU exception prints a panic with its address), entering and leaving user
+  mode (the registers saved and restored around a process's time slice), the console, the device tree, the GC's
+  pages, and the pixel loops of `gfx`. Page tables, scheduling and system calls are stellang (`proc.st`). Interrupts never run stellang code: they queue and count,
   and the program picks them up from its loop, so the collector only ever runs in ordinary code. The C library
   is `src/runtime_klibc.c`; the fonts are pre-rendered glyphs (`tools/genfont.py`); nothing else is linked.
-- Next: virtio-net and a TCP/IP stack, then page tables and user mode (processes, system calls) so apps are
-  protected from each other, and more harts.
+- The embedded userland (`userland.st`: the programs' runtime and the examples) is made from
+  `examples/stellaos/userland/` by `tools/genuserland.py`.
+- Next: images (PNG, JPEG), generics in the compiler, more harts.
 
 ## Editor support
 

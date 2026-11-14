@@ -39,6 +39,9 @@ __asm__(
     ".balign 4\n"
     ".globl trap_vector\n"
     "trap_vector:\n"
+    "  csrrw sp, sscratch, sp\n" // sscratch is 0 in the kernel, a process's frame while it runs
+    "  bnez sp, user_trap\n"
+    "  csrrw sp, sscratch, sp\n"
     "  addi sp, sp, -320\n"
     "  sd ra, 0(sp)\n  sd t0, 8(sp)\n  sd t1, 16(sp)\n  sd t2, 24(sp)\n"
     "  sd a0, 32(sp)\n  sd a1, 40(sp)\n  sd a2, 48(sp)\n  sd a3, 56(sp)\n"
@@ -67,6 +70,220 @@ __asm__(
 
 extern char __data_start, __bss_end, __stack_top, __kernel_end;
 extern void trap_vector(void);
+
+// ---- user mode: processes ----
+//
+// A process runs in user mode with its own page table. Its registers live in a frame (one page):
+//   0 pc, 8*i x1..x31, 256+8*i f0..f31, 512 fcsr, 520 satp, 528 scause, 536 stval,
+//   544.. the kernel's callee-saved registers while the process runs (ra sp s0-s11 fs0-fs11 fcsr)
+// user_enter saves the kernel's registers in the frame, puts the process's in place and srets; the
+// next trap (a system call, a fault, any interrupt) comes to user_trap, which saves the process's
+// registers and returns from user_enter with scause. The kernel itself runs without paging, so it
+// never sees user addresses: the stellang side checks them and translates them itself.
+__asm__(
+    ".text\n"
+    ".balign 4\n"
+    ".globl user_enter\n"
+    "user_enter:\n"
+    "  csrci sstatus, 2\n" // no interrupts until we are in user mode
+"  sd ra, 544(a0)\n"
+"  sd sp, 552(a0)\n"
+"  sd s0, 560(a0)\n"
+"  sd s1, 568(a0)\n"
+"  sd s2, 576(a0)\n"
+"  sd s3, 584(a0)\n"
+"  sd s4, 592(a0)\n"
+"  sd s5, 600(a0)\n"
+"  sd s6, 608(a0)\n"
+"  sd s7, 616(a0)\n"
+"  sd s8, 624(a0)\n"
+"  sd s9, 632(a0)\n"
+"  sd s10, 640(a0)\n"
+"  sd s11, 648(a0)\n"
+"  fsd fs0, 656(a0)\n"
+"  fsd fs1, 664(a0)\n"
+"  fsd fs2, 672(a0)\n"
+"  fsd fs3, 680(a0)\n"
+"  fsd fs4, 688(a0)\n"
+"  fsd fs5, 696(a0)\n"
+"  fsd fs6, 704(a0)\n"
+"  fsd fs7, 712(a0)\n"
+"  fsd fs8, 720(a0)\n"
+"  fsd fs9, 728(a0)\n"
+"  fsd fs10, 736(a0)\n"
+"  fsd fs11, 744(a0)\n"
+"  frcsr t0\n  sd t0, 752(a0)\n"
+    "  csrw sscratch, a0\n"
+    "  ld t0, 0(a0)\n  csrw sepc, t0\n"
+    "  li t0, 0x100\n  csrc sstatus, t0\n" // SPP = user
+    "  li t0, 0x20\n  csrs sstatus, t0\n"  // SPIE: interrupts on once there
+    "  ld t0, 520(a0)\n  csrw satp, t0\n  sfence.vma zero, zero\n"
+    "  ld t0, 512(a0)\n  fscsr t0\n"
+"  fld f0, 256(a0)\n"
+"  fld f1, 264(a0)\n"
+"  fld f2, 272(a0)\n"
+"  fld f3, 280(a0)\n"
+"  fld f4, 288(a0)\n"
+"  fld f5, 296(a0)\n"
+"  fld f6, 304(a0)\n"
+"  fld f7, 312(a0)\n"
+"  fld f8, 320(a0)\n"
+"  fld f9, 328(a0)\n"
+"  fld f10, 336(a0)\n"
+"  fld f11, 344(a0)\n"
+"  fld f12, 352(a0)\n"
+"  fld f13, 360(a0)\n"
+"  fld f14, 368(a0)\n"
+"  fld f15, 376(a0)\n"
+"  fld f16, 384(a0)\n"
+"  fld f17, 392(a0)\n"
+"  fld f18, 400(a0)\n"
+"  fld f19, 408(a0)\n"
+"  fld f20, 416(a0)\n"
+"  fld f21, 424(a0)\n"
+"  fld f22, 432(a0)\n"
+"  fld f23, 440(a0)\n"
+"  fld f24, 448(a0)\n"
+"  fld f25, 456(a0)\n"
+"  fld f26, 464(a0)\n"
+"  fld f27, 472(a0)\n"
+"  fld f28, 480(a0)\n"
+"  fld f29, 488(a0)\n"
+"  fld f30, 496(a0)\n"
+"  fld f31, 504(a0)\n"
+"  ld x1, 8(a0)\n"
+"  ld x2, 16(a0)\n"
+"  ld x3, 24(a0)\n"
+"  ld x4, 32(a0)\n"
+"  ld x5, 40(a0)\n"
+"  ld x6, 48(a0)\n"
+"  ld x7, 56(a0)\n"
+"  ld x8, 64(a0)\n"
+"  ld x9, 72(a0)\n"
+"  ld x11, 88(a0)\n"
+"  ld x12, 96(a0)\n"
+"  ld x13, 104(a0)\n"
+"  ld x14, 112(a0)\n"
+"  ld x15, 120(a0)\n"
+"  ld x16, 128(a0)\n"
+"  ld x17, 136(a0)\n"
+"  ld x18, 144(a0)\n"
+"  ld x19, 152(a0)\n"
+"  ld x20, 160(a0)\n"
+"  ld x21, 168(a0)\n"
+"  ld x22, 176(a0)\n"
+"  ld x23, 184(a0)\n"
+"  ld x24, 192(a0)\n"
+"  ld x25, 200(a0)\n"
+"  ld x26, 208(a0)\n"
+"  ld x27, 216(a0)\n"
+"  ld x28, 224(a0)\n"
+"  ld x29, 232(a0)\n"
+"  ld x30, 240(a0)\n"
+"  ld x31, 248(a0)\n"
+"  ld x10, 80(a0)\n"
+    "  sret\n"
+    ".balign 4\n"
+    "user_trap:\n" // sp = the frame, sscratch = the process's sp
+"  sd x1, 8(sp)\n"
+"  sd x3, 24(sp)\n"
+"  sd x4, 32(sp)\n"
+"  sd x5, 40(sp)\n"
+"  sd x6, 48(sp)\n"
+"  sd x7, 56(sp)\n"
+"  sd x8, 64(sp)\n"
+"  sd x9, 72(sp)\n"
+"  sd x10, 80(sp)\n"
+"  sd x11, 88(sp)\n"
+"  sd x12, 96(sp)\n"
+"  sd x13, 104(sp)\n"
+"  sd x14, 112(sp)\n"
+"  sd x15, 120(sp)\n"
+"  sd x16, 128(sp)\n"
+"  sd x17, 136(sp)\n"
+"  sd x18, 144(sp)\n"
+"  sd x19, 152(sp)\n"
+"  sd x20, 160(sp)\n"
+"  sd x21, 168(sp)\n"
+"  sd x22, 176(sp)\n"
+"  sd x23, 184(sp)\n"
+"  sd x24, 192(sp)\n"
+"  sd x25, 200(sp)\n"
+"  sd x26, 208(sp)\n"
+"  sd x27, 216(sp)\n"
+"  sd x28, 224(sp)\n"
+"  sd x29, 232(sp)\n"
+"  sd x30, 240(sp)\n"
+"  sd x31, 248(sp)\n"
+"  csrr t0, sscratch\n  sd t0, 16(sp)\n"
+    "  csrw sscratch, zero\n"
+    "  csrr t0, sepc\n  sd t0, 0(sp)\n"
+    "  csrr t0, scause\n  sd t0, 528(sp)\n"
+    "  csrr t0, stval\n  sd t0, 536(sp)\n"
+"  fsd f0, 256(sp)\n"
+"  fsd f1, 264(sp)\n"
+"  fsd f2, 272(sp)\n"
+"  fsd f3, 280(sp)\n"
+"  fsd f4, 288(sp)\n"
+"  fsd f5, 296(sp)\n"
+"  fsd f6, 304(sp)\n"
+"  fsd f7, 312(sp)\n"
+"  fsd f8, 320(sp)\n"
+"  fsd f9, 328(sp)\n"
+"  fsd f10, 336(sp)\n"
+"  fsd f11, 344(sp)\n"
+"  fsd f12, 352(sp)\n"
+"  fsd f13, 360(sp)\n"
+"  fsd f14, 368(sp)\n"
+"  fsd f15, 376(sp)\n"
+"  fsd f16, 384(sp)\n"
+"  fsd f17, 392(sp)\n"
+"  fsd f18, 400(sp)\n"
+"  fsd f19, 408(sp)\n"
+"  fsd f20, 416(sp)\n"
+"  fsd f21, 424(sp)\n"
+"  fsd f22, 432(sp)\n"
+"  fsd f23, 440(sp)\n"
+"  fsd f24, 448(sp)\n"
+"  fsd f25, 456(sp)\n"
+"  fsd f26, 464(sp)\n"
+"  fsd f27, 472(sp)\n"
+"  fsd f28, 480(sp)\n"
+"  fsd f29, 488(sp)\n"
+"  fsd f30, 496(sp)\n"
+"  fsd f31, 504(sp)\n"
+"  frcsr t0\n  sd t0, 512(sp)\n"
+    "  csrw satp, zero\n  sfence.vma zero, zero\n"
+    "  mv a0, sp\n"
+"  ld ra, 544(a0)\n"
+"  ld sp, 552(a0)\n"
+"  ld s0, 560(a0)\n"
+"  ld s1, 568(a0)\n"
+"  ld s2, 576(a0)\n"
+"  ld s3, 584(a0)\n"
+"  ld s4, 592(a0)\n"
+"  ld s5, 600(a0)\n"
+"  ld s6, 608(a0)\n"
+"  ld s7, 616(a0)\n"
+"  ld s8, 624(a0)\n"
+"  ld s9, 632(a0)\n"
+"  ld s10, 640(a0)\n"
+"  ld s11, 648(a0)\n"
+"  fld fs0, 656(a0)\n"
+"  fld fs1, 664(a0)\n"
+"  fld fs2, 672(a0)\n"
+"  fld fs3, 680(a0)\n"
+"  fld fs4, 688(a0)\n"
+"  fld fs5, 696(a0)\n"
+"  fld fs6, 704(a0)\n"
+"  fld fs7, 712(a0)\n"
+"  fld fs8, 720(a0)\n"
+"  fld fs9, 728(a0)\n"
+"  fld fs10, 736(a0)\n"
+"  fld fs11, 744(a0)\n"
+"  ld t0, 752(a0)\n  fscsr t0\n"
+    "  ld a0, 528(a0)\n"
+    "  ret\n");
 
 #define REG8(a) (*(volatile uint8_t *)(uintptr_t)(a))
 #define REG32(a) (*(volatile uint32_t *)(uintptr_t)(a))
@@ -257,6 +474,39 @@ char *st_k_read_str(int64_t src, int64_t n) {
     if (n > 0) memcpy(r, (const void *)src, (size_t)n);
     return r;
 }
+// Bytes as text, for data from outside (the network): NUL bytes become spaces so they can't cut a
+// string short.
+char *st_k_read_text(int64_t src, int64_t n) {
+    char *r = st_k_read_str(src, n);
+    for (int64_t i = 0; i < n; i++) if (!r[i]) r[i] = ' ';
+    return r;
+}
+// The Internet checksum's ones'-complement sum of `n` bytes (big-endian 16-bit words), added to `sum`
+// and folded to 16 bits. The callers check the range first.
+int64_t st_k_csum(int64_t addr, int64_t n, int64_t sum) {
+    const uint8_t *p = (const uint8_t *)addr;
+    uint64_t s = (uint64_t)sum;
+    for (int64_t i = 0; i + 1 < n; i += 2) s += (uint64_t)p[i] << 8 | p[i + 1];
+    if (n & 1) s += (uint64_t)p[n - 1] << 8;
+    while (s >> 16) s = (s & 0xffff) + (s >> 16);
+    return (int64_t)s;
+}
+// Scanning long text (web pages) without measuring it again on every call: the callers (html.st's
+// Src) know the length and check positions against it.
+int64_t st_k_byte(const char *s, int64_t i) { return (unsigned char)s[i]; }
+int64_t st_k_find_at(const char *s, const char *sub, int64_t from) {
+    const char *p = strstr(s + from, sub);
+    return p ? p - s : -1;
+}
+char *st_k_substr(const char *s, int64_t from, int64_t to) { return mkstr(s + from, (size_t)(to - from)); }
+// characters in a UTF-8 string (not bytes)
+int64_t st_k_utf8_len(const char *s) {
+    int64_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) n += (*p & 0xc0) != 0x80;
+    return n;
+}
+// The clock in its finest steps (for timing jitter as a little entropy).
+int64_t st_k_cycles(void) { return (int64_t)rdtime(); }
 int64_t st_k_pages_out(void) { return (int64_t)pages_out; }
 
 int64_t st_k_heap_live(void) { return (int64_t)live_bytes; }   // bytes in use after the last collection
@@ -318,6 +568,26 @@ void st_trap(uint64_t cause, uint64_t epc, uint64_t tval, uint64_t *frame) {
 }
 
 int64_t st_k_irqs(int64_t which) { return which >= 0 && which < 64 ? (int64_t)irq_counts[which] : 0; }
+
+extern uint64_t user_enter(uint64_t *frame);
+
+// Run a process (its frame) for up to `ms` milliseconds. Returns scause when it traps (8: a
+// system call; a fault), -1 when its time is up and -2 when a device interrupt wants the kernel.
+int64_t st_k_user_run(int64_t frame, int64_t ms) {
+    uint64_t *f = (uint64_t *)frame;
+    uint64_t until = rdtime() + (uint64_t)ms * (timebase / 1000);
+    for (;;) {
+        uint64_t cause = user_enter(f);
+        if ((int64_t)cause >= 0) {
+            CSR_SET(sstatus, 1u << 1);
+            return (int64_t)cause;
+        }
+        st_trap(cause, f[0], f[67], NULL);
+        CSR_SET(sstatus, 1u << 1);
+        if ((cause & 63) == 9) return -2;
+        if (rdtime() >= until) return -1;
+    }
+}
 
 // ---- timers (closures; run from the main loop) ----
 
@@ -783,6 +1053,7 @@ void kmain(uint64_t hart, const uint8_t *dtb) {
     REG8(UART + 1) = 0x01;
 
     // interrupts: the UART through the PLIC (hart 0, supervisor context = 1), and the timer
+    CSR_WRITE(sscratch, 0);
     CSR_WRITE(stvec, (uintptr_t)trap_vector);
     REG32(PLIC + 4 * UART_IRQ) = 1;
     REG32(PLIC + 0x2080) = 1u << UART_IRQ;

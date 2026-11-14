@@ -1509,7 +1509,8 @@ fn kernel_boots_stellaos() {
     let mut stdin = q.stdin.take().unwrap();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(1500));
-        for cmd in ["write a.txt hi there", "cat a.txt", "calc (1 << 10) | 0x0f", "ls", "mem", "nope", "shutdown"] {
+        // a fresh system: the console asks for the first account first
+        for cmd in ["ada", "secret1", "secret1", "write a.txt hi there", "cat a.txt", "calc (1 << 10) | 0x0f", "ls", "mem", "nope", "shutdown"] {
             stdin.write_all(format!("{cmd}\r").as_bytes()).unwrap();
             stdin.flush().unwrap();
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -1518,7 +1519,7 @@ fn kernel_boots_stellaos() {
     let out = q.wait_with_output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
     assert_eq!(out.status.code(), Some(0), "{text}");
-    for want in ["StellaOS 0.2", "hi there\n", "1039  (0x40f)", "a.txt  (9 B)", "hello.st", "RAM      128.0 MiB", "unknown command: nope", "bye!"] {
+    for want in ["StellaOS 0.3", "Hello, ada!", "hi there\n", "1039  (0x40f)", "a.txt  (9 B)", "todo.txt", "RAM      128.0 MiB", "unknown command: nope", "bye!"] {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
 
@@ -1636,6 +1637,9 @@ fn stellaos_desktop() {
 
     let text = boot(
         &|keys, serial| {
+            // the first account, made on the console: the desktop opens for it
+            serial("ada\rsecret1\rsecret1\r");
+            std::thread::sleep(Duration::from_millis(1500));
             serial("windows\r");
             // typed into the Terminal window (focused at boot), run by the shell
             keys("echo typed on the desktop\n");
@@ -1653,12 +1657,490 @@ fn stellaos_desktop() {
     }
     let text = boot(
         &|_keys, serial| {
+            serial("ada\rsecret1\r");
+            std::thread::sleep(Duration::from_millis(1500));
             serial("cat kept.txt\r");
             serial("shutdown\r");
         },
         "b",
     );
     assert!(text.contains("\nfrom the first boot\n"), "the file didn't survive the reboot:\n{text}");
+}
+
+/// StellaOS's network stack under attack. QEMU puts the kernel on a LAN with this test (a UDP
+/// socket carrying raw Ethernet frames); we are 10.0.2.66, its gateway, DNS server and web server,
+/// and also the attacker: a port scan, ARP poisoning, thousands of malformed frames, a ping flood,
+/// hostile DNS answers and TCP injection. Afterwards it must still work.
+#[test]
+fn stellaos_network() {
+    use std::io::{Read, Write};
+    use std::net::UdpSocket;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-riscv64");
+        return;
+    }
+    let dir = tmpdir("network");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let elf = dir.join("os.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(root.join("examples/stellaos/os.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+
+    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+    let ours = sock.local_addr().unwrap().port();
+    let qemu_port = UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port(); // a free port for QEMU's end
+    let mut q = Command::new("qemu-system-riscv64")
+        .args(["-machine", "virt", "-m", "256M", "-nographic", "-bios", "default"])
+        .args(["-global", "virtio-mmio.force-legacy=false", "-device", "virtio-rng-device", "-netdev"])
+        .arg(format!("dgram,id=d0,local.type=inet,local.host=127.0.0.1,local.port={qemu_port},remote.type=inet,remote.host=127.0.0.1,remote.port={ours}"))
+        .args(["-device", "virtio-net-device,netdev=d0", "-kernel"])
+        .arg(&elf)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = q.id();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(120));
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    });
+    let mut stdin = q.stdin.take().unwrap();
+    let mut stdout = q.stdout.take().unwrap();
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let sink = out.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            sink.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+    });
+    let text = || String::from_utf8_lossy(&out.lock().unwrap()).replace('\r', "");
+    let clear = || out.lock().unwrap().clear();
+
+    const GMAC: [u8; 6] = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+    const AMAC: [u8; 6] = [2, 0, 0, 0, 0, 0x66];
+    const GIP: [u8; 4] = [10, 0, 2, 15];
+    const AIP: [u8; 4] = [10, 0, 2, 66];
+    fn csum(b: &[u8]) -> u16 {
+        let mut s: u32 = 0;
+        for c in b.chunks(2) {
+            s += (c[0] as u32) << 8 | *c.get(1).unwrap_or(&0) as u32;
+        }
+        while s >> 16 != 0 {
+            s = (s & 0xffff) + (s >> 16);
+        }
+        !(s as u16)
+    }
+    fn eth(kind: u16, payload: &[u8], dst: [u8; 6], src: [u8; 6]) -> Vec<u8> {
+        [&dst[..], &src[..], &kind.to_be_bytes(), payload].concat()
+    }
+    fn ip(proto: u8, payload: &[u8], frag: u16, total: Option<u16>, ihl: u8) -> Vec<u8> {
+        let tot = total.unwrap_or(20 + payload.len() as u16);
+        let mut h = vec![0x40 | ihl, 0];
+        h.extend(tot.to_be_bytes());
+        h.extend([0x12, 0x34]);
+        h.extend(frag.to_be_bytes());
+        h.extend([64, proto, 0, 0]);
+        h.extend(AIP);
+        h.extend(GIP);
+        let c = csum(&h);
+        h[10..12].copy_from_slice(&c.to_be_bytes());
+        [h, payload.to_vec()].concat()
+    }
+    fn tcp(sport: u16, dport: u16, seq: u32, ack: u32, flags: u8, data: &[u8]) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend(sport.to_be_bytes());
+        h.extend(dport.to_be_bytes());
+        h.extend(seq.to_be_bytes());
+        h.extend(ack.to_be_bytes());
+        h.extend([0x50, flags, 0xff, 0xff, 0, 0, 0, 0]);
+        h.extend(data);
+        let pseudo = [&AIP[..], &GIP[..], &[0, 6], &(h.len() as u16).to_be_bytes()].concat();
+        let c = csum(&[pseudo, h.clone()].concat());
+        h[16..18].copy_from_slice(&c.to_be_bytes());
+        h
+    }
+    fn icmp(kind: u8, id: u16, seq: u16, data: &[u8]) -> Vec<u8> {
+        let mut b = vec![kind, 0, 0, 0];
+        b.extend(id.to_be_bytes());
+        b.extend(seq.to_be_bytes());
+        b.extend(data);
+        let c = csum(&b);
+        b[2..4].copy_from_slice(&c.to_be_bytes());
+        b
+    }
+    let to = format!("127.0.0.1:{qemu_port}");
+    let send = |f: &[u8]| {
+        sock.send_to(f, &to).unwrap();
+    };
+    let ip4 = |proto: u8, p: &[u8]| eth(0x800, &ip(proto, p, 0x4000, None, 5), GMAC, AMAC);
+
+    // our side of the LAN: answer ARP for 10.0.2.66, pings, DNS, HTTP (with attacks mixed in)
+    struct State {
+        honest_dns: bool,
+        frames: Vec<Vec<u8>>,
+        http_isn: u32,
+        http_done: bool,
+    }
+    let st = std::cell::RefCell::new(State { honest_dns: false, frames: vec![], http_isn: 0x1234_0000, http_done: false });
+    let serve = |f: &[u8]| {
+        if f.len() < 34 || f[6..12] != GMAC {
+            return;
+        }
+        st.borrow_mut().frames.push(f.to_vec());
+        if f[12..14] == [8, 6] && f[20..22] == [0, 1] && f[38..42] == AIP {
+            let arp = [&[0, 1, 8, 0, 6, 4, 0, 2][..], &AMAC, &AIP, &GMAC, &GIP].concat();
+            send(&eth(0x806, &arp, GMAC, AMAC));
+            return;
+        }
+        if f[12..14] != [8, 0] {
+            return;
+        }
+        let body = &f[34..];
+        match f[23] {
+            1 if body[0] == 8 => {
+                let id = u16::from_be_bytes([body[4], body[5]]);
+                let seq = u16::from_be_bytes([body[6], body[7]]);
+                send(&ip4(1, &icmp(0, id, seq, &body[8..])));
+            }
+            17 if body[2..4] == [0, 53] => {
+                let sport = [body[0], body[1]];
+                let qmsg = &body[8..];
+                let (id, question) = (&qmsg[..2], &qmsg[12..]);
+                let udp = |payload: Vec<u8>| {
+                    let mut u = vec![0, 53, sport[0], sport[1]];
+                    u.extend((8 + payload.len() as u16).to_be_bytes());
+                    u.extend([0, 0]);
+                    u.extend(payload);
+                    send(&ip4(17, &u));
+                };
+                let answer_a = [0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4];
+                if st.borrow().honest_dns {
+                    udp([id, &[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0], question, &answer_a, &AIP].concat());
+                } else {
+                    // a wrong id; a compression loop; an answer to another question
+                    udp([&[id[0] ^ 1, id[1]], &[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0][..], question, &answer_a, &[1, 2, 3, 4]].concat());
+                    udp([id, &[0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0], question, &[0xc0, 0x30, 0xc0, 0x2e, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]].concat());
+                    udp([id, &[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0], b"\x03bad\x07example\0\0\x01\0\x01", &answer_a, &[1, 2, 3, 4]].concat());
+                }
+            }
+            6 if body[2..4] == [0, 80] => {
+                let sport = u16::from_be_bytes([body[0], body[1]]);
+                let seq = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+                let flags = body[13];
+                let data = &body[(body[12] >> 4) as usize * 4..];
+                let s = st.borrow().http_isn;
+                let seg = |sq: u32, ak: u32, fl: u8, d: &[u8]| send(&ip4(6, &tcp(80, sport, sq, ak, fl, d)));
+                if flags & 2 != 0 {
+                    seg(s, seq + 1, 0x12, b"");
+                } else if !data.is_empty() && !st.borrow().http_done {
+                    st.borrow_mut().http_done = true;
+                    let next = seq + data.len() as u32;
+                    seg(s + 1 + 1000, next, 0x04, b""); // a reset inside the window: must be challenged, not obeyed
+                    seg(s + 1 + 5000, next, 0x18, b"EVIL DATA"); // out of order: dropped
+                    seg(s + 1, next, 0x02, b""); // a SYN on the open connection: challenged
+                    let page = b"<html>REAL PAGE</html>";
+                    let resp = [format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", page.len()).as_bytes(), page].concat();
+                    seg(s + 1, next, 0x19, &resp);
+                } else if flags & 1 != 0 {
+                    seg(s + 2 + 22 + 60, seq + 1, 0x10, b"");
+                }
+            }
+            _ => {}
+        }
+    };
+    let pump = |d: Duration| {
+        let end = Instant::now() + d;
+        let mut buf = [0u8; 2048];
+        while Instant::now() < end {
+            if let Ok(n) = sock.recv(&mut buf) {
+                serve(&buf[..n]);
+            }
+        }
+    };
+    let mut sh = |cmd: &str, wait: u64| {
+        stdin.write_all(format!("{cmd}\r").as_bytes()).unwrap();
+        stdin.flush().unwrap();
+        pump(Duration::from_millis(wait));
+    };
+    let guest_ip = |st: &std::cell::RefCell<State>| st.borrow().frames.iter().filter(|f| f[12..14] == [8, 0]).count();
+
+    pump(Duration::from_millis(2500));
+    sh("ada", 100);
+    sh("secret1", 100);
+    sh("secret1", 1500);
+    sh("ifconfig set 10.0.2.15/24 10.0.2.66", 300);
+    sh("sudo ifconfig set 10.0.2.15/24 10.0.2.66", 300);
+    sh("secret1", 1200);
+    sh("sudo dns 10.0.2.66", 300);
+    // 1. stealth: pings, a SYN scan of 300 ports and UDP to closed ports get no answer at all
+    st.borrow_mut().frames.clear();
+    for i in 0..5 {
+        send(&ip4(1, &icmp(8, 77, i, b"hello")));
+    }
+    for port in 1..=300 {
+        send(&ip4(6, &tcp(40000, port, 0xabcd_0000 + port as u32, 0, 0x02, b"")));
+    }
+    for port in 1..200u16 {
+        send(&ip4(17, &[&[0x13, 0x88][..], &port.to_be_bytes(), &[0, 12, 0, 0], b"hihi"].concat()));
+    }
+    pump(Duration::from_millis(2000));
+    assert_eq!(guest_ip(&st), 0, "something answered the scan:\n{}", text());
+    // 2. an unasked ARP answer claiming 10.0.2.66 is elsewhere must not poison the cache
+    sh("ping -c 1 10.0.2.66", 1500);
+    let evil = [2, 0, 0, 0, 0, 0xee];
+    for _ in 0..5 {
+        send(&eth(0x806, &[&[0, 1, 8, 0, 6, 4, 0, 2][..], &evil, &AIP, &GMAC, &GIP].concat(), GMAC, evil));
+    }
+    pump(Duration::from_millis(300));
+    clear();
+    sh("arp", 500);
+    assert!(text().contains("02:00:00:00:00:66") && !text().contains("02:00:00:00:00:ee"), "ARP cache poisoned:\n{}", text());
+    // 3. 3000 malformed frames: lying lengths, fragments, garbage of every kind
+    let mut seed: u32 = 12345;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    for i in 0..3000 {
+        let len = (rnd() % 300) as usize;
+        let junk: Vec<u8> = (0..len).map(|_| rnd() as u8).collect();
+        let dst = if rnd() % 2 == 0 { GMAC } else { [0xff; 6] };
+        let f = match rnd() % 4 {
+            0 => eth(0x806, &junk, dst, AMAC),
+            1 => eth(rnd() as u16, &junk, dst, AMAC),
+            _ => {
+                let proto = [1u8, 6, 17, 2, 255][(rnd() % 5) as usize];
+                let total = [None, None, Some(0), Some(19), Some(60000), Some(21)][(rnd() % 6) as usize];
+                let ihl = [5u8, 5, 5, 0, 15, 6][(rnd() % 6) as usize];
+                let frag = [0x4000u16, 0x2000, 0x0010, 0][(rnd() % 4) as usize];
+                eth(0x800, &ip(proto, &junk, frag, total, ihl), dst, AMAC)
+            }
+        };
+        send(&f);
+        if i % 200 == 0 {
+            pump(Duration::from_millis(10));
+        }
+    }
+    pump(Duration::from_millis(1000));
+    clear();
+    sh("uname", 500);
+    assert!(text().contains("StellaOS"), "the kernel didn't survive malformed frames:\n{}", text());
+    // 4. a ping flood, with answering on: rate-limited
+    sh("sudo firewall ping on", 300);
+    st.borrow_mut().frames.clear();
+    for i in 0..300 {
+        send(&ip4(1, &icmp(8, 99, i, b"flood")));
+    }
+    pump(Duration::from_millis(2500));
+    let replies = st.borrow().frames.iter().filter(|f| f[12..14] == [8, 0] && f[23] == 1 && f[34] == 0).count();
+    assert!(replies > 0 && replies <= 45, "{replies} ping replies");
+    sh("sudo firewall ping off", 300);
+    // 5. hostile DNS answers are all refused; an honest one is taken
+    clear();
+    sh("host evil.example", 5500);
+    // (the looping answer is taken apart safely and yields nothing: "no IPv4 address", or no answer at all)
+    assert!(!text().contains("1.2.3.4") && (text().contains("no IPv4 address") || text().contains("no answer")), "{}", text());
+    st.borrow_mut().honest_dns = true;
+    clear();
+    sh("host good.example", 1500);
+    assert!(text().contains("good.example has address 10.0.2.66"), "{}", text());
+    // 6. TCP: a reset inside the window, stray data and a SYN while fetching don't break the connection
+    clear();
+    sh("fetch http://good.example/", 4000);
+    assert!(text().contains("REAL PAGE") && !text().contains("EVIL") && !text().contains("reset"), "{}", text());
+    // 7. still well, and the log says what happened
+    clear();
+    sh("ping -c 2 10.0.2.66", 3000);
+    assert!(text().contains("2 sent, 2 received"), "{}", text());
+    clear();
+    sh("firewall log", 500);
+    sh("shutdown", 1000);
+    let status = q.wait().unwrap();
+    let t = text();
+    assert_eq!(status.code(), Some(0), "{t}");
+    for want in ["refused an IP fragment", "challenged, not obeyed", "doesn't match our question"] {
+        assert!(t.contains(want), "missing {want:?} in the security log:\n{t}");
+    }
+}
+
+/// StellaOS's cryptography (SHA-2, HMAC, X25519, ChaCha20-Poly1305, AES-GCM, RSA, ECDSA, X.509),
+/// checked against known answers inside QEMU (tests/stellaos_crypto.st).
+#[test]
+fn stellaos_crypto() {
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-riscv64");
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tmpdir("crypto");
+    for e in fs::read_dir(root.join("examples/stellaos")).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_file() {
+            fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+        }
+    }
+    fs::copy(root.join("tests/stellaos_crypto.st"), dir.join("crypto_test.st")).unwrap();
+    let elf = dir.join("t.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(dir.join("crypto_test.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let out = Command::new("qemu-system-riscv64")
+        .args(["-machine", "virt", "-m", "128M", "-nographic", "-bios", "default", "-kernel"])
+        .arg(&elf)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert!(text.contains("ok ecdsa p-384\n") && text.contains("\ndone") && !text.contains("FAIL"), "{text}");
+}
+
+/// StellaOS's JavaScript engine and DOM (tests/stellaos_js.st): the language, the DOM and events,
+/// and the sandbox (runaway loops stopped, deep recursion and catastrophic regexes contained, no
+/// network, no eval, the toolkit's own attributes off limits), inside QEMU.
+#[test]
+fn stellaos_js() {
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-riscv64");
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tmpdir("jsengine");
+    for e in fs::read_dir(root.join("examples/stellaos")).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_file() {
+            fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+        }
+    }
+    fs::copy(root.join("tests/stellaos_js.st"), dir.join("js_test.st")).unwrap();
+    let elf = dir.join("t.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(dir.join("js_test.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let out = Command::new("qemu-system-riscv64")
+        .args(["-machine", "virt", "-m", "256M", "-nographic", "-bios", "default", "-kernel"])
+        .arg(&elf)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert!(text.contains("passed 21/21") && !text.contains("FAIL"), "{text}");
+}
+
+/// HTTPS in StellaOS against real TLS 1.3 servers (openssl s_server on the host, reached through
+/// QEMU's user network): an unknown root is refused, so is a certificate for another name; with the
+/// root added to /etc/ca, the page loads (one server picks AES-128-GCM, the other ChaCha20).
+#[test]
+fn stellaos_https() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Stdio;
+    use std::time::Duration;
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() || Command::new("openssl").arg("version").output().is_err() {
+        eprintln!("skipped: needs qemu-system-riscv64 and openssl");
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tmpdir("https");
+    let elf = dir.join("os.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(root.join("examples/stellaos/os.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    // a test CA (P-384) and two server certificates (P-256): one for 10.0.2.2, one for another name
+    let ssl = |args: &[&str]| {
+        let o = Command::new("openssl").args(args).current_dir(&dir).output().unwrap();
+        assert!(o.status.success(), "openssl {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    };
+    ssl(&["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:secp384r1", "-keyout", "ca.key", "-out", "ca.pem", "-days", "30", "-nodes", "-subj", "/CN=Stella Test CA", "-addext", "basicConstraints=critical,CA:TRUE"]);
+    for (name, san) in [("good", "IP:10.0.2.2"), ("wrong", "DNS:wrong.example")] {
+        fs::write(dir.join(format!("{name}.ext")), format!("subjectAltName={san}\nbasicConstraints=CA:FALSE\n")).unwrap();
+        ssl(&["req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-keyout", &format!("{name}.key"), "-out", &format!("{name}.csr"), "-nodes", "-subj", "/CN=test"]);
+        ssl(&["x509", "-req", "-in", &format!("{name}.csr"), "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-out", &format!("{name}.pem"), "-days", "30", "-extfile", &format!("{name}.ext")]);
+    }
+    let free = || TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (good_port, wrong_port) = (free(), free());
+    let mut servers = vec![];
+    for (name, port, suite) in [("good", good_port, "TLS_AES_128_GCM_SHA256"), ("wrong", wrong_port, "TLS_CHACHA20_POLY1305_SHA256")] {
+        servers.push(
+            Command::new("openssl")
+                .args(["s_server", "-quiet", "-tls1_3", "-www", "-ciphersuites", suite, "-accept"])
+                .arg(port.to_string())
+                .args(["-cert", &format!("{name}.pem"), "-key", &format!("{name}.key")])
+                .current_dir(&dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    // the CA certificate, over plain HTTP, for the kernel to fetch into /etc/ca
+    let pem = fs::read(dir.join("ca.pem")).unwrap();
+    let http = TcpListener::bind("127.0.0.1:0").unwrap();
+    let http_port = http.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in http.incoming() {
+            let mut s = s.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", pem.len()).as_bytes());
+            let _ = s.write_all(&pem);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let mut q = Command::new("qemu-system-riscv64")
+        .args(["-machine", "virt", "-m", "256M", "-nographic", "-bios", "default"])
+        .args(["-global", "virtio-mmio.force-legacy=false", "-device", "virtio-rng-device"])
+        .args(["-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0", "-kernel"])
+        .arg(&elf)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = q.id();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(120));
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    });
+    let mut stdin = q.stdin.take().unwrap();
+    std::thread::sleep(Duration::from_millis(3000));
+    for (cmd, wait) in [
+        ("ada".to_string(), 100),
+        ("secret1".to_string(), 100),
+        ("secret1".to_string(), 1500),
+        (format!("fetch https://10.0.2.2:{good_port}/"), 6000),
+        ("mkdir /etc/ca".to_string(), 300),
+        ("sudo mkdir /etc/ca".to_string(), 300),
+        ("secret1".to_string(), 1200),
+        (format!("sudo fetch http://10.0.2.2:{http_port}/ca.pem -o /etc/ca/test.pem"), 2000),
+        (format!("fetch -i https://10.0.2.2:{good_port}/"), 8000),
+        (format!("fetch https://10.0.2.2:{wrong_port}/"), 8000),
+        ("shutdown".to_string(), 1000),
+    ] {
+        stdin.write_all(format!("{cmd}\r").as_bytes()).unwrap();
+        stdin.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(wait));
+    }
+    let out = q.wait_with_output().unwrap();
+    for mut s in servers {
+        let _ = s.kill();
+    }
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    for want in [
+        "the certificate can't be trusted: the certificate isn't signed by anyone we trust",
+        "saved /etc/ca/test.pem",
+        "HTTP 200 ok",
+        "TLS 1.3 · AES-128-GCM · certificate from",
+        "s_server",
+        "the certificate is for wrong.example, not 10.0.2.2",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
 }
 
 /// A field default that builds another struct with defaults (from another module) makes that
@@ -1668,4 +2150,221 @@ fn nested_field_defaults() {
     let m = "struct E {\n    h: [str] = [],\n    n: int = 2,\n}\n";
     let src = "import m\nstruct Outer {\n    e: m.E = m.E {},\n}\nfn main() {\n    let o = Outer {}\n    println(o.e.n + m.E {}.h.len())\n}\n";
     assert_eq!(run_with("nested_defaults", src, &[("m", m)]), (0, "2\n".into(), "".into()));
+}
+
+/// Processes on StellaOS (tests/stellaos_procs.st): machine code that attacks the kernel (a null
+/// pointer, writes to the kernel, a device and its own code, a kernel pointer handed to a system
+/// call, privileged instructions, a runaway stack) ends only itself; an endless loop doesn't stop
+/// the kernel; programs compiled inside the OS run, with runtime and compile errors where they are.
+#[test]
+fn stellaos_procs() {
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-riscv64");
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tmpdir("procs");
+    for e in fs::read_dir(root.join("examples/stellaos")).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_file() {
+            fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+        }
+    }
+    fs::copy(root.join("tests/stellaos_procs.st"), dir.join("procs_test.st")).unwrap();
+    let elf = dir.join("t.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(dir.join("procs_test.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let out = Command::new("qemu-system-riscv64")
+        .args(["-machine", "virt", "-m", "128M", "-nographic", "-bios", "default", "-kernel"])
+        .arg(&elf)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    for want in [
+        "[hello] hi from user mode\n[hello] ended: code 7",
+        "[null] ended: code -1 segmentation fault",
+        "[kernel-write] ended: code -1 segmentation fault: it touched memory that isn't its own (address 0x80200000)",
+        "[device-write] ended: code -1 segmentation fault",
+        "[code-write] ended: code -1 segmentation fault",
+        "[bad-pointer] ended: code -1 bad pointer passed to write",
+        "[recurse] ended: code -1 stack overflow",
+        "[wfi] ended: code -1 illegal instruction",
+        "[csr] ended: code -1 illegal instruction",
+        "[bad-syscall] ended: code -1 unknown system call 999",
+        "[spin] ended: code -1 killed",
+        "0: a x3\n1: b x2\n2: c x1\ntotal 6\n",
+        "hi counter=2 primes=[2, 3, 5]\n[2, 7, 50]\n1 3 5 7 \ntrue\nx=-2 -1 3 1024 -4 -1\n",
+        "ababab 5 [\"a\", \"b\", \"\", \"c\"] [\"line1\", \"line2\"]",
+        "-42 false Aé 9 4\n440\n261\n",
+        "-9223372036854775808\ntrue\n2\ncba\n[exit 0]",
+        "error on line 5: division by zero\n[exit 101]",
+        "=== c_stack.st\n[exit -1] stack overflow",
+        "compile error 3:5: `x` can't change: declare it with `var`",
+        "compile error 2:18: `s`: expected str, found int",
+        "compile error 2:13: no variable called `undefined_thing`",
+        "compile error 2:26: this string never ends",
+        "compile error 4:6: P has no field `y`",
+        "compile error 3:13: add takes 2 arguments, given 1",
+        "=== j_spin.st\n[still running after 3 s: killing]",
+        "error: out of memory\n[exit 101]",
+        "name? hello Ada!\ndouble: 42\n[exit 0]",
+        "churn 1398890 sum 12497500 intact true\ncollections true bounded true\n[exit 0]",
+        "1.0\n3.14\n0.3\n0.333333333333333\n1e+21\n-2.5\n100000000.0\n1.4142135623731\n2.5\n0.001\n1.5e-07\n",
+        "len 5.0 half 2.5\nf=5.0 int=5 float=7.0 floor=-3.0 ceil=3.0 round=3.0 abs=3.25\ntrue true true true\n",
+        "sin 0.5 cos 0.5 tan 1.0\n",
+        "parse -125.0 0.0\n[0.5, 1.25]\n1.00000000000792\n[exit 0]",
+        "Main St: Red (wait 30)\nMain St: Green (wait 0)\nMain St: Yellow (wait 3)\nMain St: Red (wait 30)\ntrue\n2 Green\ntwo or three\n[exit 0]",
+        "compile error 4:5: this match on Dir misses Left (or add `_ =>`)",
+        "[10, 20, 30, 40, 50, 60]\n[2, 4, 6]\ntrue true 4\n42\n42\ncounter 3\nclicks 2\n[4, 3, 6]\nPEAR-FIG-BANANA\n[0, 100, 200]\n5\ntotal 21\n[exit 0]",
+        "{\"ada\": 36, \"linus\": 29, \"grace\": 45}\n3 36 -1 true\n[\"linus\", \"grace\"]\nlinus is 29\ngrace is 45\n",
+        "{\"the\": 3, \"cat\": 1, \"and\": 2, \"hat\": 1, \"bat\": 1}\ntotal 14\nbig 2500 true false true\n",
+        "error on line 28: no key \"nobody\" in the map",
+        "Circle(1.0) has area 3.0\nRect { w: 2.0, h: 1.0 } has area 2.0\nRect { w: 3.0, h: 3.0 } has area 9.0\nEmpty has area 0.0\n",
+        "Add(Num(2), Mul(Num(3), Neg(Num(4)))) = -10\n0\ntom is a cat\nrex is a terrier\nDog(\"terrier\")\n[exit 0]",
+        "42\n-1\nerror: an age can't be negative\n0\n6\ntotal failed: not a whole number: \"oops\"\n-1\nhello ada\ncheck: no name\n2.5\ntrue true true false\nerror: no name\n[exit 1]",
+        "=== v_equality.st\ntrue\nfalse\ntrue\ntrue\nfalse\ntrue\nfalse\ntrue\ntrue\ntrue\ntrue\n[exit 0]",
+        "found ada ada@example.org 36\nbob: no email none\ntrue\n5 none 4 -1\n3 4 1 none 4\n99\n36 none\ntrue\ntrue now\n6\n\nerror on line 38: unwrap() of none",
+        "[exe] from a file",
+        "exe parse of junk: true",
+        "example bounce.st compiles\nexample guess.st compiles\nexample hello.st compiles\nexample music.st compiles\nexample notebook.st compiles\nexample orbits.st compiles\nexample paint.st compiles\nexample primes.st compiles\nexample worm.st compiles\n",
+        "\ndone",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    // the kernel kept running while a program spun
+    let turns: u32 = text.split("kernel turns while spinning: ").nth(1).unwrap().split(';').next().unwrap().parse().unwrap();
+    assert!(turns > 50, "the kernel barely ran while a program spun: {turns}");
+}
+
+/// StellaOS as a person uses it, on the serial console: the first account, programs written,
+/// compiled and run inside it (with input, files and sound: the sound card's output goes to a WAV
+/// file we check), and users kept apart (private homes, /etc/shadow, sudo, programs that try to
+/// write where they may not).
+#[test]
+fn stellaos_programs() {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::time::Duration;
+    if Command::new("qemu-system-riscv64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-riscv64");
+        return;
+    }
+    let dir = tmpdir("programs");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let elf = dir.join("os.elf");
+    let c = Command::new(BIN).arg("--kernel").arg(root.join("examples/stellaos/os.st")).arg("-o").arg(&elf).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let wav = dir.join("sound.wav");
+    let mut q = Command::new("qemu-system-riscv64")
+        .args(["-machine", "virt", "-m", "256M", "-nographic", "-bios", "default"])
+        .args(["-global", "virtio-mmio.force-legacy=false", "-device", "virtio-rng-device"])
+        .arg("-audiodev")
+        .arg(format!("wav,id=snd0,path={}", wav.display()))
+        .args(["-device", "virtio-sound-device,audiodev=snd0", "-kernel"])
+        .arg(&elf)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = q.id();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(120));
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    });
+    let mut stdin = q.stdin.take().unwrap();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1500));
+        for (cmd, wait) in [
+            ("ada", 100),
+            ("secret1", 100),
+            ("secret1", 1500),
+            ("run /home/examples/hello.st", 1500),
+            ("Ada", 1500),
+            ("cc /home/examples/primes.st -o primes", 2000),
+            ("run primes", 3000),
+            ("write boom.st fn main() { let xs = [1, 2]; println(xs[5]) }", 300),
+            ("run boom.st", 1500),
+            ("write bad.st fn main() { let n: int = \"x\" }", 300),
+            ("run bad.st", 1500),
+            ("write grab.st fn main() { println(read_file(\"/etc/shadow\").len()); println(write_file(\"/etc/passwd\", \"x\")); println(write_file(\"mine.txt\", \"ok\")) }", 300),
+            ("run grab.st", 1500),
+            ("cat mine.txt", 300),
+            ("run /home/examples/music.st", 11000),
+            ("write echo.st fn main() { let a = args(); println(\"${a.len()} args: ${a}\") }", 300),
+            ("run echo.st one two three", 1500),
+            ("write tick.st fn main() { for i in 0..3 { println(\"tick ${i}\"); sleep(200) }; println(input(\"?\")) }", 300),
+            ("run tick.st &", 300),
+            ("ps", 1500),
+            ("cat /etc/shadow", 300),
+            ("peek 0x80200000", 300),
+            ("sudo adduser bob", 300),
+            ("secret1", 1200),
+            ("bobpass", 300),
+            ("bobpass", 1500),
+            ("write ~/diary.txt dear diary", 300),
+            ("logout", 500),
+            ("bob", 200),
+            ("wrong", 1500),
+            ("bob", 2500),
+            ("bobpass", 1500),
+            ("cat /home/ada/diary.txt", 300),
+            ("sudo ls", 300),
+            ("ls -l /home", 300),
+            ("shutdown", 1000),
+        ] {
+            stdin.write_all(format!("{cmd}\r").as_bytes()).unwrap();
+            stdin.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(wait));
+        }
+    });
+    let out = q.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    for want in [
+        "Hello, ada!",
+        "Nice to meet you, Ada.\n1 squared is 1\n",
+        "5 squared is 25\n",
+        "of RISC-V machine code",
+        "9592 primes below 100000",
+        "error on line 1: index 5 is out of range (the length is 2)",
+        "bad.st:1:26: `n`: expected int, found str",
+        "0\nwrite_file /etc/passwd: permission denied: /etc/passwd\nfalse\ntrue\n",
+        "\nok",
+        "E4 E4 F4 G4",
+        "3 args: [\"one\", \"two\", \"three\"]",
+        "running in the background (`kill",
+        "tick.st",
+        "] tick 2",
+        "] tick.st ended (exit code 0)",
+        "permission denied: /etc/shadow",
+        "`peek` needs an administrator",
+        "added bob, home /home/bob",
+        "logged out",
+        "wrong user name or password",
+        "Hello, bob!",
+        "permission denied: /home/ada/diary.txt",
+        "bob isn't an administrator",
+        "drwx------  ada",
+        "drwx------  bob",
+        "bye!",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    // the music came out of the sound card: somewhere in it, E4 (330 Hz) and G4 (392 Hz) square
+    // waves (the login chime plays first)
+    let data = fs::read(&wav).unwrap();
+    let rate = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
+    let channels = u16::from_le_bytes(data[22..24].try_into().unwrap()) as usize;
+    let samples: Vec<i16> = data[44..].chunks(2 * channels).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+    assert!(samples.iter().any(|&s| s != 0), "the WAV file is silent");
+    let win = rate / 10;
+    let pitches: Vec<f64> = samples
+        .chunks(win)
+        .filter(|w| w.len() == win && w.iter().filter(|&&s| s.abs() > 1000).count() > win * 9 / 10)
+        .map(|w| w.windows(2).filter(|p| (p[0] < 0) != (p[1] < 0)).count() as f64 / 2.0 / 0.1)
+        .collect();
+    for want in [330.0, 392.0] {
+        assert!(pitches.iter().any(|hz| (hz - want).abs() < 10.0), "no {want} Hz tone in the sound: {pitches:?}");
+    }
 }
