@@ -17,6 +17,7 @@
 import kernel
 import bytes
 import nic
+import xhci
 import rng
 
 const ETH_IP = 0x0800
@@ -946,8 +947,8 @@ fn mask_bits(mask: int) -> int {
 }
 
 // Bring up the network: the card, the random number generator, DHCP. none without a card.
-fn open(r: rng.Rng) -> Net? {
-    if let card = nic.open() {
+fn open(r: rng.Rng, usb: xhci.Usb?, cards: bool) -> Net? {
+    if let card = nic.open(usb, cards) {
         let n = Net { card, rand: r, mac: card.mac }
         n.ip_id = r.u16()
         kernel.every(1, () => n.poll())

@@ -18,6 +18,7 @@
 
 import kernel
 import pci
+import bytes
 
 // TRB types
 const NORMAL = 1
@@ -121,6 +122,41 @@ struct Dev {
     loc: Loc,
 }
 
+// A USB network device: an Ethernet adapter (CDC-ECM) or a phone sharing its connection (RNDIS).
+// Frames go out on a bulk OUT endpoint and come in on a bulk IN endpoint; RNDIS wraps each in a
+// 44-byte header (and may put several in one transfer coming in).
+struct NetLink {
+    kind: str,
+    mac: [int],
+    slot: int,
+    where: str,
+    in_dci: int,
+    out_dci: int,
+    in_ring: Ring,
+    out_ring: Ring,
+    out_mps: int,
+    rndis: bool,
+    rx_by_trb: {int: int} = {},       // receive buffers waiting, by their TRB
+    ready: [[int]] = [],              // transfers in: [buffer, length]
+    tx_free: [int] = [],
+    tx_by_trb: {int: int} = {},
+    alive: bool = true,
+
+    fn header(self) -> int { return if self.rndis { 44 } else { 0 } }
+
+    fn buffer(self) -> bytes.Out? {
+        if self.tx_free.is_empty() || !self.alive { return none }
+        let b = self.tx_free.pop()
+        return some(bytes.Out { addr: b + self.header(), cap: 1514 })
+    }
+
+    fn release(self, o: bytes.Out) { self.tx_free.push(o.addr - self.header()) }
+}
+
+const NET_RX = 8
+const NET_RX_SIZE = 16384
+const NET_TX = 16
+
 // A hub and its ports.
 struct Hub {
     slot: int,
@@ -149,6 +185,8 @@ struct Controller {
     pipes: [Pipe] = [],
     devs: [Dev] = [],
     hubs: [Hub] = [],
+    links: [NetLink] = [],
+    port_changed: bool = false,
     stash: [Event] = [],      // transfer events that came while waiting for something else
     attached: [int] = [],     // ports with a device we set up (or gave up on)
     next_scan: int = 0,
@@ -316,6 +354,7 @@ struct Controller {
             self.setup_hub(slot, ep0, l, input, buf)
             return
         }
+        if self.try_net(slot, ep0, l, input) { return }
         // the configuration descriptor: first its length, then all of it
         if !self.control(slot, ep0, 0x80, 6, 0x200, 0, 9, buf) { return }
         let total = min(kernel.peek16(buf + 2), 4096)
@@ -387,6 +426,234 @@ struct Controller {
             self.pipes.push(p)
             self.note("port ${port}: USB ${p.kind}")
         }
+    }
+
+    // ---- network devices ----
+
+    // Look through the device's configurations for a network function we speak; set it up if so.
+    fn try_net(self, slot: int, ep0: Ring, l: Loc, input: int) -> bool {
+        let buf = kernel.alloc_pages(1)
+        if !self.control(slot, ep0, 0x80, 6, 0x100, 0, 18, buf) { return false }
+        let configs = min(max(kernel.peek8(buf + 17), 1), 4)
+        // a device may offer several ways (QEMU's usb-net: RNDIS and CDC-ECM): take ECM if it's
+        // there, the standard one (phones offer only RNDIS)
+        var best: [int] = []
+        for ci in 0..configs {
+            if !self.control(slot, ep0, 0x80, 6, 0x200 | ci, 0, 9, buf) { continue }
+            let total = min(kernel.peek16(buf + 2), 4096)
+            if !self.control(slot, ep0, 0x80, 6, 0x200 | ci, 0, total, buf) { continue }
+            let f = net_function(buf, total)
+            if f.is_empty() { continue }
+            if best.is_empty() || (f[0] == 1 && best[0] != 1) { best = f }
+        }
+        if best.is_empty() { return false }
+        return self.setup_net(slot, ep0, l, input, buf, best)
+    }
+
+    // f: [kind (1 ECM, 2 RNDIS), configuration, comm interface, data interface, data alt setting,
+    //     bulk IN address, its max packet, bulk OUT address, its max packet, MAC string index]
+    fn setup_net(self, slot: int, ep0: Ring, l: Loc, input: int, buf: int, f: [int]) -> bool {
+        let rndis = f[0] == 2
+        let what = if rndis { "phone or RNDIS device" } else { "USB Ethernet (CDC-ECM)" }
+        if !self.control(slot, ep0, 0x00, 9, f[1], 0, 0, 0) {
+            self.note("port ${l.where}: ${what}: configuration refused")
+            return true
+        }
+        // the two bulk endpoints
+        let in_dci = (f[5] & 15) * 2 + 1
+        let out_dci = (f[7] & 15) * 2
+        let in_ring = ring()
+        let out_ring = ring()
+        kernel.fill32(input, (self.ctx * 33) / 4, 0)
+        kernel.poke32(input + 4, 1 | (1 << in_dci) | (1 << out_dci))
+        self.slot_ctx(self.icx(input, 1), l, max(in_dci, out_dci), false, 0, 0)
+        for e in [[in_dci, f[6], 6, in_ring.base], [out_dci, f[8], 2, out_ring.base]] {
+            let ep = self.icx(input, e[0] + 1)
+            kernel.poke32(ep + 4, (e[1] << 16) | (e[2] << 3) | (3 << 1))
+            kernel.poke64(ep + 8, e[3] | 1)
+            kernel.poke32(ep + 16, 2048)
+        }
+        if self.command(input, 0, (CONFIGURE_EP << 10) | (slot << 24)) == none {
+            self.note("port ${l.where}: ${what}: the controller wouldn't take its endpoints")
+            return true
+        }
+        var mac: [int] = []
+        if rndis {
+            mac = self.rndis_start(slot, ep0, f[2], buf)
+            if mac.is_empty() {
+                self.note("port ${l.where}: ${what}: it didn't start (RNDIS)")
+                return true
+            }
+        } else {
+            // the data interface's setting with the endpoints, the MAC address (a string), what to receive
+            if f[4] != 0 { self.control(slot, ep0, 0x01, 11, f[4], f[3], 0, 0) }
+            mac = self.mac_string(slot, ep0, f[9], buf)
+            self.control(slot, ep0, 0x21, 0x43, 0x0e, f[2], 0, 0)       // directed, broadcast, all multicast
+        }
+        let link = NetLink { kind: if rndis { "USB tethering (RNDIS)" } else { "USB Ethernet (CDC-ECM)" }, mac, slot, where: l.where,
+            in_dci, out_dci, in_ring, out_ring, out_mps: max(f[8], 8), rndis }
+        let txmem = kernel.alloc_pages(NET_TX * 2048 / 4096)
+        for i in 0..NET_TX { link.tx_free.push(txmem + 2048 * i) }
+        let rxmem = kernel.alloc_pages(NET_RX * NET_RX_SIZE / 4096)
+        for i in 0..NET_RX { self.net_listen(link, rxmem + NET_RX_SIZE * i) }
+        self.links.push(link)
+        self.note("port ${l.where}: ${link.kind}")
+        return true
+    }
+
+    fn net_listen(self, link: NetLink, b: int) {
+        let trb = link.in_ring.push(b, NET_RX_SIZE, (NORMAL << 10) | 32 | 4)
+        link.rx_by_trb[trb] = b
+        kernel.poke32(self.db + 4 * link.slot, link.in_dci)
+    }
+
+    // the MAC address from the string descriptor (12 hex digits); a made-up local one if there is none
+    fn mac_string(self, slot: int, ep0: Ring, index: int, buf: int) -> [int] {
+        var mac: [int] = []
+        if index > 0 && self.control(slot, ep0, 0x80, 6, 0x300 | index, 0x0409, 26, buf) && kernel.peek8(buf) >= 26 {
+            var hexs = ""
+            for k in 0..12 { hexs += st_chr_x(kernel.peek8(buf + 2 + 2 * k)) }
+            for k in 0..6 {
+                let v = hex_val(hexs.slice(2 * k, 2 * k + 2))
+                if v < 0 {
+                    mac = []
+                    break
+                }
+                mac.push(v)
+            }
+        }
+        if mac.len() != 6 { mac = [0x02, 0x53, 0x54, 0x4c, 0x00, slot & 255] }
+        return mac
+    }
+
+    // RNDIS: initialize, ask the MAC address, set what to receive. [] if it doesn't answer.
+    fn rndis_start(self, slot: int, ep0: Ring, comm: int, buf: int) -> [int] {
+        // INITIALIZE (we take transfers of up to 16 KiB)
+        if self.rndis_call(slot, ep0, comm, buf, [2, 24, 1, 1, 0, NET_RX_SIZE], 0x8000_0002).is_empty() { return [] }
+        // QUERY the permanent address (OID_802_3_PERMANENT_ADDRESS)
+        let r = self.rndis_call(slot, ep0, comm, buf, [4, 28, 2, 0x0101_0101, 0, 0, 0], 0x8000_0004)
+        if r.is_empty() { return [] }
+        var mac: [int] = []
+        let off = 8 + kernel.peek32(buf + 20)
+        if kernel.peek32(buf + 16) >= 6 && off + 6 < 1024 {
+            for k in 0..6 { mac.push(kernel.peek8(buf + off + k)) }
+        }
+        if mac.len() != 6 { return [] }
+        // SET the packet filter (OID_GEN_CURRENT_PACKET_FILTER): directed, multicast, broadcast
+        self.rndis_call(slot, ep0, comm, buf, [5, 32, 3, 0x0001_010e, 4, 20, 0, 0x0b], 0x8000_0005)
+        return mac
+    }
+
+    // send an RNDIS message (32-bit words), wait for the reply of type `want`: its words, or [] (the
+    // reply's bytes stay in buf)
+    fn rndis_call(self, slot: int, ep0: Ring, comm: int, buf: int, words: [int], want: int) -> [int] {
+        for k, w in words { kernel.poke32(buf + 4 * k, w) }
+        if !self.control(slot, ep0, 0x21, 0x00, 0, comm, 4 * words.len(), buf) { return [] }
+        for tries in 0..20 {
+            sleep(5)
+            if self.control(slot, ep0, 0xa1, 0x01, 0, comm, 1024, buf) && kernel.peek32(buf) == want {
+                if kernel.peek32(buf + 12) != 0 { return [] }       // a status other than success
+                return [kernel.peek32(buf), kernel.peek32(buf + 4)]
+            }
+        }
+        return []
+    }
+
+    // Is this transfer event a network device's? Then take care of it.
+    fn route(self, e: Event) -> bool {
+        for link in self.links {
+            if link.slot != e.slot { continue }
+            if e.ep == link.in_dci {
+                if let b = link.rx_by_trb.get(e.param) {
+                    link.rx_by_trb.remove(e.param)
+                    if e.code == SUCCESS || e.code == SHORT_PACKET {
+                        link.ready.push([b, NET_RX_SIZE - e.left])
+                    } else {
+                        self.reset_ep(link.slot, link.in_dci, link.in_ring)
+                        self.net_listen(link, b)
+                    }
+                }
+                return true
+            }
+            if e.ep == link.out_dci {
+                if let b = link.tx_by_trb.get(e.param) {
+                    link.tx_by_trb.remove(e.param)
+                    link.tx_free.push(b)
+                }
+                if e.code != SUCCESS && e.code != SHORT_PACKET { self.reset_ep(link.slot, link.out_dci, link.out_ring) }
+                return true
+            }
+        }
+        return false
+    }
+
+    // events now (network transfers taken care of, the rest kept for poll)
+    fn pump(self) {
+        while true {
+            if let e = self.next_event() {
+                if e.kind == TRANSFER_EVENT && !self.route(e) { self.stash.push(e) }
+                if e.kind == PORT_CHANGE { self.port_changed = true }
+            } else {
+                break
+            }
+        }
+    }
+
+    fn net_send(self, link: NetLink, o: bytes.Out) -> bool {
+        let b = o.addr - link.header()
+        if o.full || o.len < 14 {
+            link.tx_free.push(b)
+            return false
+        }
+        var len = o.len
+        if link.rndis {
+            // REMOTE_NDIS_PACKET_MSG: type, length, data offset (from byte 8), data length
+            kernel.fill32(b, 11, 0)
+            kernel.poke32(b, 1)
+            kernel.poke32(b + 4, 44 + len)
+            kernel.poke32(b + 8, 36)
+            kernel.poke32(b + 12, len)
+            len += 44
+        }
+        // a transfer that's a whole number of packets ends with an empty one (CDC-ECM)
+        let zlp = !link.rndis && len % link.out_mps == 0
+        let first = link.out_ring.push(b, len, (NORMAL << 10) | (if zlp { 0 } else { 32 }))
+        var last = first
+        if zlp { last = link.out_ring.push(0, 0, (NORMAL << 10) | 32) }
+        link.tx_by_trb[last] = b
+        kernel.poke32(self.db + 4 * link.slot, link.out_dci)
+        return true
+    }
+
+    // frames that came in, each to f; their buffers go back to the device after
+    fn net_poll(self, link: NetLink, most: int, f: fn(bytes.View)) -> int {
+        self.pump()
+        var n = 0
+        while !link.ready.is_empty() && n < most {
+            let t = link.ready.remove(0)
+            let b = t[0]
+            let len = t[1]
+            if link.rndis {
+                var at = 0
+                while at + 44 <= len {
+                    let mtype = kernel.peek32(b + at)
+                    let mlen = kernel.peek32(b + at + 4)
+                    if mtype != 1 || mlen < 44 || at + mlen > len { break }
+                    let doff = kernel.peek32(b + at + 8)
+                    let dlen = kernel.peek32(b + at + 12)
+                    if dlen >= 14 && dlen <= 1514 && 8 + doff + dlen <= mlen {
+                        f(bytes.View { addr: b + at + 8 + doff, len: dlen })
+                        n += 1
+                    }
+                    at += mlen
+                }
+            } else if len >= 14 && len <= 1514 {
+                f(bytes.View { addr: b, len })
+                n += 1
+            }
+            self.net_listen(link, b)
+        }
+        return n
     }
 
     // ---- hubs ----
@@ -483,6 +750,8 @@ struct Controller {
         }
         self.hubs = self.hubs.filter(h => h.slot != slot)
         self.pipes = self.pipes.filter(p => p.slot != slot)
+        for k in self.links.filter(k => k.slot == slot) { k.alive = false }
+        self.links = self.links.filter(k => k.slot != slot)
         self.devs = self.devs.filter(d => d.slot != slot)
         self.command(0, 0, (10 << 10) | (slot << 24))                                      // Disable Slot
         kernel.poke64(self.dcbaa + 8 * slot, 0)
@@ -536,18 +805,13 @@ struct Controller {
     // Reports from keyboards and mice since the last call (and plugging in a device: noticed here).
     fn poll(self) -> [Report] {
         var out: [Report] = []
+        self.pump()
         var evs = self.stash
         self.stash = []
-        var port_changed = false
-        while true {
-            if let e = self.next_event() {
-                if e.kind == TRANSFER_EVENT { evs.push(e) }
-                if e.kind == PORT_CHANGE { port_changed = true }
-            } else {
-                break
-            }
-        }
+        let port_changed = self.port_changed
+        self.port_changed = false
         for e in evs {
+            if self.route(e) { continue }
             for p in self.pipes {
                 if p.slot == e.slot && p.dci == e.ep {
                     if e.code == SUCCESS || e.code == SHORT_PACKET {
@@ -671,10 +935,39 @@ struct Usb {
         return out
     }
 
+    // the first network device on any controller
+    fn net(self) -> NetLink? {
+        for c in self.controllers {
+            for l in c.links {
+                if l.alive { return some(l) }
+            }
+        }
+        return none
+    }
+
+    fn owner(self, link: NetLink) -> Controller? {
+        for c in self.controllers {
+            if c.links.any(k => k.slot == link.slot && k.in_dci == link.in_dci) { return some(c) }
+        }
+        return none
+    }
+
+    fn net_send(self, link: NetLink, o: bytes.Out) -> bool {
+        if let c = self.owner(link) { return c.net_send(link, o) }
+        link.release(o)
+        return false
+    }
+
+    fn net_poll(self, link: NetLink, most: int, f: fn(bytes.View)) -> int {
+        if let c = self.owner(link) { return c.net_poll(link, most, f) }
+        return 0
+    }
+
     fn devices(self) -> [str] {
         var out: [str] = []
         for c in self.controllers {
             for p in c.pipes { out.push(p.kind) }
+            for l in c.links { out.push(l.kind) }
             for h in c.hubs { out.push("hub (${h.ports} ports)") }
         }
         return out
@@ -688,4 +981,65 @@ fn open() -> Usb {
         if let c = start(f) { u.controllers.push(c) }
     }
     return u
+}
+
+// The network function in a configuration descriptor (buf, total bytes), as setup_net wants it, or [].
+fn net_function(buf: int, total: int) -> [int] {
+    let config = kernel.peek8(buf + 5)
+    var kind = 0
+    var comm = -1
+    var data = -1
+    var data_alt = 0
+    var mac_index = 0
+    var in_ep = [0, 0]
+    var out_ep = [0, 0]
+    var iface = -1
+    var alt = 0
+    var cls = 0
+    var at = 0
+    while at + 2 <= total {
+        let len = kernel.peek8(buf + at)
+        let t = kernel.peek8(buf + at + 1)
+        if len < 2 { break }
+        if t == 4 && len >= 9 {
+            iface = kernel.peek8(buf + at + 2)
+            alt = kernel.peek8(buf + at + 3)
+            cls = kernel.peek8(buf + at + 5)
+            let sub = kernel.peek8(buf + at + 6)
+            let proto = kernel.peek8(buf + at + 7)
+            if kind == 0 && cls == 2 && sub == 6 {
+                kind = 1
+                comm = iface
+            } else if kind == 0 && ((cls == 0xe0 && sub == 1 && proto == 3) || (cls == 2 && sub == 2 && proto == 0xff)) {
+                kind = 2
+                comm = iface
+            }
+        } else if t == 0x24 && len >= 4 && iface == comm && kind == 1 && kernel.peek8(buf + at + 2) == 0x0f {
+            mac_index = kernel.peek8(buf + at + 3)        // the Ethernet functional descriptor
+        } else if t == 5 && len >= 7 && kind != 0 && cls == 0x0a {
+            let addr = kernel.peek8(buf + at + 2)
+            if kernel.peek8(buf + at + 3) & 3 == 2 {      // bulk
+                let mps = kernel.peek16(buf + at + 4) & 0x7ff
+                if addr & 0x80 != 0 { in_ep = [addr, mps] } else { out_ep = [addr, mps] }
+                data = iface
+                data_alt = alt
+            }
+        }
+        at += len
+    }
+    if kind == 0 || data < 0 || in_ep[0] == 0 || out_ep[0] == 0 { return [] }
+    return [kind, config, comm, data, data_alt, in_ep[0], in_ep[1], out_ep[0], out_ep[1], mac_index]
+}
+
+extern fn st_chr(code: int) -> str
+fn st_chr_x(c: int) -> str { return st_chr(c) }
+
+fn hex_val(s: str) -> int {
+    var v = 0
+    for c in s.lower().chars() {
+        let d = "0123456789abcdef".find(c)
+        if d < 0 { return -1 }
+        v = v * 16 + d
+    }
+    return v
 }

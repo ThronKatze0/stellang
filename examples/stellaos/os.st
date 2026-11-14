@@ -43,6 +43,7 @@ import sound
 import users
 import login
 import piano
+import xhci
 
 const VERSION = "0.3"
 
@@ -664,6 +665,20 @@ struct Shell {
         result?
     }
 
+    // Bring the network up if there's a card (or a USB network device) and it isn't up yet.
+    fn network_up(self, r: rng.Rng, cards: bool) {
+        if self.net.is_some() { return }
+        var usb: xhci.Usb? = none
+        if let d = self.gui { usb = d.inp.usb }
+        self.net = inet.open(r, usb, cards)
+        if let n = self.net {
+            let t = tcp.start(n)
+            self.tcp = some(t)
+            self.web = some(www.Client { stack: t, trust: tls.Trust { extra: () => self.extra_roots() } })
+            if kernel.arch() == "x86_64" { println("${kernel.ESC}[2mnetwork: ${n.card.kind}${kernel.ESC}[0m") }
+        }
+    }
+
     fn network(self) -> inet.Net! {
         if let n = self.net { return n }
         return err("no network card (`stellang boot` adds one unless --no-net)")
@@ -951,16 +966,14 @@ fn main() {
     let r = rng.open()
     sh.random = some(r)
     sh.accounts = some(users.Users { fs: sh.fs, random: () => r.u32() })
-    sh.net = inet.open(r)
-    if let n = sh.net {
-        let t = tcp.start(n)
-        sh.tcp = some(t)
-        sh.web = some(www.Client { stack: t, trust: tls.Trust { extra: () => sh.extra_roots() } })
-    }
     banner()
     print(sh.fs.read("/etc/motd") catch "")
     // a display: the desktop comes up by itself, with a terminal on it
     sh.start_desktop() catch e { println("${kernel.ESC}[2m(no display: just this shell. `stellang boot --gui` for the desktop)${kernel.ESC}[0m") }
+    // the network (after the desktop: on a PC the USB controllers come up with it, and a USB network
+    // device, or a phone sharing its connection, can be plugged in any time: we keep looking)
+    sh.network_up(r, true)
+    if sh.net.is_none() { kernel.every(2000, () => sh.network_up(r, false)) }
     if let d = sh.gui {
         d.on_logout = () => sh.end_session(true)
         sh.show_login(d, "")

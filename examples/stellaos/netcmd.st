@@ -40,7 +40,7 @@ fn need(argv: [str], i: int, usage: str) -> str! {
 fn show(n: inet.Net) {
     let c = n.card
     println("${kernel.ESC}[1meth0${kernel.ESC}[0m  ${if n.up() { "up" } else { "waiting for an address (DHCP: ${n.dhcp.state})" }}")
-    println("      hardware ${inet.fmt_mac(n.mac)}")
+    println("      hardware ${inet.fmt_mac(n.mac)}, ${c.kind}${if c.link() { "" } else { " (no cable / no link)" }}")
     if n.up() {
         println("      address  ${inet.fmt_ip(n.ip)}/${inet.mask_bits(n.mask)}  (netmask ${inet.fmt_ip(n.mask)})")
         println("      gateway  ${if n.gateway != 0 { inet.fmt_ip(n.gateway) } else { "none" }}")
@@ -49,7 +49,7 @@ fn show(n: inet.Net) {
         println("      lease    ${left / 60} min left")
     }
     println("      frames   ${c.received} in, ${c.sent} out${if c.dropped > 0 { ", ${c.dropped} dropped (no buffer)" } else { "" }}")
-    println("      random   ${if n.rand.strong() { "ChaCha20, seeded by the host (virtio-rng)" } else { "ChaCha20, seeded by timer jitter only (no virtio-rng: weaker)" }}")
+    println("      random   ${if n.rand.strong() { "ChaCha20, seeded by the hardware (${if kernel.arch() == "x86_64" { "RDRAND" } else { "virtio-rng" }})" } else { "ChaCha20, seeded by timer jitter only (no virtio-rng: weaker)" }}")
 }
 
 // `ping [-c n] [-s size] host`

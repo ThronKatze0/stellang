@@ -95,7 +95,17 @@ touchpad yet: `hw` prints what was found and why not.
 `stellang usb os.st <folder>` builds the .efi and writes `<folder>/EFI/BOOT/BOOTX64.EFI` (refuses
 `/dev/...`).
 
-Not done: AMD's I²C controllers, network, sound, NVMe (on purpose).
+Also done: the network on PCs. `nic.st` is now a card with backends: virtio-net (QEMU's RISC-V
+machine), `e1000.st` (Intel 8254x/82574/I217-I219: the classic descriptor rings, polled; the I21x
+keep the firmware's PHY setup, no global reset) and USB (`xhci.st` NetLink: CDC-ECM and RNDIS over
+bulk endpoints, ECM preferred when a device offers both; RNDIS INITIALIZE/QUERY/SET over the control
+pipe, 44-byte packet headers, several packets per transfer in). The shell brings the network up
+after the desktop (USB comes up with input) and keeps looking every 2 s for a USB network device
+plugged in later (a phone whose tethering gets switched on). `stellaos_x86_net` gets a DHCP lease
+and fetches a page over e1000e and over usb-net (ECM); RNDIS was checked by hand (QEMU's usb-net
+offers it first). Wi-Fi: not attempted (vendor firmware + 802.11/WPA2).
+
+Not done: AMD's I²C controllers, Wi-Fi, Realtek Ethernet, CDC-NCM, sound, NVMe (on purpose).
 
 ## Testing
 

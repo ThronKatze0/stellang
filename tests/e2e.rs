@@ -2551,3 +2551,103 @@ fn stellaos_touch() {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
 }
+
+/// StellaOS's network on a PC (QEMU x86 + OVMF, its user network): Intel's Ethernet (e1000e) and a
+/// USB network device (QEMU's usb-net, as CDC-ECM: what USB Ethernet adapters speak) each get an
+/// address by DHCP and fetch a page from a web server in this test.
+#[test]
+fn stellaos_x86_net() {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    if Command::new("qemu-system-x86_64").arg("--version").output().is_err() {
+        eprintln!("skipped: no qemu-system-x86_64");
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tmpdir("x86net");
+    let efi = dir.join("os.efi");
+    let c = Command::new(BIN).args(["--kernel", "--arch", "x86_64"]).arg(root.join("examples/stellaos/os.st")).arg("-o").arg(&efi).output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    // a web server on the host (QEMU's user network reaches it as 10.0.2.2)
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = server.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in server.incoming() {
+            let Ok(mut s) = s else { continue };
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            let body = "hello over the wire\n";
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    for (device, kind) in [("e1000e,netdev=n0", "Intel Ethernet 82574 (e1000e)"), ("usb-net,netdev=n0", "USB Ethernet (CDC-ECM)")] {
+        let mut q = Command::new(BIN)
+            .args(["boot", "--arch", "x86_64"])
+            .arg(&efi)
+            .args(["-netdev", "user,id=n0", "-device", device])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let text = Arc::new(Mutex::new(String::new()));
+        let mut out = q.stdout.take().unwrap();
+        let t2 = text.clone();
+        let reader = std::thread::spawn(move || {
+            let mut b = [0u8; 4096];
+            while let Ok(n) = out.read(&mut b) {
+                if n == 0 {
+                    break;
+                }
+                t2.lock().unwrap().push_str(&String::from_utf8_lossy(&b[..n]).replace('\r', ""));
+            }
+        });
+        let mut stdin = q.stdin.take().unwrap();
+        let wait = |want: &str, secs: u64| -> bool {
+            let end = Instant::now() + Duration::from_secs(secs);
+            while Instant::now() < end {
+                if text.lock().unwrap().contains(want) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            false
+        };
+        if !wait("new user name:", 240) {
+            let _ = q.kill();
+            let mut err = String::new();
+            let _ = q.stderr.take().unwrap().read_to_string(&mut err);
+            if err.contains("no UEFI firmware") {
+                eprintln!("skipped: no OVMF");
+                return;
+            }
+            panic!("StellaOS didn't come up:\n{}\n{err}", text.lock().unwrap());
+        }
+        let mut typed = |s: &str| {
+            stdin.write_all(s.as_bytes()).unwrap();
+            stdin.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+        };
+        for line in ["ada\r", "secret1\r", "secret1\r"] {
+            typed(line);
+        }
+        assert!(wait("$ ", 60), "{}", text.lock().unwrap());
+        assert!(wait(&format!("network: {kind}"), 30), "{}", text.lock().unwrap());
+        // DHCP takes a moment
+        let end = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < end && !text.lock().unwrap().contains("address  10.0.2.15") {
+            typed("ifconfig\r");
+            std::thread::sleep(Duration::from_millis(1500));
+        }
+        typed(&format!("fetch http://10.0.2.2:{port}/\r"));
+        assert!(wait("hello over the wire", 30), "{}", text.lock().unwrap());
+        typed("shutdown\r");
+        let status = q.wait().unwrap();
+        reader.join().unwrap();
+        let text = text.lock().unwrap().clone();
+        assert_eq!(status.code(), Some(0), "{text}");
+        assert!(text.contains(&format!("hardware 52:54:00:12:34:56, {kind}")) || text.contains(&format!(", {kind}")), "{text}");
+    }
+}
